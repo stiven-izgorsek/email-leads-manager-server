@@ -1,4 +1,5 @@
-import { Account } from '../models/Account.js';
+import { AppDataSource } from '../config/database.js';
+import { Account } from '../entities/Account.js';
 
 export async function getAccounts(req, res) {
   try {
@@ -6,13 +7,18 @@ export async function getAccounts(req, res) {
     const limit = parseInt(req.query.limit) || 20;
     const skip = (page - 1) * limit;
 
+    const accountRepository = AppDataSource.getRepository(Account);
+
     const [data, total] = await Promise.all([
-      Account.find()
-        .sort({ createdAt: -1 })
-        .skip(skip)
-        .limit(limit)
-        .lean(),
-      Account.countDocuments(),
+      accountRepository.find({
+        where: { deletedAt: null },
+        order: { createdAt: 'DESC' },
+        skip: skip,
+        take: limit,
+      }),
+      accountRepository.count({
+        where: { deletedAt: null },
+      }),
     ]);
 
     const totalPages = Math.ceil(total / limit);
@@ -32,30 +38,40 @@ export async function getAccounts(req, res) {
 
 export async function getAccount(req, res) {
   try {
-    const account = await Account.findById(req.params.id);
+    const accountRepository = AppDataSource.getRepository(Account);
+    const account = await accountRepository.findOne({
+      where: { id: req.params.id, deletedAt: null },
+    });
+
     if (!account) {
       return res.status(404).json({ error: 'Account not found' });
     }
+
     res.json(account);
   } catch (error) {
     console.error('Get account error:', error);
-    if (error.name === 'CastError') {
-      return res.status(400).json({ error: 'Invalid account ID' });
-    }
     res.status(500).json({ error: 'Internal server error' });
   }
 }
 
 export async function createAccount(req, res) {
   try {
-    if (!req.body.name) {
-      return res.status(400).json({ error: 'Account name is required' });
-    }
+    const accountRepository = AppDataSource.getRepository(Account);
+    
+    // Create new account
+    const account = accountRepository.create({
+      firstName: req.body.firstName || null,
+      lastName: req.body.lastName || null,
+      linkedin: req.body.linkedin || null,
+      xing: req.body.xing || null,
+      cv: req.body.cv || null,
+      country: req.body.country || null,
+      assignedTo: req.body.assignedTo || null,
+    });
 
-    const account = new Account(req.body);
-    await account.save();
+    const savedAccount = await accountRepository.save(account);
 
-    res.status(201).json(account);
+    res.status(201).json(savedAccount);
   } catch (error) {
     console.error('Create account error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -64,38 +80,53 @@ export async function createAccount(req, res) {
 
 export async function updateAccount(req, res) {
   try {
-    const account = await Account.findByIdAndUpdate(
-      req.params.id,
-      { ...req.body, updatedAt: new Date() },
-      { new: true, runValidators: true }
-    );
+    const accountRepository = AppDataSource.getRepository(Account);
+    
+    const account = await accountRepository.findOne({
+      where: { id: req.params.id, deletedAt: null },
+    });
 
     if (!account) {
       return res.status(404).json({ error: 'Account not found' });
     }
 
-    res.json(account);
+    // Update account fields
+    if (req.body.firstName !== undefined) account.firstName = req.body.firstName;
+    if (req.body.lastName !== undefined) account.lastName = req.body.lastName;
+    if (req.body.linkedin !== undefined) account.linkedin = req.body.linkedin;
+    if (req.body.xing !== undefined) account.xing = req.body.xing;
+    if (req.body.cv !== undefined) account.cv = req.body.cv;
+    if (req.body.country !== undefined) account.country = req.body.country;
+    if (req.body.assignedTo !== undefined) account.assignedTo = req.body.assignedTo;
+
+    const updatedAccount = await accountRepository.save(account);
+
+    res.json(updatedAccount);
   } catch (error) {
     console.error('Update account error:', error);
-    if (error.name === 'CastError') {
-      return res.status(400).json({ error: 'Invalid account ID' });
-    }
     res.status(500).json({ error: 'Internal server error' });
   }
 }
 
 export async function deleteAccount(req, res) {
   try {
-    const account = await Account.findByIdAndDelete(req.params.id);
+    const accountRepository = AppDataSource.getRepository(Account);
+    
+    const account = await accountRepository.findOne({
+      where: { id: req.params.id, deletedAt: null },
+    });
+
     if (!account) {
       return res.status(404).json({ error: 'Account not found' });
     }
+
+    // Soft delete
+    account.deletedAt = new Date();
+    await accountRepository.save(account);
+
     res.json({ message: 'Account deleted successfully' });
   } catch (error) {
     console.error('Delete account error:', error);
-    if (error.name === 'CastError') {
-      return res.status(400).json({ error: 'Invalid account ID' });
-    }
     res.status(500).json({ error: 'Internal server error' });
   }
 }

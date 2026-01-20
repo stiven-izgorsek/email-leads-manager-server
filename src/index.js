@@ -3,14 +3,16 @@ import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import dotenv from 'dotenv';
 import { connectDatabase } from './config/database.js';
+import 'reflect-metadata';
 
 // Import routes
 import authRoutes from './routes/authRoutes.js';
-import leadRoutes from './routes/leadRoutes.js';
 import accountRoutes from './routes/accountRoutes.js';
 import emailRoutes from './routes/emailRoutes.js';
-import subjectTemplateRoutes from './routes/subjectTemplateRoutes.js';
-import messageTemplateRoutes from './routes/messageTemplateRoutes.js';
+import leadRoutes from './routes/leadRoutes.js';
+// TODO: Migrate these routes to TypeORM
+// import subjectTemplateRoutes from './routes/subjectTemplateRoutes.js';
+// import messageTemplateRoutes from './routes/messageTemplateRoutes.js';
 
 // Load environment variables
 dotenv.config();
@@ -34,11 +36,12 @@ app.get('/health', (req, res) => {
 
 // API routes
 app.use('/api/auth', authRoutes);
-app.use('/api/leads', leadRoutes);
 app.use('/api/accounts', accountRoutes);
 app.use('/api/emails', emailRoutes);
-app.use('/api/subject-templates', subjectTemplateRoutes);
-app.use('/api/message-templates', messageTemplateRoutes);
+app.use('/api/leads', leadRoutes);
+// TODO: Re-enable after migrating to TypeORM
+// app.use('/api/subject-templates', subjectTemplateRoutes);
+// app.use('/api/message-templates', messageTemplateRoutes);
 
 // Error handling middleware
 app.use((err, req, res, next) => {
