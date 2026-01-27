@@ -10,9 +10,8 @@ import authRoutes from './routes/authRoutes.js';
 import accountRoutes from './routes/accountRoutes.js';
 import emailRoutes from './routes/emailRoutes.js';
 import leadRoutes from './routes/leadRoutes.js';
-// TODO: Migrate these routes to TypeORM
-// import subjectTemplateRoutes from './routes/subjectTemplateRoutes.js';
-// import messageTemplateRoutes from './routes/messageTemplateRoutes.js';
+import userRoutes from './routes/userRoutes.js';
+import templateRoutes from './routes/templateRoutes.js';
 
 // Load environment variables
 dotenv.config();
@@ -22,7 +21,7 @@ const PORT = process.env.PORT || 4000;
 
 // Middleware
 app.use(cors({
-  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+  origin: true, // Allow all origins
   credentials: true,
 }));
 app.use(express.json());
@@ -39,9 +38,8 @@ app.use('/api/auth', authRoutes);
 app.use('/api/accounts', accountRoutes);
 app.use('/api/emails', emailRoutes);
 app.use('/api/leads', leadRoutes);
-// TODO: Re-enable after migrating to TypeORM
-// app.use('/api/subject-templates', subjectTemplateRoutes);
-// app.use('/api/message-templates', messageTemplateRoutes);
+app.use('/api/users', userRoutes);
+app.use('/api', templateRoutes);
 
 // Error handling middleware
 app.use((err, req, res, next) => {
