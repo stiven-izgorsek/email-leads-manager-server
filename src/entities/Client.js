@@ -1,7 +1,7 @@
 import { EntitySchema } from 'typeorm';
 
 export class Client {
-  constructor(id, firstName, lastName, linkedin, companyName, companyUrl, industries, status, sentBy, lastSent, tech, companyLocation, email, emailStatus, location, contactedBy, jobTitle, photoUrl, employees, isSent, isReplied, isFollowup, note, leadFilterId, createdAt, updatedAt, deletedAt) {
+  constructor(id, firstName, lastName, linkedin, companyName, companyUrl, industries, status, sentBy, lastSent, tech, companyLocation, email, emailStatus, location, contactedBy, jobTitle, photoUrl, employees, isSent, isReplied, isFollowup, note, leadFilterId, millionsStatus, createdAt, updatedAt, deletedAt) {
     this.id = id;
     this.firstName = firstName;
     this.lastName = lastName;
@@ -26,6 +26,7 @@ export class Client {
     this.isFollowup = isFollowup;
     this.note = note;
     this.leadFilterId = leadFilterId;
+    this.millionsStatus = millionsStatus;
     this.createdAt = createdAt;
     this.updatedAt = updatedAt;
     this.deletedAt = deletedAt;
@@ -147,6 +148,11 @@ export const ClientSchema = new EntitySchema({
     },
     leadFilterId: {
       type: 'uuid',
+      nullable: true,
+    },
+    millionsStatus: {
+      type: 'varchar',
+      length: 50,
       nullable: true,
     },
     createdAt: {

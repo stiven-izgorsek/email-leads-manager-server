@@ -24,6 +24,8 @@ app.use(cors({
   origin: true, // Allow all origins
   credentials: true,
 }));
+
+// JSON parser - handle errors in middleware
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
@@ -44,6 +46,16 @@ app.use('/api', templateRoutes);
 // Error handling middleware
 app.use((err, req, res, next) => {
   console.error('Error:', err);
+  
+  // Handle JSON parsing errors
+  if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
+    return res.status(400).json({
+      error: 'Invalid JSON in request body',
+      message: err.message,
+      hint: 'Ensure the request body is valid JSON and Content-Type header is set to application/json'
+    });
+  }
+  
   res.status(err.status || 500).json({
     error: err.message || 'Internal server error',
   });

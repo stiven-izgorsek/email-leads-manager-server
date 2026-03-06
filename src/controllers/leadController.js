@@ -5,6 +5,7 @@ import { In } from 'typeorm';
 import fs from 'fs/promises';
 import XLSX from 'xlsx';
 import path from 'path';
+import { verifyEmailsBulk } from '../services/millionsService.js';
 
 export async function getLeads(req, res) {
   try {
@@ -26,7 +27,12 @@ export async function getLeads(req, res) {
     }
 
     if (req.query.status) {
-      queryBuilder.andWhere('client.status = :status', { status: req.query.status });
+      // Handle both NULL and 'new' as 'new' status (since default is 'new')
+      if (req.query.status === 'new') {
+        queryBuilder.andWhere('(client.status = :status OR client.status IS NULL)', { status: req.query.status });
+      } else {
+        queryBuilder.andWhere('client.status = :status', { status: req.query.status });
+      }
     }
 
     if (req.query.location) {
@@ -76,7 +82,12 @@ export async function getLeads(req, res) {
     }
 
     if (req.query.status) {
-      countQuery.andWhere('client.status = :status', { status: req.query.status });
+      // Handle both NULL and 'new' as 'new' status (since default is 'new')
+      if (req.query.status === 'new') {
+        countQuery.andWhere('(client.status = :status OR client.status IS NULL)', { status: req.query.status });
+      } else {
+        countQuery.andWhere('client.status = :status', { status: req.query.status });
+      }
     }
 
     if (req.query.location) {
@@ -578,12 +589,14 @@ export async function getUncontactedLeads(req, res) {
 
     // Fetch new uncontacted leads (excluding 'ready' and 'followedup' status - those are managed by extension locally or already followed up)
     // Only fetch leads that haven't been fetched by any extension yet and haven't been followed up
+    // Only return leads with 'good' or 'risky' millionsStatus (prioritize 'good')
     const queryBuilder = clientRepository
       .createQueryBuilder('client')
       .where('client.deletedAt IS NULL')
       .andWhere('(client.isSent = false OR client.isSent IS NULL)') // Only uncontacted leads
       .andWhere('(client.status != :readyStatus OR client.status IS NULL)', { readyStatus: 'ready' }) // Exclude 'ready' status
-      .andWhere('(client.status != :followedupStatus OR client.status IS NULL)', { followedupStatus: 'followedup' }); // Exclude 'followedup' status
+      .andWhere('(client.status != :followedupStatus OR client.status IS NULL)', { followedupStatus: 'followedup' }) // Exclude 'followedup' status
+      .andWhere('client.millionsStatus IN (:...millionsStatuses)', { millionsStatuses: ['good', 'risky'] }); // Only 'good' or 'risky' millionsStatus
 
     // Filter by leadFilterId if provided (include or exclude)
     if (leadFilterId) {
@@ -615,7 +628,15 @@ export async function getUncontactedLeads(req, res) {
     }
 
     const leads = await queryBuilder
-      .orderBy('client.createdAt', 'DESC')
+      .orderBy(
+        `CASE 
+          WHEN client.millionsStatus = 'good' THEN 1 
+          WHEN client.millionsStatus = 'risky' THEN 2 
+          ELSE 3 
+        END`,
+        'ASC'
+      ) // Prioritize 'good' over 'risky'
+      .addOrderBy('client.createdAt', 'DESC') // Then by creation date
       .take(count)
       .getMany();
     
@@ -908,12 +929,39 @@ export async function getDashboardKPIs(req, res) {
     const tomorrow = new Date(today);
     tomorrow.setDate(tomorrow.getDate() + 1);
     
+    // Get this week's date range (start of week to end of today)
+    const weekStart = new Date(today);
+    weekStart.setDate(today.getDate() - today.getDay()); // Start of week (Sunday)
+    weekStart.setHours(0, 0, 0, 0);
+    
+    // Get this month's date range (start of month to end of today)
+    const monthStart = new Date(today.getFullYear(), today.getMonth(), 1);
+    monthStart.setHours(0, 0, 0, 0);
+    
     // Count emails sent today (isSent = true AND lastSent is today)
     const emailsSentToday = await clientRepository
       .createQueryBuilder('client')
       .where('client.deletedAt IS NULL')
       .andWhere('client.isSent = :isSent', { isSent: true })
       .andWhere('client.lastSent >= :today', { today })
+      .andWhere('client.lastSent < :tomorrow', { tomorrow })
+      .getCount();
+    
+    // Count emails sent this week
+    const emailsSentThisWeek = await clientRepository
+      .createQueryBuilder('client')
+      .where('client.deletedAt IS NULL')
+      .andWhere('client.isSent = :isSent', { isSent: true })
+      .andWhere('client.lastSent >= :weekStart', { weekStart })
+      .andWhere('client.lastSent < :tomorrow', { tomorrow })
+      .getCount();
+    
+    // Count emails sent this month
+    const emailsSentThisMonth = await clientRepository
+      .createQueryBuilder('client')
+      .where('client.deletedAt IS NULL')
+      .andWhere('client.isSent = :isSent', { isSent: true })
+      .andWhere('client.lastSent >= :monthStart', { monthStart })
       .andWhere('client.lastSent < :tomorrow', { tomorrow })
       .getCount();
     
@@ -957,6 +1005,8 @@ export async function getDashboardKPIs(req, res) {
       success: true,
       data: {
         emailsSentToday,
+        emailsSentThisWeek,
+        emailsSentThisMonth,
         followUpEmailsToday,
         clientsRepliedToday,
         meetingsScheduledToday,
@@ -964,6 +1014,54 @@ export async function getDashboardKPIs(req, res) {
     });
   } catch (error) {
     console.error('Get dashboard KPIs error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
+// Get emails sent in a date range
+export async function getEmailsSentInDateRange(req, res) {
+  try {
+    const { startDate, endDate } = req.query;
+    
+    if (!startDate || !endDate) {
+      return res.status(400).json({ error: 'startDate and endDate query parameters are required' });
+    }
+    
+    const start = new Date(startDate);
+    start.setHours(0, 0, 0, 0);
+    
+    const end = new Date(endDate);
+    end.setHours(23, 59, 59, 999);
+    
+    if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+      return res.status(400).json({ error: 'Invalid date format. Use YYYY-MM-DD format' });
+    }
+    
+    if (start > end) {
+      return res.status(400).json({ error: 'startDate must be before or equal to endDate' });
+    }
+    
+    const clientRepository = AppDataSource.getRepository(Client);
+    
+    // Count emails sent in the date range
+    const emailsSent = await clientRepository
+      .createQueryBuilder('client')
+      .where('client.deletedAt IS NULL')
+      .andWhere('client.isSent = :isSent', { isSent: true })
+      .andWhere('client.lastSent >= :start', { start })
+      .andWhere('client.lastSent <= :end', { end })
+      .getCount();
+    
+    res.json({
+      success: true,
+      data: {
+        emailsSent,
+        startDate: start.toISOString(),
+        endDate: end.toISOString(),
+      },
+    });
+  } catch (error) {
+    console.error('Get emails sent in date range error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 }
@@ -994,6 +1092,337 @@ export async function resetLeadsStatus(req, res) {
     });
   } catch (error) {
     console.error('Reset leads status error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
+// In-memory storage for verification job status
+const verificationJobs = new Map();
+
+/**
+ * Start bulk email verification with Millions API
+ */
+export async function bulkVerifyEmails(req, res) {
+  try {
+    // Debug logging
+    console.log('bulkVerifyEmails - Request body:', req.body);
+    console.log('bulkVerifyEmails - Request body type:', typeof req.body);
+    console.log('bulkVerifyEmails - Content-Type:', req.get('Content-Type'));
+    
+    // Check if body exists
+    if (!req.body) {
+      return res.status(400).json({ 
+        error: 'Request body is missing',
+        hint: 'Make sure to send JSON with Content-Type: application/json header'
+      });
+    }
+    
+    // Handle case where body might be a string (shouldn't happen with express.json(), but just in case)
+    let body = req.body;
+    if (typeof body === 'string') {
+      try {
+        body = JSON.parse(body);
+      } catch (parseError) {
+        console.error('Error parsing body as JSON:', parseError);
+        return res.status(400).json({ 
+          error: 'Invalid JSON in request body', 
+          details: parseError.message,
+          hint: 'Ensure the request body is valid JSON and Content-Type header is set to application/json'
+        });
+      }
+    }
+    
+    const { clientIds } = body;
+    
+    if (!clientIds) {
+      return res.status(400).json({ error: 'clientIds is required in request body' });
+    }
+    
+    if (!Array.isArray(clientIds)) {
+      return res.status(400).json({ error: 'clientIds must be an array' });
+    }
+    
+    if (clientIds.length === 0) {
+      return res.status(400).json({ error: 'clientIds array cannot be empty' });
+    }
+
+    const apiKey = process.env.MILLIONS_API_KEY;
+    if (!apiKey) {
+      // Return a proper error even if API key is missing
+      return res.status(400).json({ 
+        error: 'MILLIONS_API_KEY environment variable is not set',
+        message: 'Please configure the Millions API key in your environment variables'
+      });
+    }
+
+    const clientRepository = AppDataSource.getRepository(Client);
+    
+    // Fetch clients with emails, excluding those already verified
+    const clients = await clientRepository.find({
+      where: {
+        id: In(clientIds),
+        deletedAt: null,
+      },
+    });
+
+    // Filter out clients without emails or already verified (exclude those with 'good' or 'risky' status)
+    const clientsToVerify = clients.filter(client => {
+      return client.email && 
+             client.email.trim() !== '' && 
+             (!client.millionsStatus || client.millionsStatus === 'bad' || client.millionsStatus === 'error');
+    });
+
+    if (clientsToVerify.length === 0) {
+      return res.status(400).json({ error: 'No valid emails to verify' });
+    }
+
+    const emails = clientsToVerify.map(c => c.email);
+    const jobId = `job_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+    // Initialize job status
+    verificationJobs.set(jobId, {
+      jobId,
+      status: 'processing',
+      total: emails.length,
+      completed: 0,
+      results: [],
+      startTime: new Date(),
+    });
+
+    // Start verification in background
+    (async () => {
+      try {
+        await verifyEmailsBulk(
+          emails,
+          apiKey,
+          async (email, result, index, total) => {
+            // Find the client for this email
+            const client = clientsToVerify.find(c => c.email === email);
+            if (client) {
+              // Update client in database
+              await clientRepository.update(
+                { id: client.id },
+                { millionsStatus: result.status }
+              ).catch(err => console.error(`Error updating client ${client.id}:`, err));
+
+              // Update job status
+              const job = verificationJobs.get(jobId);
+              if (job) {
+                job.completed = index;
+                job.results.push({
+                  clientId: client.id,
+                  email: email,
+                  status: result.status,
+                  result: result.result,
+                  error: result.error,
+                });
+              }
+            }
+          }
+        );
+
+        // Mark job as completed
+        const job = verificationJobs.get(jobId);
+        if (job) {
+          job.status = 'completed';
+          job.completed = job.total;
+          job.endTime = new Date();
+        }
+      } catch (error) {
+        console.error('Verification job error:', error);
+        const job = verificationJobs.get(jobId);
+        if (job) {
+          job.status = 'error';
+          job.error = error.message;
+          job.endTime = new Date();
+        }
+      }
+    })();
+
+    res.json({
+      success: true,
+      jobId,
+      total: emails.length,
+      message: 'Verification started',
+    });
+  } catch (error) {
+    console.error('Bulk verify emails error:', error);
+    console.error('Error stack:', error.stack);
+    res.status(500).json({ 
+      error: 'Internal server error',
+      message: error.message,
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
+  }
+}
+
+/**
+ * Verify all leads with status "new"
+ */
+export async function bulkVerifyAllNew(req, res) {
+  try {
+    const apiKey = process.env.MILLIONS_API_KEY;
+    if (!apiKey) {
+      return res.status(400).json({ 
+        error: 'MILLIONS_API_KEY environment variable is not set',
+        message: 'Please configure the Millions API key in your environment variables'
+      });
+    }
+
+    const clientRepository = AppDataSource.getRepository(Client);
+    
+    // Fetch all clients with status "new" that have emails and are not already verified
+    // Handle both NULL and 'new' as 'new' status (since default is 'new')
+    const clients = await clientRepository
+      .createQueryBuilder('client')
+      .where('client.deletedAt IS NULL')
+      .andWhere('(client.status = :status OR client.status IS NULL)', { status: 'new' })
+      .getMany();
+
+    // Filter out clients without emails or already verified (good/risky)
+    const clientsToVerify = clients.filter(client => {
+      return client.email && 
+             client.email.trim() !== '' && 
+             (!client.millionsStatus || client.millionsStatus === 'bad' || client.millionsStatus === 'error');
+    });
+
+    if (clientsToVerify.length === 0) {
+      return res.status(400).json({ error: 'No valid emails to verify. All "new" status leads are either missing emails or already verified.' });
+    }
+
+    const emails = clientsToVerify.map(c => c.email);
+    const jobId = `job_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+    // Initialize job status
+    verificationJobs.set(jobId, {
+      jobId,
+      status: 'processing',
+      total: emails.length,
+      completed: 0,
+      results: [],
+      startTime: new Date(),
+    });
+
+    // Start verification in background
+    (async () => {
+      try {
+        await verifyEmailsBulk(
+          emails,
+          apiKey,
+          async (email, result, index, total) => {
+            // Find the client for this email
+            const client = clientsToVerify.find(c => c.email === email);
+            if (client) {
+              // Update client in database
+              await clientRepository.update(
+                { id: client.id },
+                { millionsStatus: result.status }
+              ).catch(err => console.error(`Error updating client ${client.id}:`, err));
+
+              // Update job status
+              const job = verificationJobs.get(jobId);
+              if (job) {
+                job.completed = index;
+                job.results.push({
+                  clientId: client.id,
+                  email: email,
+                  status: result.status,
+                  result: result.result,
+                  error: result.error,
+                });
+              }
+            }
+          }
+        );
+
+        // Mark job as completed
+        const job = verificationJobs.get(jobId);
+        if (job) {
+          job.status = 'completed';
+          job.completed = job.total;
+          job.endTime = new Date();
+        }
+      } catch (error) {
+        console.error('Verification job error:', error);
+        const job = verificationJobs.get(jobId);
+        if (job) {
+          job.status = 'error';
+          job.error = error.message;
+          job.endTime = new Date();
+        }
+      }
+    })();
+
+    res.json({
+      success: true,
+      jobId,
+      total: emails.length,
+      message: 'Verification started for all "new" status leads',
+    });
+  } catch (error) {
+    console.error('Bulk verify all new error:', error);
+    console.error('Error stack:', error.stack);
+    res.status(500).json({ 
+      error: 'Internal server error',
+      message: error.message,
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
+  }
+}
+
+/**
+ * Get count of new leads that can be verified
+ */
+export async function getNewLeadsVerificationCount(req, res) {
+  try {
+    const clientRepository = AppDataSource.getRepository(Client);
+    
+    // Fetch all clients with status "new" that have emails and are not already verified
+    // Handle both NULL and 'new' as 'new' status (since default is 'new')
+    const clients = await clientRepository
+      .createQueryBuilder('client')
+      .where('client.deletedAt IS NULL')
+      .andWhere('(client.status = :status OR client.status IS NULL)', { status: 'new' })
+      .getMany();
+
+    // Filter out clients without emails or already verified (good/risky)
+    const clientsToVerify = clients.filter(client => {
+      return client.email && 
+             client.email.trim() !== '' && 
+             (!client.millionsStatus || client.millionsStatus === 'bad' || client.millionsStatus === 'error');
+    });
+
+    res.json({
+      count: clientsToVerify.length,
+      totalNew: clients.length,
+      alreadyVerified: clients.length - clientsToVerify.length,
+    });
+  } catch (error) {
+    console.error('Get new leads verification count error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
+/**
+ * Get verification job status
+ */
+export async function getVerificationStatus(req, res) {
+  try {
+    const { jobId } = req.params;
+    
+    if (!jobId) {
+      return res.status(400).json({ error: 'jobId is required' });
+    }
+
+    const job = verificationJobs.get(jobId);
+    
+    if (!job) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    res.json(job);
+  } catch (error) {
+    console.error('Get verification status error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 }

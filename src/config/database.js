@@ -13,7 +13,7 @@ export const AppDataSource = new DataSource({
   password: process.env.DB_PASSWORD || 'postgres',
   database: process.env.DB_NAME || 'email_leads_manager',
   synchronize: process.env.NODE_ENV !== 'production', // Auto-sync schema in development
-  logging: process.env.NODE_ENV === 'development',
+  logging: false, // Disable query logging
   entities: [UserSchema, AccountSchema, EmailSchema, ClientSchema, TemplateSchema, InterviewSchema, LeadFilterSchema],
   migrations: ['src/migrations/**/*.js'],
   subscribers: ['src/subscribers/**/*.js'],
