@@ -220,6 +220,7 @@ export async function uploadLeads(req, res) {
 
     // Parse LeadFilter from request if provided
     let leadFilterId = null;
+    let leadFilterMillionsStatus = null;
     if (req.body.leadFilter) {
       try {
         const leadFilterData = typeof req.body.leadFilter === 'string' 
@@ -235,6 +236,14 @@ export async function uploadLeads(req, res) {
           });
           const savedLeadFilter = await leadFilterRepository.save(leadFilter);
           leadFilterId = savedLeadFilter.id;
+        }
+
+        // Optional: apply Millions status from filter to all uploaded leads
+        if (leadFilterData.millionsStatus) {
+          const normalized = String(leadFilterData.millionsStatus).trim().toLowerCase();
+          if (['good', 'risky', 'bad', 'error'].includes(normalized)) {
+            leadFilterMillionsStatus = normalized;
+          }
         }
       } catch (err) {
         console.error('Error parsing LeadFilter:', err);
@@ -455,6 +464,34 @@ export async function uploadLeads(req, res) {
             'company_city'
           ) || country;
 
+          // Handle Millions verification status (manual CSV column)
+          const rawMillionsStatus = getField(
+            row,
+            'millionsstatus',
+            'millions_status',
+            'millionsverificationstatus',
+            'millions_verification_status',
+            'millions'
+          );
+
+          // If a Millions status was provided in the Lead Filter, use that for all rows.
+          // Otherwise, fall back to any per-row CSV value.
+          let millionsStatus = leadFilterMillionsStatus || null;
+          if (rawMillionsStatus) {
+            const normalized = String(rawMillionsStatus).trim().toLowerCase();
+            // Normalize common variants to the core statuses used in the app
+            if (['good', 'risky', 'bad', 'error'].includes(normalized)) {
+              millionsStatus = normalized;
+            } else if (['valid', 'deliverable'].includes(normalized)) {
+              millionsStatus = 'good';
+            } else if (['risky-valid', 'riskyvalid', 'risky_deliverable'].includes(normalized)) {
+              millionsStatus = 'risky';
+            } else if (['invalid', 'undeliverable', 'blocklisted', 'blocked'].includes(normalized)) {
+              millionsStatus = 'bad';
+            }
+            // Any other values (including "unknown"/"unverified") are treated as null/unset
+          }
+
           const clientData = {
             email: email.toLowerCase().trim(),
             firstName: firstName || null,
@@ -481,6 +518,7 @@ export async function uploadLeads(req, res) {
               return Array.isArray(value) ? value : value.split(',').map(t => t.trim()).filter(t => t);
             })(),
             leadFilterId: leadFilterId,
+            millionsStatus,
           };
 
           // Check if client already exists
@@ -584,19 +622,23 @@ export async function getUncontactedLeads(req, res) {
     const leadFilterMode = req.query.leadFilterMode || 'include'; // 'include' or 'exclude'
     const location = req.query.location;
     const industry = req.query.industry;
+    const verifiedOnly = req.query.verifiedOnly !== 'false'; // default true: only verified (good/risky); false = include unverified
 
     const clientRepository = AppDataSource.getRepository(Client);
 
     // Fetch new uncontacted leads (excluding 'ready' and 'followedup' status - those are managed by extension locally or already followed up)
     // Only fetch leads that haven't been fetched by any extension yet and haven't been followed up
-    // Only return leads with 'good' or 'risky' millionsStatus (prioritize 'good')
     const queryBuilder = clientRepository
       .createQueryBuilder('client')
       .where('client.deletedAt IS NULL')
       .andWhere('(client.isSent = false OR client.isSent IS NULL)') // Only uncontacted leads
       .andWhere('(client.status != :readyStatus OR client.status IS NULL)', { readyStatus: 'ready' }) // Exclude 'ready' status
-      .andWhere('(client.status != :followedupStatus OR client.status IS NULL)', { followedupStatus: 'followedup' }) // Exclude 'followedup' status
-      .andWhere('client.millionsStatus IN (:...millionsStatuses)', { millionsStatuses: ['good', 'risky'] }); // Only 'good' or 'risky' millionsStatus
+      .andWhere('(client.status != :followedupStatus OR client.status IS NULL)', { followedupStatus: 'followedup' }); // Exclude 'followedup' status
+
+    // When verifiedOnly is true (default), only return leads with 'good' or 'risky' millionsStatus
+    if (verifiedOnly) {
+      queryBuilder.andWhere('client.millionsStatus IN (:...millionsStatuses)', { millionsStatuses: ['good', 'risky'] });
+    }
 
     // Filter by leadFilterId if provided (include or exclude)
     if (leadFilterId) {
