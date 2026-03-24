@@ -1,7 +1,7 @@
 import { EntitySchema } from 'typeorm';
 
 export class Email {
-  constructor(id, address, accountId, status, password, twoFa, recoveryEmail, createdAt, updatedAt, deletedAt) {
+  constructor(id, address, accountId, status, password, twoFa, recoveryEmail, grantId, nylasKey, createdAt, updatedAt, deletedAt) {
     this.id = id;
     this.address = address;
     this.accountId = accountId;
@@ -9,6 +9,8 @@ export class Email {
     this.password = password;
     this.twoFa = twoFa;
     this.recoveryEmail = recoveryEmail;
+    this.grantId = grantId;
+    this.nylasKey = nylasKey;
     this.createdAt = createdAt;
     this.updatedAt = updatedAt;
     this.deletedAt = deletedAt;
@@ -51,6 +53,18 @@ export const EmailSchema = new EntitySchema({
     recoveryEmail: {
       type: 'varchar',
       length: 255,
+      nullable: true,
+    },
+    grantId: {
+      name: 'grant_id',
+      type: 'varchar',
+      length: 500,
+      nullable: true,
+    },
+    nylasKey: {
+      name: 'nylas_key',
+      type: 'varchar',
+      length: 1000,
       nullable: true,
     },
     createdAt: {

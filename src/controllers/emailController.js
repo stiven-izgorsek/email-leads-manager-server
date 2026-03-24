@@ -80,6 +80,8 @@ export async function createEmail(req, res) {
       password: req.body.password || null,
       twoFa: req.body.twoFa || req.body['2fa'] || null,
       recoveryEmail: req.body.recoveryEmail || null,
+      grantId: req.body.grantId || req.body.grant_id || null,
+      nylasKey: req.body.nylasKey || req.body.nylas_key || null,
     };
 
     const email = emailRepository.create(emailData);
@@ -94,6 +96,67 @@ export async function createEmail(req, res) {
     res.status(201).json(emailWithAccount);
   } catch (error) {
     console.error('Create email error:', error);
+    if (error.code === '23505') {
+      return res.status(400).json({ error: 'Email already exists' });
+    }
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
+export async function updateEmail(req, res) {
+  try {
+    const emailRepository = AppDataSource.getRepository(Email);
+
+    const email = await emailRepository.findOne({
+      where: { id: req.params.id, deletedAt: null },
+      relations: ['account'],
+    });
+
+    if (!email) {
+      return res.status(404).json({ error: 'Email not found' });
+    }
+
+    if (req.body.address !== undefined) {
+      const nextAddress = String(req.body.address).toLowerCase().trim();
+      if (!nextAddress) {
+        return res.status(400).json({ error: 'Email address is required' });
+      }
+
+      if (nextAddress !== email.address) {
+        const existing = await emailRepository.findOne({
+          where: { address: nextAddress, deletedAt: null },
+        });
+        if (existing && existing.id !== email.id) {
+          return res.status(400).json({ error: 'Email already exists' });
+        }
+      }
+      email.address = nextAddress;
+    }
+
+    if (req.body.status !== undefined) email.status = req.body.status;
+    if (req.body.accountId !== undefined) email.accountId = req.body.accountId || null;
+    if (req.body.password !== undefined) email.password = req.body.password || null;
+    if (req.body.twoFa !== undefined || req.body['2fa'] !== undefined) {
+      email.twoFa = req.body.twoFa || req.body['2fa'] || null;
+    }
+    if (req.body.recoveryEmail !== undefined) email.recoveryEmail = req.body.recoveryEmail || null;
+    if (req.body.grantId !== undefined || req.body.grant_id !== undefined) {
+      email.grantId = req.body.grantId || req.body.grant_id || null;
+    }
+    if (req.body.nylasKey !== undefined || req.body.nylas_key !== undefined) {
+      email.nylasKey = req.body.nylasKey || req.body.nylas_key || null;
+    }
+
+    const updatedEmail = await emailRepository.save(email);
+
+    const emailWithAccount = await emailRepository.findOne({
+      where: { id: updatedEmail.id },
+      relations: ['account'],
+    });
+
+    res.json(emailWithAccount);
+  } catch (error) {
+    console.error('Update email error:', error);
     if (error.code === '23505') {
       return res.status(400).json({ error: 'Email already exists' });
     }
@@ -319,6 +382,8 @@ export async function uploadEmails(req, res) {
             password: getField(row, 'password', 'pass') || null,
             twoFa: getField(row, '2fa', 'twofa', 'two_fa', 'twofactor', 'two_factor') || null,
             recoveryEmail: getField(row, 'recoveryemail', 'recovery_email', 'recovery', 'backupemail', 'backup_email') || null,
+            grantId: getField(row, 'grantid', 'grant_id') || null,
+            nylasKey: getField(row, 'nylaskey', 'nylas_key', 'nylasapikey', 'nylas_api_key') || null,
           };
 
           // Check if email already exists

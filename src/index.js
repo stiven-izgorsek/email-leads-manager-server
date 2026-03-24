@@ -12,6 +12,9 @@ import emailRoutes from './routes/emailRoutes.js';
 import leadRoutes from './routes/leadRoutes.js';
 import userRoutes from './routes/userRoutes.js';
 import templateRoutes from './routes/templateRoutes.js';
+import portfolioRoutes from './routes/portfolioRoutes.js';
+import incomingMessageRoutes from './routes/incomingMessageRoutes.js';
+import { startNylasUnreadPollingJob } from './services/nylasPollingService.js';
 
 // Load environment variables
 dotenv.config();
@@ -42,6 +45,8 @@ app.use('/api/emails', emailRoutes);
 app.use('/api/leads', leadRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api', templateRoutes);
+app.use('/api/portfolios', portfolioRoutes);
+app.use('/api', incomingMessageRoutes);
 
 // Error handling middleware
 app.use((err, req, res, next) => {
@@ -70,6 +75,7 @@ app.use((req, res) => {
 async function startServer() {
   try {
     await connectDatabase();
+    startNylasUnreadPollingJob();
     app.listen(PORT, () => {
       console.log(`Server is running on port ${PORT}`);
       console.log(`Health check: http://localhost:${PORT}/health`);

@@ -1,7 +1,22 @@
 import 'reflect-metadata';
 import { DataSource } from 'typeorm';
 import dotenv from 'dotenv';
-import { UserSchema, AccountSchema, EmailSchema, ClientSchema, TemplateSchema, InterviewSchema, LeadFilterSchema } from '../entities/index.js';
+import {
+  UserSchema,
+  AccountSchema,
+  EmailSchema,
+  ClientSchema,
+  TemplateSchema,
+  InterviewSchema,
+  LeadFilterSchema,
+  PortfolioSchema,
+  PortfolioIndustrySchema,
+  PortfolioWorkExperienceSchema,
+  PortfolioTagSchema,
+  NylasSlackNotificationSchema,
+  IncomingMessageSchema,
+  MessageTypeRuleSchema,
+} from '../entities/index.js';
 
 dotenv.config();
 
@@ -14,7 +29,22 @@ export const AppDataSource = new DataSource({
   database: process.env.DB_NAME || 'email_leads_manager',
   synchronize: process.env.NODE_ENV !== 'production', // Auto-sync schema in development
   logging: false, // Disable query logging
-  entities: [UserSchema, AccountSchema, EmailSchema, ClientSchema, TemplateSchema, InterviewSchema, LeadFilterSchema],
+  entities: [
+    UserSchema,
+    AccountSchema,
+    EmailSchema,
+    ClientSchema,
+    TemplateSchema,
+    InterviewSchema,
+    LeadFilterSchema,
+    PortfolioSchema,
+    PortfolioIndustrySchema,
+    PortfolioWorkExperienceSchema,
+    PortfolioTagSchema,
+    NylasSlackNotificationSchema,
+    IncomingMessageSchema,
+    MessageTypeRuleSchema,
+  ],
   migrations: ['src/migrations/**/*.js'],
   subscribers: ['src/subscribers/**/*.js'],
 });
