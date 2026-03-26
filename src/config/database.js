@@ -16,6 +16,8 @@ import {
   NylasSlackNotificationSchema,
   IncomingMessageSchema,
   MessageTypeRuleSchema,
+  CompanySchema,
+  CompanySavedSearchSchema,
 } from '../entities/index.js';
 
 dotenv.config();
@@ -44,6 +46,8 @@ export const AppDataSource = new DataSource({
     NylasSlackNotificationSchema,
     IncomingMessageSchema,
     MessageTypeRuleSchema,
+    CompanySchema,
+    CompanySavedSearchSchema,
   ],
   migrations: ['src/migrations/**/*.js'],
   subscribers: ['src/subscribers/**/*.js'],

@@ -13,6 +13,7 @@ import leadRoutes from './routes/leadRoutes.js';
 import userRoutes from './routes/userRoutes.js';
 import templateRoutes from './routes/templateRoutes.js';
 import portfolioRoutes from './routes/portfolioRoutes.js';
+import companyRoutes from './routes/companyRoutes.js';
 import incomingMessageRoutes from './routes/incomingMessageRoutes.js';
 import { startNylasUnreadPollingJob } from './services/nylasPollingService.js';
 
@@ -46,6 +47,7 @@ app.use('/api/leads', leadRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api', templateRoutes);
 app.use('/api/portfolios', portfolioRoutes);
+app.use('/api/companies', companyRoutes);
 app.use('/api', incomingMessageRoutes);
 
 // Error handling middleware
