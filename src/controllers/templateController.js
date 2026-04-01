@@ -174,7 +174,8 @@ export async function composeAiEmail(req, res) {
       'Do not use phrases like "I recently came across..." or "I was very impressed..." in the message.',
       'A simple natural greeting at the beginning is fine, for example "Hi John," or "Hello John,".',
       'You may use the portfolio context only to infer relevant experience domains and capability fit, not to name-drop projects.',
-      'Add an emoticon to the subject only occasionally, roughly around 1 out of 3 messages, and at most one emoticon when you do.',
+      'Do not use emoji or emoticon icons in the subject.',
+      'Generate varied subject styles that sound natural, direct, and opportunity-focused.',
     ].join(' ');
 
     const userPrompt = JSON.stringify({
@@ -222,6 +223,14 @@ export async function composeAiEmail(req, res) {
           "I came across your website and wanted to reach out directly. I'm a Senior Software Engineer currently exploring new opportunities and would love to be considered if you have any open or upcoming roles.",
           "My background includes SaaS, Fintech, Healthcare, eCommerce, and AI projects, working mainly with JavaScript/TypeScript, Python, and PHP. I enjoy building scalable products and contributing to teams that value clean, reliable software.",
           "If relevant, I'd be happy to share my CV and portfolio."
+        ],
+        subjectStyleReferences: [
+          "Eager to Contribute as a Web Developer at {{companyName}}",
+          "Ready to Boost Development at {{companyName}}",
+          "Exploring Engineering Roles at {{companyName}}",
+          "Idea for {{companyName}}'s Platform + Engineer Intro",
+          "Inspired by Your Work at {{companyName}}",
+          "Open to join the right build - let's chat"
         ],
         outputFormat: {
           subject: 'string',
