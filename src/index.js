@@ -15,6 +15,7 @@ import templateRoutes from './routes/templateRoutes.js';
 import portfolioRoutes from './routes/portfolioRoutes.js';
 import companyRoutes from './routes/companyRoutes.js';
 import incomingMessageRoutes from './routes/incomingMessageRoutes.js';
+import applicationRoutes from './routes/applicationRoutes.js';
 import { startNylasUnreadPollingJob } from './services/nylasPollingService.js';
 
 // Load environment variables
@@ -49,6 +50,7 @@ app.use('/api', templateRoutes);
 app.use('/api/portfolios', portfolioRoutes);
 app.use('/api/companies', companyRoutes);
 app.use('/api', incomingMessageRoutes);
+app.use('/api', applicationRoutes);
 
 // Error handling middleware
 app.use((err, req, res, next) => {

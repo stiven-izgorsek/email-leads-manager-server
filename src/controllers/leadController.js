@@ -700,6 +700,11 @@ export async function getUncontactedLeads(req, res) {
       firstName: lead.firstName || '',
       company_name: lead.companyName || '',
       companyName: lead.companyName || '',
+      companyUrl: lead.companyUrl || '',
+      industries: lead.industries || [],
+      tech: lead.tech || [],
+      jobTitle: lead.jobTitle || '',
+      companyLocation: lead.companyLocation || '',
       email: lead.email || '',
       icebreaker_title: null, // Can be added later if needed
       icebreaker: null, // Can be added later if needed
