@@ -4,6 +4,8 @@ import {
   getMessageTemplates, 
   createSubjectTemplate, 
   createMessageTemplate,
+  generateMessageTemplates,
+  updateMessageTemplate,
   composeEmailFromTemplates,
   composeAiEmail
 } from '../controllers/templateController.js';
@@ -17,6 +19,8 @@ router.post('/subject-templates', createSubjectTemplate);
 // Message templates endpoints
 router.get('/message-templates', getMessageTemplates);
 router.post('/message-templates', createMessageTemplate);
+router.post('/message-templates/generate', generateMessageTemplates);
+router.put('/message-templates/:id', updateMessageTemplate);
 
 // Compose email (backend selects templates + renders {{...}} placeholders)
 router.post('/compose-email', composeEmailFromTemplates);

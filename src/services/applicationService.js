@@ -106,7 +106,7 @@ export async function createChatCompletion(messages) {
       body: JSON.stringify({
         model,
         messages,
-        temperature: 0.7,
+        temperature: 0.2,
       }),
       signal: controller.signal,
     });

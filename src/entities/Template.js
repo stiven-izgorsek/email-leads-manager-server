@@ -1,12 +1,14 @@
 import { EntitySchema } from 'typeorm';
 
 export class Template {
-  constructor(id, content, type, tech, industries, createdAt, updatedAt, deletedAt) {
+  constructor(id, content, type, tech, industries, size, usedCount, createdAt, updatedAt, deletedAt) {
     this.id = id;
     this.content = content;
     this.type = type;
     this.tech = tech;
     this.industries = industries;
+    this.size = size;
+    this.usedCount = usedCount;
     this.createdAt = createdAt;
     this.updatedAt = updatedAt;
     this.deletedAt = deletedAt;
@@ -38,6 +40,17 @@ export const TemplateSchema = new EntitySchema({
     industries: {
       type: 'simple-array',
       nullable: true,
+    },
+    size: {
+      type: 'varchar',
+      length: 20,
+      nullable: true,
+      default: 'normal',
+    },
+    usedCount: {
+      type: 'int',
+      nullable: false,
+      default: 0,
     },
     createdAt: {
       type: 'timestamp',

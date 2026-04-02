@@ -1,11 +1,25 @@
-const ABOUT_PATH_CANDIDATES = [
-  '/',
-  '/about',
-  '/about-us',
-  '/who-we-are',
-  '/company',
-  '/our-story',
-  '/team',
+const MAX_PAGES = 6;
+const HOME_TEXT_LIMIT = 12000;
+const PAGE_TEXT_LIMIT = 8000;
+const COMBINED_TEXT_LIMIT = 32000;
+const CONCURRENCY_LIMIT = 3;
+const FETCH_TIMEOUT_MS = 8000;
+
+const PRIORITY_PATH_CANDIDATES = [
+  '/about', '/about-us', '/about-the-company', '/company', '/our-story', '/who-we-are',
+  '/mission', '/vision', '/our-mission',
+  '/product', '/products', '/platform', '/solution', '/solutions',
+  '/features', '/technology', '/tech', '/how-it-works',
+  '/customers', '/industries', '/use-cases', '/case-studies',
+  '/enterprise', '/for-business',
+  '/services', '/what-we-do', '/team',
+];
+
+const VALUABLE_LINK_PATTERNS = [
+  /about/i, /company/i, /who we are/i, /our story/i, /mission/i,
+  /product/i, /platform/i, /solution/i, /feature/i, /technology/i,
+  /how it works/i, /what we do/i, /service/i, /industry/i,
+  /customer/i, /use.?case/i, /case.?stud/i, /enterprise/i,
 ];
 
 function normalizeUrl(rawUrl) {
@@ -21,6 +35,15 @@ function toAbsoluteUrl(baseUrl, href) {
     return new URL(href, baseUrl).toString();
   } catch {
     return null;
+  }
+}
+
+function normalizeTrailingSlash(url) {
+  try {
+    const u = new URL(url);
+    return (u.origin + u.pathname).replace(/\/$/, '') + (u.search || '');
+  } catch {
+    return url;
   }
 }
 
@@ -45,29 +68,38 @@ function extractTitle(html) {
   return match ? stripHtmlToText(match[1]).slice(0, 200) : '';
 }
 
-function extractAboutLinks(html, baseUrl) {
-  const hrefMatches = Array.from(String(html || '').matchAll(/<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi));
-  const discovered = new Set();
+function extractValuableLinks(html, baseUrl) {
+  const links = new Set();
+  const anchorRe = /<a[^>]+href=["']([^"'#?][^"']*)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  let match;
 
-  for (const match of hrefMatches) {
-    const href = match[1];
-    const anchorText = stripHtmlToText(match[2]).toLowerCase();
-    const hrefLower = String(href || '').toLowerCase();
-    const looksRelevant =
-      /about|who-we-are|our-story|company|team/.test(hrefLower) ||
-      /about|who we are|our story|company|team/.test(anchorText);
+  while ((match = anchorRe.exec(html)) !== null) {
+    const href = match[1].trim();
+    const text = match[2].replace(/<[^>]+>/g, '').trim();
 
-    if (!looksRelevant) continue;
-    const abs = toAbsoluteUrl(baseUrl, href);
-    if (abs) discovered.add(abs);
+    const isValuableHref = VALUABLE_LINK_PATTERNS.some((re) => re.test(href));
+    const isValuableText = VALUABLE_LINK_PATTERNS.some((re) => re.test(text));
+    if (!isValuableHref && !isValuableText) continue;
+
+    const absolute = toAbsoluteUrl(baseUrl, href);
+    if (!absolute) continue;
+
+    try {
+      if (new URL(absolute).hostname !== new URL(baseUrl).hostname) continue;
+    } catch {
+      continue;
+    }
+
+    links.add(normalizeTrailingSlash(absolute));
   }
 
-  return Array.from(discovered).slice(0, 4);
+  return [...links];
 }
 
-async function fetchHtml(url) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 10000);
+async function fetchHtml(url, options = {}) {
+  const controller = options.signal ? null : new AbortController();
+  const signal = options.signal || controller?.signal;
+  const timeout = controller ? setTimeout(() => controller.abort(), 10000) : null;
   try {
     const res = await fetch(url, {
       method: 'GET',
@@ -76,7 +108,7 @@ async function fetchHtml(url) {
         'Accept': 'text/html,application/xhtml+xml',
       },
       redirect: 'follow',
-      signal: controller.signal,
+      signal,
     });
     if (!res.ok) return null;
     const contentType = res.headers.get('content-type') || '';
@@ -86,69 +118,105 @@ async function fetchHtml(url) {
   } catch {
     return null;
   } finally {
-    clearTimeout(timeout);
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+async function fetchWithConcurrency(tasks, limit) {
+  const results = [];
+  const queue = [...tasks];
+  const active = [];
+
+  while (queue.length > 0 || active.length > 0) {
+    while (active.length < limit && queue.length > 0) {
+      const task = queue.shift();
+      const promise = task().then((result) => {
+        active.splice(active.indexOf(promise), 1);
+        results.push(result);
+      });
+      active.push(promise);
+    }
+    await Promise.race(active);
+  }
+
+  return results;
+}
+
+async function safeFetchHtml(url, timeoutMs = FETCH_TIMEOUT_MS) {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const result = await fetchHtml(url, { signal: controller.signal });
+    clearTimeout(timer);
+    return result;
+  } catch {
+    return null;
   }
 }
 
 export async function fetchWebsiteContentSummary(rawUrl) {
   const normalized = normalizeUrl(rawUrl);
   if (!normalized) {
-    return {
-      sourceUrl: null,
-      pages: [],
-      combinedText: '',
-    };
+    return { sourceUrl: null, pages: [], combinedText: '' };
   }
 
   const visited = new Set();
   const pages = [];
 
-  const home = await fetchHtml(normalized);
-  if (home) {
-    visited.add(home.url);
-    const title = extractTitle(home.html);
-    const text = stripHtmlToText(home.html).slice(0, 12000);
-    pages.push({ url: home.url, title, text });
+  const addPage = (url, html, textLimit) => {
+    visited.add(normalizeTrailingSlash(url));
+    pages.push({
+      url,
+      title: extractTitle(html),
+      text: stripHtmlToText(html).slice(0, textLimit),
+    });
+  };
 
-    const discoveredAboutLinks = extractAboutLinks(home.html, home.url);
-    for (const link of discoveredAboutLinks) {
-      if (visited.has(link)) continue;
-      const page = await fetchHtml(link);
-      if (!page) continue;
-      visited.add(page.url);
-      pages.push({
-        url: page.url,
-        title: extractTitle(page.html),
-        text: stripHtmlToText(page.html).slice(0, 8000),
-      });
-      if (pages.length >= 4) break;
-    }
+  const home = await safeFetchHtml(normalized);
+  if (home) {
+    addPage(home.url, home.html, HOME_TEXT_LIMIT);
   }
 
-  if (pages.length < 2) {
-    for (const path of ABOUT_PATH_CANDIDATES) {
-      const candidate = toAbsoluteUrl(normalized, path);
-      if (!candidate || visited.has(candidate)) continue;
-      const page = await fetchHtml(candidate);
-      if (!page) continue;
-      visited.add(page.url);
-      pages.push({
-        url: page.url,
-        title: extractTitle(page.html),
-        text: stripHtmlToText(page.html).slice(0, 8000),
-      });
-      if (pages.length >= 4) break;
-    }
+  const discovered = home ? extractValuableLinks(home.html, home.url) : [];
+
+  const fallbackCandidates = PRIORITY_PATH_CANDIDATES
+    .map((path) => toAbsoluteUrl(normalized, path))
+    .filter(Boolean)
+    .map(normalizeTrailingSlash);
+
+  const seenCandidates = new Set();
+  const candidateQueue = [...discovered, ...fallbackCandidates].filter((url) => {
+    if (!url || visited.has(url) || seenCandidates.has(url)) return false;
+    seenCandidates.add(url);
+    return true;
+  });
+
+  const remaining = () => MAX_PAGES - pages.length;
+
+  const tasks = candidateQueue.slice(0, MAX_PAGES * 2).map((url) => async () => {
+    if (remaining() <= 0 || visited.has(url)) return null;
+    const page = await safeFetchHtml(url);
+    if (!page) return null;
+    const canonicalUrl = normalizeTrailingSlash(page.url);
+    if (visited.has(canonicalUrl)) return null;
+    return { url: page.url, canonicalUrl, html: page.html };
+  });
+
+  const fetched = await fetchWithConcurrency(tasks, CONCURRENCY_LIMIT);
+
+  for (const result of fetched) {
+    if (!result || remaining() <= 0) continue;
+    if (visited.has(result.canonicalUrl)) continue;
+    addPage(result.url, result.html, PAGE_TEXT_LIMIT);
   }
 
   const combinedText = pages
-    .map((page) => `URL: ${page.url}\nTITLE: ${page.title}\nCONTENT:\n${page.text}`)
+    .map(
+      (page) =>
+        `### PAGE: ${page.title || '(no title)'}\nURL: ${page.url}\n\n${page.text}`
+    )
     .join('\n\n---\n\n')
-    .slice(0, 24000);
+    .slice(0, COMBINED_TEXT_LIMIT);
 
-  return {
-    sourceUrl: normalized,
-    pages,
-    combinedText,
-  };
+  return { sourceUrl: normalized, pages, combinedText };
 }
