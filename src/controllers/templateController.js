@@ -62,6 +62,19 @@ async function incrementTemplateUsedCount(templateRepository, id) {
   }
 }
 
+/** Whitelist sort columns for template list endpoints (query params sortBy / sortOrder). */
+function parseTemplateListSort(sortBy, sortOrder) {
+  const order = String(sortOrder || 'desc').toLowerCase() === 'asc' ? 'ASC' : 'DESC';
+  const key = String(sortBy || 'createdAt').toLowerCase();
+  const columnByKey = {
+    used: 'template.usedCount',
+    content: 'template.content',
+    createdat: 'template.createdAt',
+  };
+  const column = columnByKey[key] || 'template.createdAt';
+  return { column, order };
+}
+
 async function findMessageTemplateForIndustryAndSize(templateRepository, messageType, industry, size) {
   return templateRepository
     .createQueryBuilder('template')
@@ -447,9 +460,14 @@ export async function getSubjectTemplates(req, res) {
       });
     }
 
+    const { column: sortColumn, order: sortOrderSql } = parseTemplateListSort(
+      req.query.sortBy,
+      req.query.sortOrder
+    );
+
     const [data, total] = await Promise.all([
       queryBuilder
-        .orderBy('template.createdAt', 'DESC')
+        .orderBy(sortColumn, sortOrderSql)
         .skip(skip)
         .take(limit)
         .getMany(),
@@ -898,9 +916,14 @@ export async function getMessageTemplates(req, res) {
       countQuery.andWhere('template.size = :size', { size: req.query.size });
     }
 
+    const { column: sortColumn, order: sortOrderSql } = parseTemplateListSort(
+      req.query.sortBy,
+      req.query.sortOrder
+    );
+
     const [data, total] = await Promise.all([
       queryBuilder
-        .orderBy('template.createdAt', 'DESC')
+        .orderBy(sortColumn, sortOrderSql)
         .skip(skip)
         .take(limit)
         .getMany(),

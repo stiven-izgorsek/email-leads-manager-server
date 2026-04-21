@@ -138,6 +138,73 @@ export async function getLeads(req, res) {
   }
 }
 
+export async function downloadNewLeadsCsv(req, res) {
+  try {
+    const clientRepository = AppDataSource.getRepository(Client);
+    const leads = await clientRepository
+      .createQueryBuilder('client')
+      .where('client.deletedAt IS NULL')
+      .andWhere('(client.status = :status OR client.status IS NULL)', { status: 'new' })
+      .orderBy('client.createdAt', 'DESC')
+      .getMany();
+
+    const columns = [
+      'id',
+      'email',
+      'firstName',
+      'lastName',
+      'companyName',
+      'jobTitle',
+      'status',
+      'location',
+      'companyLocation',
+      'linkedin',
+      'companyUrl',
+      'industries',
+      'tech',
+      'employees',
+      'contactedBy',
+      'millionsStatus',
+      'isSent',
+      'isReplied',
+      'isFollowup',
+      'lastSent',
+      'createdAt',
+      'updatedAt',
+      'note',
+    ];
+
+    const toCsvCell = (value) => {
+      if (value === null || value === undefined) return '';
+      if (Array.isArray(value)) return value.join('; ');
+      const str = String(value)
+        .replace(/\r\n/g, '\n')
+        .replace(/\r/g, '\n')
+        .replace(/\n/g, ' ');
+      return /[",\n]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
+    };
+
+    const lines = [columns.join(',')];
+    for (const lead of leads) {
+      const row = columns.map((k) => toCsvCell(lead[k]));
+      lines.push(row.join(','));
+    }
+
+    const now = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    const stamp = `${now.getUTCFullYear()}${pad(now.getUTCMonth() + 1)}${pad(now.getUTCDate())}-${pad(
+      now.getUTCHours()
+    )}${pad(now.getUTCMinutes())}${pad(now.getUTCSeconds())}`;
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="new-leads-${stamp}.csv"`);
+    res.status(200).send('\uFEFF' + lines.join('\n'));
+  } catch (error) {
+    console.error('downloadNewLeadsCsv error:', error);
+    res.status(500).json({ error: 'Failed to export new leads CSV' });
+  }
+}
+
 export async function createLead(req, res) {
   try {
     const clientRepository = AppDataSource.getRepository(Client);

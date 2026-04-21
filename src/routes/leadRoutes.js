@@ -2,7 +2,7 @@ import express from 'express';
 import multer from 'multer';
 import path from 'path';
 import os from 'os';
-import { getLeads, createLead, uploadLeads, bulkDeleteLeads, bulkUpdateLeads, getUncontactedLeads, getLeadFilters, markClientAsSent, markClientAsFollowedUp, checkLeadsStatus, getDashboardKPIs, resetLeadsStatus, getEmailsSentInDateRange, bulkVerifyEmails, bulkVerifyAllNew, getNewLeadsVerificationCount, getVerificationStatus } from '../controllers/leadController.js';
+import { getLeads, createLead, uploadLeads, bulkDeleteLeads, bulkUpdateLeads, getUncontactedLeads, getLeadFilters, markClientAsSent, markClientAsFollowedUp, checkLeadsStatus, getDashboardKPIs, resetLeadsStatus, getEmailsSentInDateRange, bulkVerifyEmails, bulkVerifyAllNew, getNewLeadsVerificationCount, getVerificationStatus, downloadNewLeadsCsv } from '../controllers/leadController.js';
 // import { authenticateToken } from '../middleware/auth.js';
 
 const router = express.Router();
@@ -35,6 +35,7 @@ router.post('/reset-status', resetLeadsStatus);
 router.post('/bulk-verify-emails', bulkVerifyEmails);
 router.post('/bulk-verify-all-new', bulkVerifyAllNew);
 router.get('/new-leads-verification-count', getNewLeadsVerificationCount);
+router.get('/download-new-csv', downloadNewLeadsCsv);
 router.get('/verification-status/:jobId', getVerificationStatus);
 router.put('/:clientId/mark-sent', markClientAsSent);
 router.post('/mark-followed-up', markClientAsFollowedUp);
