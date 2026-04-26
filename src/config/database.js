@@ -18,6 +18,7 @@ import {
   MessageTypeRuleSchema,
   CompanySchema,
   CompanySavedSearchSchema,
+  CrmClientSchema,
 } from '../entities/index.js';
 
 dotenv.config();
@@ -48,6 +49,7 @@ export const AppDataSource = new DataSource({
     MessageTypeRuleSchema,
     CompanySchema,
     CompanySavedSearchSchema,
+    CrmClientSchema,
   ],
   migrations: ['src/migrations/**/*.js'],
   subscribers: ['src/subscribers/**/*.js'],

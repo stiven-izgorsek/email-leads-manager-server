@@ -14,3 +14,4 @@ export { IncomingMessage, IncomingMessageSchema } from './IncomingMessage.js';
 export { MessageTypeRule, MessageTypeRuleSchema } from './MessageTypeRule.js';
 export { Company, CompanySchema, COMPANY_STATUSES } from './Company.js';
 export { CompanySavedSearch, CompanySavedSearchSchema } from './CompanySavedSearch.js';
+export { CrmClient, CrmClientSchema, CRM_CLIENT_STATUSES } from './CrmClient.js';
