@@ -32,6 +32,38 @@ function normalizeList(items) {
   }).filter(Boolean);
 }
 
+/** Sender domains we skip classifying and never notify Slack for (marketing / platform mail). */
+const IGNORED_SENDER_EMAIL_DOMAINS = ['linkedin.com', 'xing.com', 'medium.com', 'indeed.com'];
+
+/**
+ * @param {string} addr
+ * @returns {string}
+ */
+function domainFromEmailAddress(addr) {
+  const raw = String(addr || '').trim().toLowerCase();
+  const angle = raw.match(/<([^>]+)>/);
+  const inner = (angle ? angle[1] : raw).trim();
+  const at = inner.lastIndexOf('@');
+  if (at === -1) return '';
+  return inner.slice(at + 1);
+}
+
+/**
+ * True if any From address uses one of {@link IGNORED_SENDER_EMAIL_DOMAINS} (host or subdomain).
+ * @param {string[]} fromAddresses
+ */
+function isIgnoredMarketingSender(fromAddresses) {
+  const list = Array.isArray(fromAddresses) ? fromAddresses : [];
+  for (const item of list) {
+    const domain = domainFromEmailAddress(item);
+    if (!domain) continue;
+    for (const suffix of IGNORED_SENDER_EMAIL_DOMAINS) {
+      if (domain === suffix || domain.endsWith('.' + suffix)) return true;
+    }
+  }
+  return false;
+}
+
 function getMessageBody(message) {
   return message?.body || message?.snippet || message?.text || '';
 }
@@ -86,6 +118,16 @@ function normalizeSlackMessageText(text) {
     .replace(/\r/g, '')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+}
+
+/**
+ * Warm-up threads often append machine tokens to subject lines, e.g.
+ * "Mattew - can I help? | DVRXVG6 B04JHEK". We don't want Slack noise for those.
+ */
+function isWarmupTokenSubject(subject) {
+  const s = String(subject || '').trim();
+  if (!s) return false;
+  return /\|\s*[A-Z0-9]{5,}\s+[A-Z0-9]{5,}\s*$/.test(s);
 }
 
 async function sendMessageToSlack({ emailAccount, subject, from, to, body }) {
@@ -207,7 +249,30 @@ async function fetchUnreadMessagesForMailbox(emailRow) {
     const toAddresses = normalizeList(message?.to);
     const subject = message?.subject || '(no subject)';
     const body = getMessageBody(message);
-    const classification = classifyIncomingMessage({
+    const receivedAt = message?.date ? new Date(message.date * 1000) : null;
+
+    if (isIgnoredMarketingSender(fromAddresses)) {
+      try {
+        await incomingRepo.save(
+          incomingRepo.create({
+            emailAddress: emailRow.address,
+            messageId,
+            subject,
+            fromEmail: fromAddresses[0] || null,
+            messageType: 'ignored_sender',
+            receivedAt,
+            isRead: false,
+          })
+        );
+      } catch (error) {
+        if (error?.code !== '23505') {
+          console.error('[NYLAS] Failed storing ignored-sender incoming message:', error.message || error);
+        }
+      }
+      continue;
+    }
+
+    const classification = await classifyIncomingMessage({
       subject,
       body,
       fromEmail: fromAddresses.join(', '),
@@ -215,7 +280,6 @@ async function fetchUnreadMessagesForMailbox(emailRow) {
       rules: messageTypeRules,
     });
     const messageType = classification.messageType;
-    const receivedAt = message?.date ? new Date(message.date * 1000) : null;
     const slackPayload = {
       emailAccount: emailRow.address,
       subject,
@@ -224,7 +288,11 @@ async function fetchUnreadMessagesForMailbox(emailRow) {
       body,
     };
 
-    const shouldSendSlack = messageType === 'interest' && !alreadyNotifiedIds.has(messageId);
+    const isWarmupSubject = isWarmupTokenSubject(subject);
+    const shouldSendSlack =
+      messageType === 'interest' &&
+      !isWarmupSubject &&
+      !alreadyNotifiedIds.has(messageId);
     if (shouldSendSlack) {
       try {
         await sendMessageToSlack(slackPayload);
@@ -253,8 +321,10 @@ async function fetchUnreadMessagesForMailbox(emailRow) {
           emailAddress: emailRow.address,
           messageId,
           subject,
+            fromEmail: fromAddresses[0] || null,
           messageType,
           receivedAt,
+            isRead: false,
         })
       );
     } catch (error) {
@@ -287,7 +357,6 @@ async function pollUnreadEmails() {
       } catch (error) {
         console.error(`[NYLAS] Failed polling ${emailRow.address}:`, error.message || error, {
           grantId: emailRow.grantId,
-          nylasKey: emailRow.nylasKey,
         });
       }
     }

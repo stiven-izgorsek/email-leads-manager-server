@@ -119,6 +119,45 @@ function applyFilters(qb, query) {
   }
 }
 
+/** Whitelist-only ORDER BY for CRM client list (prevents SQL injection). */
+function applyCrmClientSort(qb, sortBy, sortOrder) {
+  const o = sortOrder === 'ASC' ? 'ASC' : 'DESC';
+  const nl = 'NULLS LAST';
+  switch (sortBy) {
+    case 'clientName':
+      qb.orderBy('c.firstName', o, nl).addOrderBy('c.lastName', o, nl);
+      break;
+    case 'email':
+      qb.orderBy('c.email', o, nl);
+      break;
+    case 'country':
+      qb.orderBy('c.country', o, nl);
+      break;
+    case 'sentByAccount':
+      qb.orderBy('c.sentByAccount', o, nl);
+      break;
+    case 'rating':
+      qb.orderBy('c.rating', o, nl);
+      break;
+    case 'status':
+      qb.orderBy('c.status', o, nl);
+      break;
+    case 'followUpAt':
+      qb.orderBy('c.followUpAt', o, nl);
+      break;
+    case 'connectedAt':
+      qb.orderBy('c.connectedAt', o, nl);
+      break;
+    case 'createdAt':
+      qb.orderBy('c.createdAt', o, nl);
+      break;
+    case 'updatedAt':
+    default:
+      qb.orderBy('c.updatedAt', o, nl);
+      break;
+  }
+}
+
 export async function listCrmClients(req, res) {
   try {
     const page = Math.max(1, parseInt(req.query.page, 10) || 1);
@@ -127,17 +166,21 @@ export async function listCrmClients(req, res) {
 
     const sortByRaw = String(req.query.sortBy || 'updatedAt');
     const sortOrderRaw = String(req.query.sortOrder || 'DESC').toUpperCase();
+    const sortOrder = sortOrderRaw === 'ASC' ? 'ASC' : 'DESC';
+
     const allowedSorts = new Set([
       'updatedAt',
       'createdAt',
+      'clientName',
+      'email',
+      'country',
+      'sentByAccount',
       'rating',
       'status',
-      'email',
       'followUpAt',
       'connectedAt',
     ]);
     const sortBy = allowedSorts.has(sortByRaw) ? sortByRaw : 'updatedAt';
-    const sortOrder = sortOrderRaw === 'ASC' ? 'ASC' : 'DESC';
 
     const repo = AppDataSource.getRepository(CrmClient);
 
@@ -145,12 +188,9 @@ export async function listCrmClients(req, res) {
     applyFilters(qbCount, req.query);
     const total = await qbCount.getCount();
 
-    const qb = repo
-      .createQueryBuilder('c')
-      .where('c.deletedAt IS NULL')
-      .orderBy(`c.${sortBy}`, sortOrder, 'NULLS LAST')
-      .skip(skip)
-      .take(limit);
+    const qb = repo.createQueryBuilder('c').where('c.deletedAt IS NULL');
+    applyCrmClientSort(qb, sortBy, sortOrder);
+    qb.skip(skip).take(limit);
     applyFilters(qb, req.query);
     const rows = await qb.getMany();
 

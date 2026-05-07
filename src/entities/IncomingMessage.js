@@ -26,6 +26,11 @@ export const IncomingMessageSchema = new EntitySchema({
       type: 'text',
       nullable: true,
     },
+    fromEmail: {
+      type: 'varchar',
+      length: 255,
+      nullable: true,
+    },
     messageType: {
       type: 'varchar',
       length: 100,
@@ -34,6 +39,10 @@ export const IncomingMessageSchema = new EntitySchema({
     receivedAt: {
       type: 'timestamp',
       nullable: true,
+    },
+    isRead: {
+      type: 'boolean',
+      default: false,
     },
     createdAt: {
       type: 'timestamp',

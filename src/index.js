@@ -17,6 +17,7 @@ import companyRoutes from './routes/companyRoutes.js';
 import crmClientRoutes from './routes/crmClientRoutes.js';
 import incomingMessageRoutes from './routes/incomingMessageRoutes.js';
 import applicationRoutes from './routes/applicationRoutes.js';
+import calendarRoutes from './routes/calendarRoutes.js';
 import { startNylasUnreadPollingJob } from './services/nylasPollingService.js';
 
 // Load environment variables
@@ -29,6 +30,11 @@ const PORT = process.env.PORT || 4000;
 app.use(cors({
   origin: true, // Allow all origins
   credentials: true,
+  exposedHeaders: [
+    'X-Apollo-Total-Fetched',
+    'X-Apollo-Total-After-Founded-Year',
+    'X-Apollo-Min-Founded-Year',
+  ],
 }));
 
 // JSON parser - handle errors in middleware
@@ -53,6 +59,7 @@ app.use('/api/companies', companyRoutes);
 app.use('/api/crm-clients', crmClientRoutes);
 app.use('/api', incomingMessageRoutes);
 app.use('/api', applicationRoutes);
+app.use('/api/calendar', calendarRoutes);
 
 // Error handling middleware
 app.use((err, req, res, next) => {

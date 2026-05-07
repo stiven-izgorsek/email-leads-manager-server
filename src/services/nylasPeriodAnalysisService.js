@@ -195,7 +195,7 @@ export async function analyzeNylasMessagesForPeriod({ preset, n }) {
         const subject = message?.subject || '';
         const body = getMessageBody(message);
 
-        const classification = classifyIncomingMessage({
+        const classification = await classifyIncomingMessage({
           subject,
           body,
           fromEmail: fromAddresses.join(', '),

@@ -1393,11 +1393,12 @@ export async function bulkVerifyAllNew(req, res) {
       .andWhere('(client.status = :status OR client.status IS NULL)', { status: 'new' })
       .getMany();
 
-    // Filter out clients without emails or already verified (good/risky)
+    // Filter out clients without emails or already verified.
+    // Verify only "Not Verified" (null/empty) for "Verify All New" flow.
     const clientsToVerify = clients.filter(client => {
       return client.email && 
              client.email.trim() !== '' && 
-             (!client.millionsStatus || client.millionsStatus === 'bad' || client.millionsStatus === 'error');
+             (!client.millionsStatus || String(client.millionsStatus).trim() === '');
     });
 
     if (clientsToVerify.length === 0) {
@@ -1499,11 +1500,12 @@ export async function getNewLeadsVerificationCount(req, res) {
       .andWhere('(client.status = :status OR client.status IS NULL)', { status: 'new' })
       .getMany();
 
-    // Filter out clients without emails or already verified (good/risky)
+    // Filter out clients without emails or already verified.
+    // Verify only "Not Verified" (null/empty) for "Verify All New" flow.
     const clientsToVerify = clients.filter(client => {
       return client.email && 
              client.email.trim() !== '' && 
-             (!client.millionsStatus || client.millionsStatus === 'bad' || client.millionsStatus === 'error');
+             (!client.millionsStatus || String(client.millionsStatus).trim() === '');
     });
 
     res.json({

@@ -1,12 +1,78 @@
 import { AppDataSource } from '../config/database.js';
 import { IncomingMessage } from '../entities/IncomingMessage.js';
 import { MessageTypeRule } from '../entities/MessageTypeRule.js';
+import { Email } from '../entities/Email.js';
 import {
   classifyIncomingMessage,
   ensureDefaultMessageTypeRules,
   loadMessageTypeRules,
 } from '../services/messageTypeService.js';
 import { analyzeNylasMessagesForPeriod } from '../services/nylasPeriodAnalysisService.js';
+
+const configuredNylasRegion = (process.env.NYLAS_REGION || '').toLowerCase();
+
+function getNylasBaseUrls() {
+  if (configuredNylasRegion === 'us') return ['https://api.us.nylas.com'];
+  if (configuredNylasRegion === 'eu') return ['https://api.eu.nylas.com'];
+  return ['https://api.eu.nylas.com', 'https://api.us.nylas.com'];
+}
+
+function normalizeList(items) {
+  if (!Array.isArray(items)) return [];
+  return items
+    .map((item) => {
+      if (typeof item === 'string') return item;
+      const name = String(item?.name || '').trim();
+      const email = String(item?.email || '').trim();
+      if (name && email) return `${name} <${email}>`;
+      return email || '';
+    })
+    .filter(Boolean);
+}
+
+/** Nylas sometimes returns `body` as a string; older/alternate shapes may nest HTML/text. */
+function extractNylasMessageBody(message) {
+  if (!message) return '';
+  const b = message.body;
+  if (typeof b === 'string') return b;
+  if (b != null && typeof b === 'object') {
+    if (typeof b.value === 'string') return b.value;
+    if (typeof b.content === 'string') return b.content;
+  }
+  if (typeof message.text === 'string') return message.text;
+  if (typeof message.snippet === 'string') return message.snippet;
+  return '';
+}
+
+async function fetchNylasMessageById(grantId, nylasKey, messageId) {
+  let lastError = null;
+  for (const baseUrl of getNylasBaseUrls()) {
+    try {
+      const response = await fetch(`${baseUrl}/v3/grants/${grantId}/messages/${messageId}`, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${nylasKey}`,
+          Accept: 'application/json',
+        },
+      });
+      if (response.ok) {
+        const payload = await response.json();
+        return payload?.data || payload;
+      }
+      const text = await response.text().catch(() => '');
+      const err = new Error(`Nylas fetch failed (${response.status}) on ${baseUrl}: ${text || response.statusText}`);
+      err.status = response.status;
+      lastError = err;
+      // In auto region mode, keep trying the next region even on 401/403,
+      // because some mailboxes are valid only on the other Nylas base URL.
+      if (configuredNylasRegion) break;
+    } catch (error) {
+      lastError = error;
+      if (configuredNylasRegion) break;
+    }
+  }
+  throw lastError || new Error('Failed to fetch message from Nylas');
+}
 
 export async function listIncomingMessages(req, res) {
   try {
@@ -29,6 +95,17 @@ export async function listIncomingMessages(req, res) {
         { search: `%${req.query.search}%` }
       );
     }
+    const todayOnly = String(req.query.todayOnly || 'true').toLowerCase() !== 'false';
+    if (todayOnly) {
+      const start = new Date();
+      start.setHours(0, 0, 0, 0);
+      const end = new Date();
+      end.setHours(23, 59, 59, 999);
+      qb.andWhere('COALESCE(m.receivedAt, m.createdAt) >= :start AND COALESCE(m.receivedAt, m.createdAt) <= :end', {
+        start,
+        end,
+      });
+    }
 
     const [data, total] = await Promise.all([
       qb.orderBy('COALESCE(m.receivedAt, m.createdAt)', 'DESC').skip(skip).take(limit).getMany(),
@@ -44,6 +121,94 @@ export async function listIncomingMessages(req, res) {
     });
   } catch (error) {
     console.error('listIncomingMessages error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
+export async function getIncomingUnreadCount(req, res) {
+  try {
+    const repo = AppDataSource.getRepository(IncomingMessage);
+    const qb = repo.createQueryBuilder('m').where('m.isRead = :isRead', { isRead: false });
+    const todayOnly = String(req.query.todayOnly || 'true').toLowerCase() !== 'false';
+    if (todayOnly) {
+      const start = new Date();
+      start.setHours(0, 0, 0, 0);
+      const end = new Date();
+      end.setHours(23, 59, 59, 999);
+      qb.andWhere('COALESCE(m.receivedAt, m.createdAt) >= :start AND COALESCE(m.receivedAt, m.createdAt) <= :end', {
+        start,
+        end,
+      });
+    }
+    const unread = await qb.getCount();
+    res.json({ unread });
+  } catch (error) {
+    console.error('getIncomingUnreadCount error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
+export async function markAllIncomingAsRead(req, res) {
+  try {
+    const repo = AppDataSource.getRepository(IncomingMessage);
+    const todayOnly = String(req.body?.todayOnly ?? 'true').toLowerCase() !== 'false';
+    const qb = repo
+      .createQueryBuilder()
+      .update(IncomingMessage)
+      .set({ isRead: true })
+      .where('isRead = :isRead', { isRead: false });
+
+    if (todayOnly) {
+      const start = new Date();
+      start.setHours(0, 0, 0, 0);
+      const end = new Date();
+      end.setHours(23, 59, 59, 999);
+      qb.andWhere('COALESCE(receivedAt, createdAt) >= :start AND COALESCE(receivedAt, createdAt) <= :end', {
+        start,
+        end,
+      });
+    }
+
+    const result = await qb.execute();
+    res.json({ updated: result.affected || 0 });
+  } catch (error) {
+    console.error('markAllIncomingAsRead error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
+export async function listLatestUnreadIncoming(req, res) {
+  try {
+    const repo = AppDataSource.getRepository(IncomingMessage);
+    const limit = Math.min(10, Math.max(1, parseInt(req.query.limit, 10) || 3));
+    const qb = repo.createQueryBuilder('m').where('m.isRead = :isRead', { isRead: false });
+    const todayOnly = String(req.query.todayOnly || 'true').toLowerCase() !== 'false';
+    if (todayOnly) {
+      const start = new Date();
+      start.setHours(0, 0, 0, 0);
+      const end = new Date();
+      end.setHours(23, 59, 59, 999);
+      qb.andWhere('COALESCE(m.receivedAt, m.createdAt) >= :start AND COALESCE(m.receivedAt, m.createdAt) <= :end', {
+        start,
+        end,
+      });
+    }
+
+    const rows = await qb
+      .orderBy('COALESCE(m.receivedAt, m.createdAt)', 'DESC')
+      .take(limit)
+      .getMany();
+
+    res.json({
+      data: rows.map((r) => ({
+        id: r.id,
+        emailAddress: r.emailAddress,
+        fromEmail: r.fromEmail || '',
+        subject: r.subject || '',
+      })),
+    });
+  } catch (error) {
+    console.error('listLatestUnreadIncoming error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 }
@@ -250,7 +415,7 @@ export async function classifyMessagePreview(req, res) {
   try {
     await ensureDefaultMessageTypeRules();
     const rules = await loadMessageTypeRules();
-    const result = classifyIncomingMessage({
+    const result = await classifyIncomingMessage({
       subject: req.body.subject,
       body: req.body.body,
       fromEmail: req.body.fromEmail,
@@ -261,6 +426,62 @@ export async function classifyMessagePreview(req, res) {
   } catch (error) {
     console.error('classifyMessagePreview error:', error);
     res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
+export async function getIncomingMessageContent(req, res) {
+  try {
+    const id = String(req.params.id || '').trim();
+    if (!id) return res.status(400).json({ error: 'id is required' });
+
+    const incomingRepo = AppDataSource.getRepository(IncomingMessage);
+    const incoming = await incomingRepo.findOne({ where: { id } });
+    if (!incoming) return res.status(404).json({ error: 'Incoming message not found' });
+
+    const emailRepo = AppDataSource.getRepository(Email);
+    const mailbox = await emailRepo.findOne({
+      where: { address: incoming.emailAddress, deletedAt: null },
+    });
+    if (!mailbox?.grantId || !mailbox?.nylasKey) {
+      return res.status(400).json({ error: 'Mailbox is missing Nylas credentials' });
+    }
+
+    const message = await fetchNylasMessageById(mailbox.grantId, mailbox.nylasKey, incoming.messageId);
+    if (!message) return res.status(404).json({ error: 'Message not found in Nylas' });
+
+    if (!incoming.isRead) {
+      incoming.isRead = true;
+      await incomingRepo.save(incoming);
+    }
+
+    const body = extractNylasMessageBody(message);
+    res.json({
+      id: incoming.id,
+      messageId: incoming.messageId,
+      emailAddress: incoming.emailAddress,
+      subject: message.subject || incoming.subject || '',
+      body: body || message.snippet || '',
+      snippet: message.snippet || '',
+      from: normalizeList(message.from),
+      to: normalizeList(message.to),
+      date: message.date || null,
+      receivedAt: incoming.receivedAt || null,
+      isRead: true,
+    });
+  } catch (error) {
+    console.error('getIncomingMessageContent error:', error);
+    const msg = String(error?.message || '');
+    if (msg.includes('Nylas fetch failed (401)') || msg.toLowerCase().includes('invalid api key')) {
+      return res.status(502).json({
+        error: 'Nylas authentication failed for this mailbox (invalid API key). Reconnect/update mailbox credentials.',
+      });
+    }
+    if (msg.includes('Nylas fetch failed (403)')) {
+      return res.status(502).json({
+        error: 'Nylas access denied for this mailbox. Check grant/API key permissions.',
+      });
+    }
+    res.status(500).json({ error: 'Failed to load incoming message content' });
   }
 }
 

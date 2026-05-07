@@ -7,6 +7,7 @@ import {
 } from '../services/apolloOrganizationService.js';
 
 const MAX_EXTRACT_PAGES = 500;
+const DEFAULT_MIN_FOUNDED_YEAR = 1950;
 
 function normalizeStatus(raw) {
   const s = String(raw || 'pending').toLowerCase().trim();
@@ -53,6 +54,43 @@ const CSV_HEADER = [
 
 function filtersNonEmpty(filters) {
   return filters && typeof filters === 'object' && Object.keys(filters).length > 0;
+}
+
+/**
+ * Parse minimum founded year from extract request body (default 1950).
+ * @param {object} body
+ * @returns {number}
+ */
+function parseMinFoundedYear(body) {
+  const raw = body?.min_founded_year ?? body?.minFoundedYear ?? DEFAULT_MIN_FOUNDED_YEAR;
+  const n = typeof raw === 'number' ? raw : parseInt(String(raw).trim(), 10);
+  if (!Number.isFinite(n)) return DEFAULT_MIN_FOUNDED_YEAR;
+  if (n < 1000) return 1000;
+  if (n > 2100) return 2100;
+  return n;
+}
+
+/**
+ * Include org if founded_year >= minYear (inclusive).
+ * Missing / invalid founded_year passes only when minYear <= DEFAULT_MIN_FOUNDED_YEAR (default baseline).
+ * Stricter thresholds (e.g. 2025) require a known year from Apollo.
+ * @param {object} org
+ * @param {number} minYear
+ */
+function passesMinFoundedYear(org, minYear) {
+  const raw = org?.founded_year;
+  if (raw == null || raw === '') {
+    return minYear <= DEFAULT_MIN_FOUNDED_YEAR;
+  }
+  const n = typeof raw === 'number' ? raw : parseInt(String(raw).trim(), 10);
+  if (!Number.isFinite(n)) {
+    return minYear <= DEFAULT_MIN_FOUNDED_YEAR;
+  }
+  return n >= minYear;
+}
+
+function filterOrganizationsByFoundedYear(organizations, minYear) {
+  return organizations.filter((org) => passesMinFoundedYear(org, minYear));
 }
 
 export async function apolloSearch(req, res) {
@@ -127,6 +165,8 @@ export async function apolloExtractCsv(req, res) {
     }
     const maxPages = Math.min(MAX_EXTRACT_PAGES, Math.max(1, parseInt(body.max_pages, 10) || MAX_EXTRACT_PAGES));
 
+    const minFoundedYear = parseMinFoundedYear(body);
+
     let organizations;
     try {
       organizations = await fetchAllOrganizationsForFilters(filters, maxPages);
@@ -138,6 +178,9 @@ export async function apolloExtractCsv(req, res) {
       });
     }
 
+    const totalFetchedFromApollo = organizations.length;
+    organizations = filterOrganizationsByFoundedYear(organizations, minFoundedYear);
+
     const lines = [CSV_HEADER.join(',')];
     for (const org of organizations) {
       lines.push(apolloOrgToCsvRow(org).join(','));
@@ -145,7 +188,13 @@ export async function apolloExtractCsv(req, res) {
 
     const csv = lines.join('\r\n');
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition', 'attachment; filename="apollo-organizations.csv"');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="apollo-organizations-founded-ge-${minFoundedYear}.csv"`
+    );
+    res.setHeader('X-Apollo-Total-Fetched', String(totalFetchedFromApollo));
+    res.setHeader('X-Apollo-Total-After-Founded-Year', String(organizations.length));
+    res.setHeader('X-Apollo-Min-Founded-Year', String(minFoundedYear));
     res.send(csv);
   } catch (error) {
     console.error('apolloExtractCsv error:', error);
@@ -203,6 +252,7 @@ export async function apolloExtractDb(req, res) {
     }
     const status = normalizeStatus(body.status);
     const maxPages = Math.min(MAX_EXTRACT_PAGES, Math.max(1, parseInt(body.max_pages, 10) || MAX_EXTRACT_PAGES));
+    const minFoundedYear = parseMinFoundedYear(body);
 
     let organizations;
     try {
@@ -214,6 +264,10 @@ export async function apolloExtractDb(req, res) {
         details: e.details,
       });
     }
+
+    const totalFetchedFromApollo = organizations.length;
+    organizations = filterOrganizationsByFoundedYear(organizations, minFoundedYear);
+    const skippedFoundedYear = totalFetchedFromApollo - organizations.length;
 
     const repo = AppDataSource.getRepository(Company);
     let created = 0;
@@ -254,7 +308,10 @@ export async function apolloExtractDb(req, res) {
 
     res.json({
       message: 'Import finished',
-      totalFromApollo: organizations.length,
+      minFoundedYear,
+      totalFetchedFromApollo,
+      totalMatchingFoundedYear: organizations.length,
+      skippedFoundedYear,
       created,
       updated,
       skipped,
