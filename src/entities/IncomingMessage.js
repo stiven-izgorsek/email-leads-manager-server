@@ -44,6 +44,11 @@ export const IncomingMessageSchema = new EntitySchema({
       type: 'boolean',
       default: false,
     },
+    /** Soft-delete: row kept so Nylas polling does not recreate the same message. */
+    deletedAt: {
+      type: 'timestamp',
+      nullable: true,
+    },
     createdAt: {
       type: 'timestamp',
       createDate: true,

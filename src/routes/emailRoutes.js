@@ -2,7 +2,7 @@ import express from 'express';
 import multer from 'multer';
 import path from 'path';
 import os from 'os';
-import { getEmails, createEmail, updateEmail, bulkDeleteEmails, bulkUpdateEmails, uploadEmails } from '../controllers/emailController.js';
+import { getEmails, createEmail, updateEmail, bulkDeleteEmails, bulkUpdateEmails, uploadEmails, getNylasIntegrationStatus } from '../controllers/emailController.js';
 // import { authenticateToken } from '../middleware/auth.js';
 
 const router = express.Router();
@@ -22,6 +22,7 @@ const upload = multer({ storage });
 // router.use(authenticateToken); // Uncomment to enable authentication
 
 router.get('/', getEmails);
+router.get('/nylas-integration-status', getNylasIntegrationStatus);
 router.post('/', createEmail);
 router.post('/upload', upload.single('file'), uploadEmails);
 router.post('/bulk-delete', bulkDeleteEmails);

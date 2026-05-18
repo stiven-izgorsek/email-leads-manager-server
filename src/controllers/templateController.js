@@ -114,6 +114,102 @@ function normalizeLeadVariables(lead) {
   };
 }
 
+const COMPOSE_MESSAGE_TYPES = new Set(['outreach', 'followup', '2nd-followup']);
+
+/**
+ * outreach | followup | 2nd-followup — aligns with {@link selectMessageTemplate} types.
+ */
+function resolveComposeMessageType(explicit, lead) {
+  const norm = (v) =>
+    String(v || '')
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, '-')
+      .replace(/_/g, '-');
+
+  const fromExplicit = norm(explicit);
+  if (fromExplicit === '2nd-followup' || fromExplicit === '2ndfollowup') return '2nd-followup';
+  if (COMPOSE_MESSAGE_TYPES.has(fromExplicit)) return fromExplicit;
+
+  const fromLead = norm(lead?.messageType ?? lead?.message_type);
+  if (fromLead === '2nd-followup' || fromLead === '2ndfollowup') return '2nd-followup';
+  if (COMPOSE_MESSAGE_TYPES.has(fromLead)) return fromLead;
+
+  const fu = lead?.isFollowup ?? lead?.is_followup ?? lead?.is_follow_up;
+  const status = norm(lead?.status);
+  if (fu === true || fu === 1 || status === 'followup' || status === 'follow-up') {
+    const stage = Number(lead?.followUpStage ?? lead?.follow_up_stage ?? 0);
+    if (stage >= 2) return '2nd-followup';
+    return 'followup';
+  }
+
+  return 'outreach';
+}
+
+/**
+ * Best-effort map CRM lead industries / tech / titles to a template industry bucket when OpenAI is unavailable.
+ */
+function pickIndustryFromLead(normalizedLead) {
+  const industries = Array.isArray(normalizedLead.industries) ? normalizedLead.industries : [];
+  const tech = Array.isArray(normalizedLead.tech) ? normalizedLead.tech : [];
+  const blob = [
+    ...industries.map((x) => String(x || '').toLowerCase()),
+    ...tech.map((x) => String(x || '').toLowerCase()),
+    String(normalizedLead.jobTitle || '').toLowerCase(),
+    String(normalizedLead.companyName || '').toLowerCase(),
+  ]
+    .join(' ')
+    .replace(/\s+/g, ' ');
+
+  let best = null;
+  let bestScore = 0;
+
+  for (const cat of COMPANY_CATEGORIES) {
+    const c = cat.toLowerCase();
+    const variants = [c, c.replace(/-/g, ' '), c.replace(/-/g, '')].filter((v) => v.length > 1);
+
+    let score = 0;
+    for (const raw of industries) {
+      const s = String(raw || '').toLowerCase().trim();
+      if (!s) continue;
+      if (s === c) score += 12;
+      else if (s === cat) score += 12;
+      else if (s.includes(c) || c.includes(s)) score += 7;
+      for (const v of variants) {
+        if (v.length > 2 && s.includes(v)) score += 4;
+      }
+    }
+    for (const v of variants) {
+      if (v.length > 2 && blob.includes(v)) score += 2;
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      best = cat;
+    }
+  }
+
+  if (best && bestScore >= 3) return best;
+  if (best && bestScore > 0) return best;
+  return 'Other';
+}
+
+function isOpenAiComposeFallbackError(err) {
+  const msg = String(err?.message || err || '');
+  const status = err?.status;
+  if (status === 503) return true;
+  if (status === 401) return true;
+  if (status === 429) return true;
+  if (status === 400 && /quota|billing|invalid|incorrect|authentication|api key|unauthorized|permission/i.test(msg))
+    return true;
+  if (
+    /not configured|OPEN_AI_API_KEY|OPENAI_API_KEY|incorrect api key|invalid api key|invalid_api_key|quota|billing|insufficient_quota|rate limit|429|timed out|AbortError|fetch failed|ECONNREFUSED/i.test(
+      msg
+    )
+  )
+    return true;
+  return false;
+}
+
 async function selectSubjectTemplate(templateRepository) {
   return templateRepository.createQueryBuilder('template')
     .where('template.deletedAt IS NULL')
@@ -303,8 +399,8 @@ export async function composeEmailFromTemplates(req, res) {
       ...senderVars,
     };
 
-    const subject = renderTemplateVariables(subjectTemplate.content, vars);
-    const template = renderTemplateVariables(messageTemplate.content, vars);
+    const subject = sanitizeRandomPlaceholders(renderTemplateVariables(subjectTemplate.content, vars));
+    const template = sanitizeRandomPlaceholders(renderTemplateVariables(messageTemplate.content, vars));
 
     await incrementTemplateUsedCount(subjectRepo, subjectTemplate.id);
     await incrementTemplateUsedCount(subjectRepo, messageTemplate.id);
@@ -324,71 +420,123 @@ export async function composeEmailFromTemplates(req, res) {
 
 export async function composeAiEmail(req, res) {
   try {
-    assertOpenAiConfigured();
-
-    const { accountName, accountEmail, lead } = req.body || {};
+    const { accountName, accountEmail, lead, messageType: bodyMessageType } = req.body || {};
     if (!lead || typeof lead !== 'object') {
       return res.status(400).json({ error: 'lead is required' });
     }
 
     const normalizedLead = normalizeLeadVariables(lead);
+    const requestedMessageType = resolveComposeMessageType(bodyMessageType, lead);
 
-    const websiteSummary = await fetchWebsiteContentSummary(normalizedLead.companyUrl);
-
-    const systemPrompt = [
-      'You classify companies into a fixed list of categories based on their website HTML/text content.',
-      'Return only valid JSON.',
-      'The JSON must have keys: category, reasoning, accuracy.',
-      `Allowed categories: ${COMPANY_CATEGORIES.join(', ')}.`,
-      'Choose exactly one category from the allowed list.',
-      'Do not invent facts not supported by the website/company context.',
-      'Base the decision mainly on website HTML/text content.',
-      'Use accuracy as a number from 0 to 10 indicating confidence in the chosen category.',
-      'If the website content is sparse or unclear, use a lower accuracy and choose the closest unknown category when appropriate.',
-    ].join(' ');
-
-    const userPrompt = JSON.stringify({
-      lead: normalizedLead,
-      websiteSummary: {
-        sourceUrl: websiteSummary.sourceUrl,
-        pages: websiteSummary.pages.map((page) => ({
-          url: page.url,
-          title: page.title,
-        })),
-        combinedText: websiteSummary.combinedText,
-      },
-      instructions: {
-        goal: 'Classify this company into one allowed category using the website content.',
-        outputFormat: {
-          category: 'one string from the allowed category list',
-          reasoning: 'short string',
-          accuracy: 'number from 0 to 10 indicating how confident the classification is',
-        },
-      },
-    });
-
-    const raw = await createChatCompletion([
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: userPrompt },
-    ]);
-
-    let parsed;
+    let websiteSummary = { sourceUrl: normalizedLead.companyUrl || '', pages: [], combinedText: '' };
     try {
-      parsed = JSON.parse(raw);
+      websiteSummary = await fetchWebsiteContentSummary(normalizedLead.companyUrl);
     } catch {
-      const fenced = raw.match(/\{[\s\S]*\}/);
-      parsed = fenced ? JSON.parse(fenced[0]) : null;
+      // Non-fatal: OpenAI can still classify from lead fields; fallback uses industries only.
     }
 
-    if (!parsed || typeof parsed !== 'object') {
-      return res.status(502).json({ error: 'Invalid AI response format' });
-    }
+    let category = 'unknown';
+    let selectedIndustry = 'Other';
+    let reasoning = '';
+    let accuracy = 0;
+    let usedAiClassification = false;
 
-    const rawAccuracy = Number(parsed.accuracy);
-    const accuracy = Number.isFinite(rawAccuracy) ? rawAccuracy : 0;
-    const rawCategory = String(parsed.category || '').trim();
-    const category = COMPANY_CATEGORIES.includes(rawCategory) ? rawCategory : 'unknown';
-    const selectedIndustry = accuracy < 3 ? 'Other' : category;
+    const applyAiClassification = (parsed) => {
+      const rawAccuracy = Number(parsed.accuracy);
+      accuracy = Number.isFinite(rawAccuracy) ? rawAccuracy : 0;
+      const rawCategory = String(parsed.category || '').trim();
+      category = COMPANY_CATEGORIES.includes(rawCategory) ? rawCategory : 'unknown';
+      selectedIndustry = accuracy < 3 ? 'Other' : category;
+      reasoning = String(parsed.reasoning || '').trim();
+      usedAiClassification = true;
+    };
+
+    const applyLeadFallback = (reason) => {
+      selectedIndustry = pickIndustryFromLead(normalizedLead);
+      category = selectedIndustry;
+      reasoning = reason;
+      accuracy = 0;
+      usedAiClassification = false;
+    };
+
+    let openAiFailed = false;
+    try {
+      assertOpenAiConfigured();
+      const systemPrompt = [
+        'You classify companies into a fixed list of categories based on their website HTML/text content.',
+        'Return only valid JSON.',
+        'The JSON must have keys: category, reasoning, accuracy.',
+        `Allowed categories: ${COMPANY_CATEGORIES.join(', ')}.`,
+        'Choose exactly one category from the allowed list.',
+        'Do not invent facts not supported by the website/company context.',
+        'Base the decision mainly on website HTML/text content.',
+        'Use accuracy as a number from 0 to 10 indicating confidence in the chosen category.',
+        'If the website content is sparse or unclear, use a lower accuracy and choose the closest unknown category when appropriate.',
+      ].join(' ');
+
+      const userPrompt = JSON.stringify({
+        lead: normalizedLead,
+        websiteSummary: {
+          sourceUrl: websiteSummary.sourceUrl,
+          pages: websiteSummary.pages.map((page) => ({
+            url: page.url,
+            title: page.title,
+          })),
+          combinedText: websiteSummary.combinedText,
+        },
+        instructions: {
+          goal: 'Classify this company into one allowed category using the website content.',
+          outputFormat: {
+            category: 'one string from the allowed category list',
+            reasoning: 'short string',
+            accuracy: 'number from 0 to 10 indicating how confident the classification is',
+          },
+        },
+      });
+
+      const raw = await createChatCompletion([
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ]);
+
+      let parsed;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        try {
+          const fenced = raw.match(/\{[\s\S]*\}/);
+          parsed = fenced ? JSON.parse(fenced[0]) : null;
+        } catch {
+          parsed = null;
+        }
+      }
+
+      if (!parsed || typeof parsed !== 'object') {
+        console.warn('[OpenAI] composeAiEmail: unparseable or empty AI JSON; using lead industries.');
+        applyLeadFallback('OpenAI returned an unusable response; using lead industries for template selection.');
+        openAiFailed = true;
+      } else {
+        applyAiClassification(parsed);
+      }
+    } catch (error) {
+      if (isOpenAiComposeFallbackError(error)) {
+        openAiFailed = true;
+        const msg = String(error?.message || error || 'OpenAI unavailable');
+        applyLeadFallback(
+          `OpenAI unavailable (${msg.slice(0, 200)}); using lead industries and message type "${requestedMessageType}".`
+        );
+        if (/quota|billing|insufficient_quota/i.test(msg)) {
+          console.warn(
+            '[OpenAI] composeAiEmail: falling back to lead-based industries (quota/billing). Add credits or set OPENAI_API_KEY.'
+          );
+        } else if (!/quota|billing/i.test(msg)) {
+          console.warn('[OpenAI] composeAiEmail: falling back to lead-based industries:', msg.slice(0, 300));
+        }
+      } else {
+        console.error('composeAiEmail error:', error);
+        return res.status(error.status || 500).json({ error: error.message || 'Internal server error' });
+      }
+    }
 
     const templateRepository = AppDataSource.getRepository(Template);
     const subjectTemplate = await selectSubjectTemplate(templateRepository);
@@ -396,9 +544,13 @@ export async function composeAiEmail(req, res) {
       return res.status(404).json({ error: 'No subject templates found' });
     }
 
-    const messageTemplate = await selectMessageTemplate(templateRepository, 'outreach', selectedIndustry);
+    const messageTemplate = await selectMessageTemplate(
+      templateRepository,
+      requestedMessageType,
+      selectedIndustry
+    );
     if (!messageTemplate) {
-      return res.status(404).json({ error: 'No message templates found for outreach' });
+      return res.status(404).json({ error: `No message templates found for type ${requestedMessageType}` });
     }
 
     const vars = {
@@ -407,8 +559,10 @@ export async function composeAiEmail(req, res) {
       email: accountEmail ?? '',
     };
 
-    const subject = renderTemplateVariables(subjectTemplate.content, vars);
-    const template = renderTemplateVariables(messageTemplate.content, vars);
+    let subject = renderTemplateVariables(subjectTemplate.content, vars);
+    let template = renderTemplateVariables(messageTemplate.content, vars);
+    subject = sanitizeRandomPlaceholders(subject);
+    template = sanitizeRandomPlaceholders(template);
 
     await incrementTemplateUsedCount(templateRepository, subjectTemplate.id);
     await incrementTemplateUsedCount(templateRepository, messageTemplate.id);
@@ -418,11 +572,14 @@ export async function composeAiEmail(req, res) {
       template,
       category,
       selectedIndustry,
-      reasoning: String(parsed.reasoning || '').trim(),
+      reasoning,
       accuracy,
       websitePagesUsed: websiteSummary.pages.map((page) => page.url),
       subjectTemplateId: subjectTemplate.id,
       messageTemplateId: messageTemplate.id,
+      messageType: requestedMessageType,
+      usedAiClassification,
+      openAiFailed,
     });
   } catch (error) {
     console.error('composeAiEmail error:', error);

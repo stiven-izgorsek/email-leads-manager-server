@@ -2,6 +2,8 @@ import { AppDataSource } from '../config/database.js';
 import { Email } from '../entities/Email.js';
 import fs from 'fs/promises';
 import XLSX from 'xlsx';
+import { sleep } from '../utils/nylasRateLimit.js';
+import { probeNylasGrantMessagesList } from '../services/nylasGrantProbeService.js';
 
 export async function getEmails(req, res) {
   try {
@@ -73,6 +75,12 @@ export async function createEmail(req, res) {
       return res.status(400).json({ error: 'Email already exists' });
     }
 
+    const rawGmailUIndex = req.body.gmailUIndex ?? req.body.gmail_u_index;
+    const parsedGmailUIndex =
+      rawGmailUIndex === '' || rawGmailUIndex === null || rawGmailUIndex === undefined
+        ? null
+        : Number.parseInt(String(rawGmailUIndex), 10);
+
     const emailData = {
       address: emailAddress,
       accountId: req.body.accountId || null,
@@ -82,6 +90,10 @@ export async function createEmail(req, res) {
       recoveryEmail: req.body.recoveryEmail || null,
       grantId: req.body.grantId || req.body.grant_id || null,
       nylasKey: req.body.nylasKey || req.body.nylas_key || null,
+      chromePath: req.body.chromePath || req.body.chrome_path || null,
+      chromeUserDataDir: req.body.chromeUserDataDir || req.body.chrome_user_data_dir || null,
+      chromeProfileDirectory: req.body.chromeProfileDirectory || req.body.chrome_profile_directory || null,
+      gmailUIndex: Number.isNaN(parsedGmailUIndex) ? null : parsedGmailUIndex,
     };
 
     const email = emailRepository.create(emailData);
@@ -145,6 +157,23 @@ export async function updateEmail(req, res) {
     }
     if (req.body.nylasKey !== undefined || req.body.nylas_key !== undefined) {
       email.nylasKey = req.body.nylasKey || req.body.nylas_key || null;
+    }
+    if (req.body.chromePath !== undefined || req.body.chrome_path !== undefined) {
+      email.chromePath = req.body.chromePath || req.body.chrome_path || null;
+    }
+    if (req.body.chromeUserDataDir !== undefined || req.body.chrome_user_data_dir !== undefined) {
+      email.chromeUserDataDir = req.body.chromeUserDataDir || req.body.chrome_user_data_dir || null;
+    }
+    if (req.body.chromeProfileDirectory !== undefined || req.body.chrome_profile_directory !== undefined) {
+      email.chromeProfileDirectory = req.body.chromeProfileDirectory || req.body.chrome_profile_directory || null;
+    }
+    if (req.body.gmailUIndex !== undefined || req.body.gmail_u_index !== undefined) {
+      const nextUIndex = req.body.gmailUIndex ?? req.body.gmail_u_index;
+      const parsedUIndex =
+        nextUIndex === '' || nextUIndex === null || nextUIndex === undefined
+          ? null
+          : Number.parseInt(String(nextUIndex), 10);
+      email.gmailUIndex = Number.isNaN(parsedUIndex) ? null : parsedUIndex;
     }
 
     const updatedEmail = await emailRepository.save(email);
@@ -384,7 +413,15 @@ export async function uploadEmails(req, res) {
             recoveryEmail: getField(row, 'recoveryemail', 'recovery_email', 'recovery', 'backupemail', 'backup_email') || null,
             grantId: getField(row, 'grantid', 'grant_id') || null,
             nylasKey: getField(row, 'nylaskey', 'nylas_key', 'nylasapikey', 'nylas_api_key') || null,
+            chromePath: getField(row, 'chromepath', 'chrome_path') || null,
+            chromeUserDataDir: getField(row, 'chromeuserdatadir', 'chrome_user_data_dir', 'userdatadir', 'user_data_dir') || null,
+            chromeProfileDirectory: getField(row, 'chromeprofiledirectory', 'chrome_profile_directory', 'profiledirectory', 'profile_directory') || null,
+            gmailUIndex: getField(row, 'gmailuindex', 'gmail_u_index', 'uindex', 'u_index'),
           };
+          if (emailData.gmailUIndex !== null) {
+            const parsedUIndex = Number.parseInt(String(emailData.gmailUIndex), 10);
+            emailData.gmailUIndex = Number.isNaN(parsedUIndex) ? null : parsedUIndex;
+          }
 
           // Check if email already exists
           const existing = await emailRepository.findOne({
@@ -431,6 +468,78 @@ export async function uploadEmails(req, res) {
     });
   } catch (error) {
     console.error('Upload emails error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
+/**
+ * Lists CRM email mailboxes with any Nylas fields set, and live-checks grant + API key when both are present.
+ * GET /api/emails/nylas-integration-status?staggerMs=120
+ */
+export async function getNylasIntegrationStatus(req, res) {
+  try {
+    const staggerMs = Math.min(2000, Math.max(0, parseInt(String(req.query.staggerMs || '120'), 10) || 120));
+    const emailRepository = AppDataSource.getRepository(Email);
+    const emails = await emailRepository
+      .createQueryBuilder('email')
+      .where('email.deletedAt IS NULL')
+      .andWhere(
+        `(
+          (email.grant_id IS NOT NULL AND TRIM(email.grant_id) <> '')
+          OR (email.nylas_key IS NOT NULL AND TRIM(email.nylas_key) <> '')
+        )`
+      )
+      .orderBy('email.address', 'ASC')
+      .getMany();
+
+    const data = [];
+    for (let i = 0; i < emails.length; i += 1) {
+      const row = emails[i];
+      const grantId = String(row.grantId || '').trim();
+      const nylasKey = String(row.nylasKey || '').trim();
+      const hasGrant = Boolean(grantId);
+      const hasKey = Boolean(nylasKey);
+
+      let status = 'incomplete';
+      let httpStatus = null;
+      let detail = '';
+
+      if (!hasGrant) {
+        detail = 'Grant ID is missing (Nylas cannot be used for this mailbox).';
+      } else if (!hasKey) {
+        detail = 'Nylas API key is missing.';
+      } else {
+        const probe = await probeNylasGrantMessagesList(grantId, nylasKey);
+        httpStatus = probe.httpStatus;
+        detail = probe.detail || '';
+        if (probe.ok) status = 'ok';
+        else if (probe.code === 'invalid_api_key') status = 'invalid_api_key';
+        else if (probe.code === 'grant_not_found') status = 'grant_not_found';
+        else if (probe.code === 'forbidden') status = 'forbidden';
+        else if (probe.code === 'rate_limited') status = 'rate_limited';
+        else if (probe.code === 'network_error') status = 'network_error';
+        else status = 'error';
+      }
+
+      data.push({
+        id: row.id,
+        address: row.address,
+        hasGrantId: hasGrant,
+        hasNylasKey: hasKey,
+        grantIdPreview: hasGrant ? `${grantId.slice(0, 8)}…` : null,
+        status,
+        httpStatus,
+        detail,
+      });
+
+      if (hasGrant && hasKey && staggerMs > 0 && i < emails.length - 1) {
+        await sleep(staggerMs);
+      }
+    }
+
+    res.json({ data, checkedAt: new Date().toISOString() });
+  } catch (error) {
+    console.error('getNylasIntegrationStatus error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 }

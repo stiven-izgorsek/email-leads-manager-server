@@ -13,6 +13,7 @@ import {
   getIncomingUnreadCount,
   markAllIncomingAsRead,
   listLatestUnreadIncoming,
+  deleteIncomingMessage,
 } from '../controllers/incomingMessageController.js';
 
 const router = express.Router();
@@ -21,6 +22,7 @@ router.get('/incoming-messages', listIncomingMessages);
 router.get('/incoming-messages/unread-count', getIncomingUnreadCount);
 router.get('/incoming-messages/unread-latest', listLatestUnreadIncoming);
 router.post('/incoming-messages/mark-all-read', markAllIncomingAsRead);
+router.delete('/incoming-messages/:id', deleteIncomingMessage);
 router.get('/incoming-messages/counts', listIncomingMessageTypeCounts);
 router.post('/incoming-messages/analyze-period', analyzeIncomingMessagesPeriod);
 router.get('/incoming-messages/:id/content', getIncomingMessageContent);

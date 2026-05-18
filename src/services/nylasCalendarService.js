@@ -1,3 +1,5 @@
+import { NYLAS_LIST_PAGE_LIMIT, sleep } from '../utils/nylasRateLimit.js';
+
 const configuredNylasRegion = (process.env.NYLAS_REGION || '').toLowerCase();
 
 export function getNylasBaseUrls() {
@@ -34,7 +36,7 @@ export async function fetchPrimaryCalendarEvents(grantId, nylasKey, startSec, en
     params.set('calendar_id', 'primary');
     params.set('start', String(startSec));
     params.set('end', String(endSec));
-    params.set('limit', '200');
+    params.set('limit', String(NYLAS_LIST_PAGE_LIMIT));
     if (pageToken) {
       params.set('page_token', pageToken);
     }
@@ -80,6 +82,7 @@ export async function fetchPrimaryCalendarEvents(grantId, nylasKey, startSec, en
     all.push(...chunk);
     pageToken = payload?.next_cursor || null;
     if (!pageToken) break;
+    await sleep(120);
   }
 
   return { events: all, error: null };

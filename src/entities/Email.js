@@ -1,7 +1,7 @@
 import { EntitySchema } from 'typeorm';
 
 export class Email {
-  constructor(id, address, accountId, status, password, twoFa, recoveryEmail, grantId, nylasKey, createdAt, updatedAt, deletedAt) {
+  constructor(id, address, accountId, status, password, twoFa, recoveryEmail, grantId, nylasKey, chromePath, chromeUserDataDir, chromeProfileDirectory, gmailUIndex, createdAt, updatedAt, deletedAt) {
     this.id = id;
     this.address = address;
     this.accountId = accountId;
@@ -11,6 +11,10 @@ export class Email {
     this.recoveryEmail = recoveryEmail;
     this.grantId = grantId;
     this.nylasKey = nylasKey;
+    this.chromePath = chromePath;
+    this.chromeUserDataDir = chromeUserDataDir;
+    this.chromeProfileDirectory = chromeProfileDirectory;
+    this.gmailUIndex = gmailUIndex;
     this.createdAt = createdAt;
     this.updatedAt = updatedAt;
     this.deletedAt = deletedAt;
@@ -65,6 +69,29 @@ export const EmailSchema = new EntitySchema({
       name: 'nylas_key',
       type: 'varchar',
       length: 1000,
+      nullable: true,
+    },
+    chromePath: {
+      name: 'chrome_path',
+      type: 'varchar',
+      length: 1000,
+      nullable: true,
+    },
+    chromeUserDataDir: {
+      name: 'chrome_user_data_dir',
+      type: 'varchar',
+      length: 1000,
+      nullable: true,
+    },
+    chromeProfileDirectory: {
+      name: 'chrome_profile_directory',
+      type: 'varchar',
+      length: 255,
+      nullable: true,
+    },
+    gmailUIndex: {
+      name: 'gmail_u_index',
+      type: 'int',
       nullable: true,
     },
     createdAt: {

@@ -5,8 +5,11 @@ import {
   ensureDefaultMessageTypeRules,
   loadMessageTypeRules,
 } from './messageTypeService.js';
+import { NYLAS_LIST_PAGE_LIMIT, parseNylas429RetryDelayMs, sleep } from '../utils/nylasRateLimit.js';
 
 const configuredNylasRegion = (process.env.NYLAS_REGION || '').toLowerCase();
+const NYLAS_PAGE_GAP_MS = Math.min(5000, Math.max(50, parseInt(process.env.NYLAS_PAGE_GAP_MS || '150', 10) || 150));
+const NYLAS_429_MAX_RETRIES = Math.min(5, Math.max(0, parseInt(process.env.NYLAS_429_MAX_RETRIES || '2', 10) || 2));
 
 function getNylasBaseUrls() {
   if (configuredNylasRegion === 'us') return ['https://api.us.nylas.com'];
@@ -97,26 +100,43 @@ export function computeReceivedRange(preset, n) {
 }
 
 async function fetchMessagesPage(baseUrl, grantId, nylasKey, { receivedAfter, receivedBefore, limit, pageToken }) {
-  const params = new URLSearchParams({ limit: String(limit || 100) });
+  const pageLimit = Math.min(NYLAS_LIST_PAGE_LIMIT, Math.max(1, limit || NYLAS_LIST_PAGE_LIMIT));
+  const params = new URLSearchParams({ limit: String(pageLimit) });
   if (receivedAfter != null) params.set('received_after', String(receivedAfter));
   if (receivedBefore != null) params.set('received_before', String(receivedBefore));
   if (pageToken) params.set('page_token', pageToken);
 
   const url = `${baseUrl}/v3/grants/${grantId}/messages?${params.toString()}`;
-  const response = await fetch(url, {
-    method: 'GET',
-    headers: {
-      Authorization: `Bearer ${nylasKey}`,
-      Accept: 'application/json',
-    },
-  });
 
-  if (!response.ok) {
+  for (let attempt = 0; attempt <= NYLAS_429_MAX_RETRIES; attempt += 1) {
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${nylasKey}`,
+        Accept: 'application/json',
+      },
+    });
+
     const text = await response.text().catch(() => '');
+
+    if (response.ok) {
+      try {
+        return text ? JSON.parse(text) : {};
+      } catch {
+        throw new Error('Nylas returned invalid JSON for messages page');
+      }
+    }
+
+    if (response.status === 429 && attempt < NYLAS_429_MAX_RETRIES) {
+      const waitMs = parseNylas429RetryDelayMs(response, text);
+      await sleep(waitMs);
+      continue;
+    }
+
     throw new Error(`Nylas request failed (${response.status}): ${text || response.statusText}`);
   }
 
-  return response.json();
+  throw new Error('Nylas messages page: exceeded 429 retries');
 }
 
 async function fetchAllMessagesInRange(grantId, nylasKey, receivedAfter, receivedBefore) {
@@ -131,7 +151,7 @@ async function fetchAllMessagesInRange(grantId, nylasKey, receivedAfter, receive
         const payload = await fetchMessagesPage(baseUrl, grantId, nylasKey, {
           receivedAfter,
           receivedBefore,
-          limit: 100,
+          limit: NYLAS_LIST_PAGE_LIMIT,
           pageToken,
         });
         const batch = Array.isArray(payload?.data) ? payload.data : [];
@@ -139,7 +159,7 @@ async function fetchAllMessagesInRange(grantId, nylasKey, receivedAfter, receive
         pageToken =
           payload?.next_cursor || payload?.nextCursor || payload?.next_page_token || payload?.nextPageToken || null;
         if (!pageToken || batch.length === 0) break;
-        await new Promise((r) => setTimeout(r, 50));
+        await sleep(NYLAS_PAGE_GAP_MS);
       }
       return all;
     } catch (err) {
@@ -223,7 +243,7 @@ export async function analyzeNylasMessagesForPeriod({ preset, n }) {
       });
     }
 
-    await new Promise((r) => setTimeout(r, 100));
+    await sleep(Math.min(2000, Math.max(80, NYLAS_PAGE_GAP_MS)));
   }
 
   return {

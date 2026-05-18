@@ -2,7 +2,7 @@ import express from 'express';
 import multer from 'multer';
 import path from 'path';
 import os from 'os';
-import { getLeads, createLead, uploadLeads, bulkDeleteLeads, bulkUpdateLeads, getUncontactedLeads, getLeadFilters, markClientAsSent, markClientAsFollowedUp, checkLeadsStatus, getDashboardKPIs, resetLeadsStatus, getEmailsSentInDateRange, bulkVerifyEmails, bulkVerifyAllNew, getNewLeadsVerificationCount, getVerificationStatus, downloadNewLeadsCsv } from '../controllers/leadController.js';
+import { getLeads, createLead, uploadLeads, bulkDeleteLeads, bulkUpdateLeads, getUncontactedLeads, getLeadFilters, markClientAsSent, markClientAsFollowedUp, checkLeadsStatus, getDashboardKPIs, resetLeadsStatus, getEmailsSentInDateRange, bulkVerifyEmails, bulkVerifyAllNew, getNewLeadsVerificationCount, getVerificationStatus, downloadNewLeadsCsv, getFollowupCandidates } from '../controllers/leadController.js';
 // import { authenticateToken } from '../middleware/auth.js';
 
 const router = express.Router();
@@ -26,6 +26,7 @@ router.get('/uncontacted', getUncontactedLeads);
 router.get('/filters', getLeadFilters);
 router.get('/dashboard-kpis', getDashboardKPIs);
 router.get('/emails-date-range', getEmailsSentInDateRange);
+router.get('/followup-candidates', getFollowupCandidates);
 router.post('/', createLead);
 router.post('/upload', upload.single('file'), uploadLeads);
 router.post('/bulk-delete', bulkDeleteLeads);

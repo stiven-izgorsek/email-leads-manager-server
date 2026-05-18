@@ -8,6 +8,53 @@ function normalizeStatus(raw, fallback = 'first_connected') {
   return CRM_CLIENT_STATUSES.includes(s) ? s : fallback;
 }
 
+/** Dedupe valid CRM statuses while preserving first-seen order */
+function dedupeValidStatuses(values) {
+  const seen = new Set();
+  const out = [];
+  for (const raw of values || []) {
+    const s = String(raw || '').toLowerCase().trim();
+    if (CRM_CLIENT_STATUSES.includes(s) && !seen.has(s)) {
+      seen.add(s);
+      out.push(s);
+    }
+  }
+  return out;
+}
+
+/**
+ * Parse multi-status from body. Returns null when neither field was sent (PATCH semantics).
+ */
+function parseStatusesFromBody(body) {
+  if (body.statuses !== undefined) {
+    const raw = body.statuses;
+    const list = Array.isArray(raw) ? raw : raw != null ? [raw] : [];
+    const cleaned = dedupeValidStatuses(list);
+    return cleaned.length ? cleaned : ['first_connected'];
+  }
+  if (body.status !== undefined) {
+    return [normalizeStatus(body.status)];
+  }
+  return null;
+}
+
+/** Effective statuses for a DB row (supports legacy rows with only varchar status). */
+function getStatusesArray(row) {
+  const parsed = row?.statuses;
+  if (Array.isArray(parsed) && parsed.length) {
+    const cleaned = dedupeValidStatuses(parsed);
+    if (cleaned.length) return cleaned;
+  }
+  const legacy = row?.status && CRM_CLIENT_STATUSES.includes(row.status) ? row.status : null;
+  return legacy ? [legacy] : ['first_connected'];
+}
+
+function applyStatusesToRow(row, statusesArray) {
+  const arr = statusesArray?.length ? statusesArray : ['first_connected'];
+  row.statuses = arr;
+  row.status = arr[0];
+}
+
 function parseDate(raw) {
   if (raw == null || raw === '') return null;
   const d = new Date(raw);
@@ -31,6 +78,7 @@ function trimOrNull(v) {
 
 export function serializeCrmClient(row) {
   if (!row) return null;
+  const statuses = getStatusesArray(row);
   return {
     id: row.id,
     leadId: row.leadId,
@@ -46,7 +94,9 @@ export function serializeCrmClient(row) {
     chatHistory: row.chatHistory,
     note: row.note,
     rating: row.rating,
-    status: row.status,
+    statuses,
+    /** First tag — kept for older clients / extensions that still read `status` */
+    status: statuses[0],
     followUpAt: row.followUpAt instanceof Date ? row.followUpAt.toISOString() : row.followUpAt,
     createdAt: row.createdAt instanceof Date ? row.createdAt.toISOString() : row.createdAt,
     updatedAt: row.updatedAt instanceof Date ? row.updatedAt.toISOString() : row.updatedAt,
@@ -77,9 +127,39 @@ function applyFilters(qb, query) {
     qb.andWhere(`${c}.country ILIKE :countryFilter`, { countryFilter: `%${country}%` });
   }
 
+  const sentByAccount = (query.sentByAccount || '').trim();
+  if (sentByAccount) {
+    qb.andWhere(`${c}.sentByAccount ILIKE :sentByAccountFilter`, {
+      sentByAccountFilter: `%${sentByAccount}%`,
+    });
+  }
+
   const status = (query.status || '').trim().toLowerCase();
   if (status && CRM_CLIENT_STATUSES.includes(status)) {
-    qb.andWhere(`${c}.status = :status`, { status });
+    const tag = JSON.stringify([status]);
+    qb.andWhere(
+      new Brackets((b) => {
+        b.where(`COALESCE(${c}.statuses, '[]'::jsonb) @> CAST(:statusTag AS jsonb)`, {
+          statusTag: tag,
+        }).orWhere(`(${c}.statuses IS NULL AND ${c}.status = :legacyStatus)`, {
+          legacyStatus: status,
+        });
+      }),
+    );
+  }
+
+  const excludeFailedRaw = String(query.excludeFailed || '').toLowerCase();
+  const excludeFailed =
+    excludeFailedRaw === '1' || excludeFailedRaw === 'true' || excludeFailedRaw === 'yes';
+  if (excludeFailed) {
+    const failedTag = JSON.stringify(['failed']);
+    qb.andWhere(
+      `NOT (
+        (COALESCE(${c}.statuses, '[]'::jsonb) @> CAST(:excludeFailedTag AS jsonb))
+        OR (${c}.status = :excludeFailedLegacy)
+      )`,
+      { excludeFailedTag: failedTag, excludeFailedLegacy: 'failed' },
+    );
   }
 
   const ratingMin = parseInt(query.ratingMin, 10);
@@ -392,9 +472,11 @@ export async function createCrmClient(req, res) {
       chatHistory: body.chatHistory != null ? String(body.chatHistory) : null,
       note: body.note != null ? String(body.note) : null,
       rating: parseRating(body.rating),
-      status: normalizeStatus(body.status),
       followUpAt: parseDate(body.followUpAt),
     });
+
+    const parsedStatuses = parseStatusesFromBody(body);
+    applyStatusesToRow(row, parsedStatuses || ['first_connected']);
 
     const saved = await repo.save(row);
     res.status(201).json({
@@ -440,7 +522,10 @@ export async function updateCrmClient(req, res) {
       existing.note = body.note == null ? null : String(body.note);
     }
     if (body.rating !== undefined) existing.rating = parseRating(body.rating);
-    if (body.status !== undefined) existing.status = normalizeStatus(body.status, existing.status);
+    if (body.statuses !== undefined || body.status !== undefined) {
+      const next = parseStatusesFromBody(body);
+      if (next) applyStatusesToRow(existing, next);
+    }
     if (body.followUpAt !== undefined) existing.followUpAt = parseDate(body.followUpAt);
 
     const saved = await repo.save(existing);

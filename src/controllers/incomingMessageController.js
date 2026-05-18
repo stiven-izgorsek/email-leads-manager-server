@@ -1,3 +1,4 @@
+import { IsNull } from 'typeorm';
 import { AppDataSource } from '../config/database.js';
 import { IncomingMessage } from '../entities/IncomingMessage.js';
 import { MessageTypeRule } from '../entities/MessageTypeRule.js';
@@ -28,6 +29,46 @@ function normalizeList(items) {
       return email || '';
     })
     .filter(Boolean);
+}
+
+/** Parse `YYYY-MM-DD` into start/end of that calendar day in the server local timezone. */
+function parseYyyyMmDdToLocalDayBounds(dateStr) {
+  const s = String(dateStr || '').trim();
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  if (!m) return null;
+  const y = parseInt(m[1], 10);
+  const mo = parseInt(m[2], 10);
+  const d = parseInt(m[3], 10);
+  if (!Number.isFinite(y) || mo < 1 || mo > 12 || d < 1 || d > 31) return null;
+  const start = new Date(y, mo - 1, d, 0, 0, 0, 0);
+  const end = new Date(y, mo - 1, d, 23, 59, 59, 999);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return null;
+  if (start.getFullYear() !== y || start.getMonth() !== mo - 1 || start.getDate() !== d) return null;
+  return { start, end };
+}
+
+function getIncomingListDayBounds(query) {
+  const explicit = parseYyyyMmDdToLocalDayBounds(query?.date);
+  if (explicit) return explicit;
+  const todayOnly = String(query?.todayOnly ?? 'true').toLowerCase() !== 'false';
+  if (!todayOnly) return null;
+  const start = new Date();
+  start.setHours(0, 0, 0, 0);
+  const end = new Date();
+  end.setHours(23, 59, 59, 999);
+  return { start, end };
+}
+
+function getMarkAllReadDayBounds(body) {
+  const explicit = parseYyyyMmDdToLocalDayBounds(body?.date);
+  if (explicit) return explicit;
+  const todayOnly = String(body?.todayOnly ?? 'true').toLowerCase() !== 'false';
+  if (!todayOnly) return null;
+  const start = new Date();
+  start.setHours(0, 0, 0, 0);
+  const end = new Date();
+  end.setHours(23, 59, 59, 999);
+  return { start, end };
 }
 
 /** Nylas sometimes returns `body` as a string; older/alternate shapes may nest HTML/text. */
@@ -81,7 +122,7 @@ export async function listIncomingMessages(req, res) {
     const skip = (page - 1) * limit;
 
     const repo = AppDataSource.getRepository(IncomingMessage);
-    const qb = repo.createQueryBuilder('m');
+    const qb = repo.createQueryBuilder('m').where('m.deletedAt IS NULL');
 
     if (req.query.emailAddress) {
       qb.andWhere('m.emailAddress ILIKE :emailAddress', { emailAddress: `%${req.query.emailAddress}%` });
@@ -95,15 +136,11 @@ export async function listIncomingMessages(req, res) {
         { search: `%${req.query.search}%` }
       );
     }
-    const todayOnly = String(req.query.todayOnly || 'true').toLowerCase() !== 'false';
-    if (todayOnly) {
-      const start = new Date();
-      start.setHours(0, 0, 0, 0);
-      const end = new Date();
-      end.setHours(23, 59, 59, 999);
+    const dayBounds = getIncomingListDayBounds(req.query);
+    if (dayBounds) {
       qb.andWhere('COALESCE(m.receivedAt, m.createdAt) >= :start AND COALESCE(m.receivedAt, m.createdAt) <= :end', {
-        start,
-        end,
+        start: dayBounds.start,
+        end: dayBounds.end,
       });
     }
 
@@ -128,16 +165,15 @@ export async function listIncomingMessages(req, res) {
 export async function getIncomingUnreadCount(req, res) {
   try {
     const repo = AppDataSource.getRepository(IncomingMessage);
-    const qb = repo.createQueryBuilder('m').where('m.isRead = :isRead', { isRead: false });
-    const todayOnly = String(req.query.todayOnly || 'true').toLowerCase() !== 'false';
-    if (todayOnly) {
-      const start = new Date();
-      start.setHours(0, 0, 0, 0);
-      const end = new Date();
-      end.setHours(23, 59, 59, 999);
+    const qb = repo
+      .createQueryBuilder('m')
+      .where('m.isRead = :isRead', { isRead: false })
+      .andWhere('m.deletedAt IS NULL');
+    const dayBounds = getIncomingListDayBounds(req.query);
+    if (dayBounds) {
       qb.andWhere('COALESCE(m.receivedAt, m.createdAt) >= :start AND COALESCE(m.receivedAt, m.createdAt) <= :end', {
-        start,
-        end,
+        start: dayBounds.start,
+        end: dayBounds.end,
       });
     }
     const unread = await qb.getCount();
@@ -151,21 +187,18 @@ export async function getIncomingUnreadCount(req, res) {
 export async function markAllIncomingAsRead(req, res) {
   try {
     const repo = AppDataSource.getRepository(IncomingMessage);
-    const todayOnly = String(req.body?.todayOnly ?? 'true').toLowerCase() !== 'false';
     const qb = repo
       .createQueryBuilder()
       .update(IncomingMessage)
       .set({ isRead: true })
-      .where('isRead = :isRead', { isRead: false });
+      .where('isRead = :isRead', { isRead: false })
+      .andWhere('"deletedAt" IS NULL');
 
-    if (todayOnly) {
-      const start = new Date();
-      start.setHours(0, 0, 0, 0);
-      const end = new Date();
-      end.setHours(23, 59, 59, 999);
+    const dayBounds = getMarkAllReadDayBounds(req.body || {});
+    if (dayBounds) {
       qb.andWhere('COALESCE(receivedAt, createdAt) >= :start AND COALESCE(receivedAt, createdAt) <= :end', {
-        start,
-        end,
+        start: dayBounds.start,
+        end: dayBounds.end,
       });
     }
 
@@ -181,7 +214,10 @@ export async function listLatestUnreadIncoming(req, res) {
   try {
     const repo = AppDataSource.getRepository(IncomingMessage);
     const limit = Math.min(10, Math.max(1, parseInt(req.query.limit, 10) || 3));
-    const qb = repo.createQueryBuilder('m').where('m.isRead = :isRead', { isRead: false });
+    const qb = repo
+      .createQueryBuilder('m')
+      .where('m.isRead = :isRead', { isRead: false })
+      .andWhere('m.deletedAt IS NULL');
     const todayOnly = String(req.query.todayOnly || 'true').toLowerCase() !== 'false';
     if (todayOnly) {
       const start = new Date();
@@ -218,6 +254,7 @@ export async function listIncomingMessageTypeCounts(req, res) {
     const repo = AppDataSource.getRepository(IncomingMessage);
     const rows = await repo
       .createQueryBuilder('m')
+      .where('m.deletedAt IS NULL')
       .select('m.emailAddress', 'emailAddress')
       .addSelect('m.messageType', 'messageType')
       .addSelect('COUNT(*)', 'count')
@@ -338,7 +375,9 @@ export async function renameMessageTypeForRules(req, res) {
     const incomingRepo = AppDataSource.getRepository(IncomingMessage);
 
     const movingRules = await ruleRepo.find({ where: { type: fromType } });
-    const incomingCount = await incomingRepo.count({ where: { messageType: fromType } });
+    const incomingCount = await incomingRepo.count({
+      where: { messageType: fromType, deletedAt: IsNull() },
+    });
 
     if (movingRules.length === 0 && incomingCount === 0) {
       return res.status(404).json({ error: 'No rules or stored messages use this message type' });
@@ -361,7 +400,13 @@ export async function renameMessageTypeForRules(req, res) {
         await manager.getRepository(MessageTypeRule).update({ type: fromType }, { type: toType });
       }
       if (incomingCount > 0) {
-        await manager.getRepository(IncomingMessage).update({ messageType: fromType }, { messageType: toType });
+        await manager
+          .createQueryBuilder()
+          .update(IncomingMessage)
+          .set({ messageType: toType })
+          .where('messageType = :fromType', { fromType })
+          .andWhere('"deletedAt" IS NULL')
+          .execute();
       }
     });
 
@@ -429,13 +474,31 @@ export async function classifyMessagePreview(req, res) {
   }
 }
 
+export async function deleteIncomingMessage(req, res) {
+  try {
+    const id = String(req.params.id || '').trim();
+    if (!id) return res.status(400).json({ error: 'id is required' });
+
+    const repo = AppDataSource.getRepository(IncomingMessage);
+    const row = await repo.findOne({ where: { id, deletedAt: IsNull() } });
+    if (!row) return res.status(404).json({ error: 'Incoming message not found' });
+
+    row.deletedAt = new Date();
+    await repo.save(row);
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('deleteIncomingMessage error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
 export async function getIncomingMessageContent(req, res) {
   try {
     const id = String(req.params.id || '').trim();
     if (!id) return res.status(400).json({ error: 'id is required' });
 
     const incomingRepo = AppDataSource.getRepository(IncomingMessage);
-    const incoming = await incomingRepo.findOne({ where: { id } });
+    const incoming = await incomingRepo.findOne({ where: { id, deletedAt: IsNull() } });
     if (!incoming) return res.status(404).json({ error: 'Incoming message not found' });
 
     const emailRepo = AppDataSource.getRepository(Email);

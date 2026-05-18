@@ -2,11 +2,16 @@ import { EntitySchema } from 'typeorm';
 
 export const CRM_CLIENT_STATUSES = [
   'first_connected',
+  'no_response',
+  'in_discussion',
   'first_call_scheduled',
   'second_call_scheduled',
+  'proposal_sent',
   'nda_signed',
   'contract_signed',
   'stay_connect',
+  'on_hold',
+  'failed',
 ];
 
 export class CrmClient {
@@ -127,6 +132,11 @@ export const CrmClientSchema = new EntitySchema({
       length: 50,
       nullable: false,
       default: 'first_connected',
+    },
+    /** Ordered CRM tags; varchar `status` mirrors the first tag for sorting / legacy rows */
+    statuses: {
+      type: 'jsonb',
+      nullable: true,
     },
     followUpAt: {
       type: 'timestamp',

@@ -138,6 +138,71 @@ export async function getLeads(req, res) {
   }
 }
 
+/**
+ * Return candidate lead emails for follow-up:
+ * - sent by a specific account
+ * - last sent on/before now - N days
+ * - not deleted, has email, was sent before
+ */
+export async function getFollowupCandidates(req, res) {
+  try {
+    const sentBy = String(req.query.sentBy || req.query.sentByEmail || '').trim().toLowerCase();
+    const daysAgoRaw = parseInt(String(req.query.daysAgo || req.query.days || '0'), 10);
+    const limitRaw = parseInt(String(req.query.limit || '400'), 10);
+
+    if (!sentBy || !sentBy.includes('@')) {
+      return res.status(400).json({ error: 'sentBy (email) query param is required' });
+    }
+    if (!Number.isFinite(daysAgoRaw) || daysAgoRaw < 1) {
+      return res.status(400).json({ error: 'daysAgo must be an integer >= 1' });
+    }
+
+    const daysAgo = Math.min(365, daysAgoRaw);
+    const limit = Math.min(1000, Math.max(1, Number.isFinite(limitRaw) ? limitRaw : 400));
+    const cutoff = new Date(Date.now() - daysAgo * 24 * 60 * 60 * 1000);
+
+    const clientRepository = AppDataSource.getRepository(Client);
+    const rows = await clientRepository
+      .createQueryBuilder('client')
+      .where('client.deletedAt IS NULL')
+      .andWhere('client.email IS NOT NULL')
+      .andWhere("TRIM(client.email) <> ''")
+      .andWhere('client.lastSent IS NOT NULL')
+      .andWhere('client.lastSent <= :cutoff', { cutoff })
+      .andWhere('(client.isSent = true OR client.isSent IS NULL)')
+      .andWhere('(client.isFollowup = false OR client.isFollowup IS NULL)')
+      // simple-array in TypeORM is stored as comma-separated text.
+      .andWhere('LOWER(COALESCE(client.sentBy, \'\')) LIKE :sentBy', {
+        sentBy: `%${sentBy}%`,
+      })
+      .orderBy('client.lastSent', 'ASC')
+      .take(limit * 3)
+      .getMany();
+
+    const seen = new Set();
+    const emails = [];
+    for (const row of rows) {
+      const email = String(row?.email || '').trim().toLowerCase();
+      if (!email || seen.has(email)) continue;
+      seen.add(email);
+      emails.push(email);
+      if (emails.length >= limit) break;
+    }
+
+    res.json({
+      sentBy,
+      daysAgo,
+      cutoff: cutoff.toISOString(),
+      totalMatchedRows: rows.length,
+      totalCandidateEmails: emails.length,
+      emails,
+    });
+  } catch (error) {
+    console.error('getFollowupCandidates error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
 export async function downloadNewLeadsCsv(req, res) {
   try {
     const clientRepository = AppDataSource.getRepository(Client);

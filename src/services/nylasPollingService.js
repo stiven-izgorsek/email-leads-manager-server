@@ -8,8 +8,19 @@ import {
   ensureDefaultMessageTypeRules,
   loadMessageTypeRules,
 } from './messageTypeService.js';
+import { NYLAS_LIST_PAGE_LIMIT, parseNylas429RetryDelayMs, sleep } from '../utils/nylasRateLimit.js';
 
-const POLL_MS = 60 * 1000;
+const POLL_MS = Math.min(
+  30 * 60 * 1000,
+  Math.max(30_000, parseInt(process.env.NYLAS_POLL_MS || '', 10) || 60 * 1000)
+);
+/** Space out mailbox polls to reduce Gmail user quota bursts (ms). */
+const POLL_STAGGER_MS = Math.min(
+  10_000,
+  Math.max(0, parseInt(process.env.NYLAS_POLL_STAGGER_MS || '400', 10) || 400)
+);
+/** After a 429, do not call Nylas for this grant again until this time (avoids long sleeps blocking other mailboxes). */
+const grantPollBackoffUntil = new Map();
 const seenMessageIds = new Set();
 let timer = null;
 let isRunning = false;
@@ -169,13 +180,20 @@ function formatFetchError(err) {
 async function fetchUnreadMessagesForMailbox(emailRow) {
   const grantId = emailRow.grantId;
   const nylasKey = emailRow.nylasKey;
+  const gid = String(grantId || '').trim();
+  if (gid) {
+    const until = grantPollBackoffUntil.get(gid);
+    if (until && Date.now() < until) return;
+  }
 
   let payload = null;
   let lastError = null;
   const baseUrls = getNylasBaseUrls();
+  const listUrl = (baseUrl) =>
+    `${baseUrl}/v3/grants/${grantId}/messages?limit=${NYLAS_LIST_PAGE_LIMIT}&unread=true`;
 
   for (const baseUrl of baseUrls) {
-    const url = `${baseUrl}/v3/grants/${grantId}/messages?limit=25&unread=true`;
+    const url = listUrl(baseUrl);
     try {
       const response = await fetch(url, {
         method: 'GET',
@@ -185,29 +203,52 @@ async function fetchUnreadMessagesForMailbox(emailRow) {
         },
       });
 
+      const text = await response.text().catch(() => '');
+
       if (response.ok) {
-        payload = await response.json();
+        try {
+          payload = text ? JSON.parse(text) : null;
+        } catch {
+          lastError = new Error(`Nylas invalid JSON on ${baseUrl}`);
+          break;
+        }
+        if (gid) grantPollBackoffUntil.delete(gid);
         break;
       }
 
-      const text = await response.text().catch(() => '');
+      if (response.status === 429) {
+        const raw = parseNylas429RetryDelayMs(response, text);
+        const backoffMs = Math.min(Math.max(raw, 15_000), 900_000);
+        if (gid) grantPollBackoffUntil.set(gid, Date.now() + backoffMs);
+        const resumeIso = new Date(Date.now() + backoffMs).toISOString();
+        console.warn(
+          `[NYLAS] 429 for ${emailRow.address} — backing off this grant until ~${resumeIso} (~${Math.round(backoffMs / 60_000)} min). Gmail/Nylas quota; other mailboxes still poll. Set NYLAS_POLL_MS (e.g. 120000) to poll less often.`
+        );
+        return;
+      }
+
+      const hint401 =
+        response.status === 401
+          ? ' (invalid or expired Nylas API key for this mailbox — check CRM email nylas_key matches your Nylas app)'
+          : '';
       lastError = new Error(
-        `Nylas request failed (${response.status}) on ${baseUrl}: ${text || response.statusText}`
+        `Nylas request failed (${response.status}) on ${baseUrl}: ${text || response.statusText}${hint401}`
       );
 
-      // If auth failed and we are in forced region mode, no point retrying another region.
       if (response.status === 401 && configuredNylasRegion) {
         throw lastError;
       }
     } catch (err) {
-      // Network/TLS/DNS errors throw before any HTTP response — try next region in auto mode.
+      if (lastError && err === lastError) throw err;
       const msg = formatFetchError(err);
       lastError = new Error(`Nylas fetch failed on ${baseUrl}: ${msg}`);
       if (configuredNylasRegion) {
         throw lastError;
       }
-      continue;
     }
+
+    if (payload) break;
+    if (configuredNylasRegion && lastError) throw lastError;
   }
 
   if (!payload) {
@@ -230,6 +271,7 @@ async function fetchUnreadMessagesForMailbox(emailRow) {
       })
     : [];
   const alreadyNotifiedIds = new Set(alreadyNotifiedRows.map((row) => row.messageId));
+  // Includes soft-deleted rows so we do not insert again for the same Nylas message id.
   const existingIncomingRows = messageIds.length
     ? await incomingRepo.find({
         where: {
@@ -351,13 +393,17 @@ async function pollUnreadEmails() {
       .andWhere("TRIM(email.nylas_key) <> ''")
       .getMany();
 
-    for (const emailRow of emailAccounts) {
+    for (let i = 0; i < emailAccounts.length; i += 1) {
+      const emailRow = emailAccounts[i];
       try {
         await fetchUnreadMessagesForMailbox(emailRow);
       } catch (error) {
         console.error(`[NYLAS] Failed polling ${emailRow.address}:`, error.message || error, {
           grantId: emailRow.grantId,
         });
+      }
+      if (POLL_STAGGER_MS > 0 && i < emailAccounts.length - 1) {
+        await sleep(POLL_STAGGER_MS);
       }
     }
   } catch (error) {
@@ -373,6 +419,6 @@ export function startNylasUnreadPollingJob() {
   timer = setInterval(() => {
     pollUnreadEmails().catch(() => undefined);
   }, POLL_MS);
-  console.log('[NYLAS] Unread-email polling started (every 1 minute)');
+  console.log(`[NYLAS] Unread-email polling started (every ${Math.round(POLL_MS / 1000)}s)`);
 }
 
