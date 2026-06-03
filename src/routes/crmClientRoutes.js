@@ -7,11 +7,13 @@ import {
   deleteCrmClient,
   getFollowUpsToday,
   getCrmClientStatuses,
+  getCrmClientCountsBySentAccount,
 } from '../controllers/crmClientController.js';
 
 const router = express.Router();
 
 router.get('/statuses', getCrmClientStatuses);
+router.get('/counts-by-sent-account', getCrmClientCountsBySentAccount);
 router.get('/follow-ups/today', getFollowUpsToday);
 
 router.get('/', listCrmClients);

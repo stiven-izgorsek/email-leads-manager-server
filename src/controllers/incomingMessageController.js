@@ -9,6 +9,10 @@ import {
   loadMessageTypeRules,
 } from '../services/messageTypeService.js';
 import { analyzeNylasMessagesForPeriod } from '../services/nylasPeriodAnalysisService.js';
+import {
+  replyToIncomingMessageById,
+  listManualRepliesForIncomingMessage,
+} from '../services/incomingMessageReplyService.js';
 
 const configuredNylasRegion = (process.env.NYLAS_REGION || '').toLowerCase();
 
@@ -69,6 +73,60 @@ function getMarkAllReadDayBounds(body) {
   const end = new Date();
   end.setHours(23, 59, 59, 999);
   return { start, end };
+}
+
+function isQueryFlagTrue(value) {
+  return String(value ?? '').toLowerCase() === 'true';
+}
+
+function getYesterdayBoundsFromDayStart(dayStart) {
+  const prev = new Date(dayStart);
+  prev.setDate(prev.getDate() - 1);
+  const yStart = new Date(prev.getFullYear(), prev.getMonth(), prev.getDate(), 0, 0, 0, 0);
+  const yEnd = new Date(prev.getFullYear(), prev.getMonth(), prev.getDate(), 23, 59, 59, 999);
+  return { start: yStart, end: yEnd };
+}
+
+function applyIncomingReceivedDateFilter(qb, { dayBounds, includeYesterdayUnread, alias = 'm' }) {
+  if (!dayBounds) return qb;
+  const ts = `COALESCE(${alias}.receivedAt, ${alias}.createdAt)`;
+  if (includeYesterdayUnread) {
+    const yesterday = getYesterdayBoundsFromDayStart(dayBounds.start);
+    return qb.andWhere(
+      `(${ts} >= :dayStart AND ${ts} <= :dayEnd) OR (${alias}.isRead = false AND ${ts} >= :yStart AND ${ts} <= :yEnd)`,
+      {
+        dayStart: dayBounds.start,
+        dayEnd: dayBounds.end,
+        yStart: yesterday.start,
+        yEnd: yesterday.end,
+      }
+    );
+  }
+  return qb.andWhere(`${ts} >= :start AND ${ts} <= :end`, {
+    start: dayBounds.start,
+    end: dayBounds.end,
+  });
+}
+
+function applyIncomingReceivedDateFilterForUpdate(qb, { dayBounds, includeYesterdayUnread }) {
+  if (!dayBounds) return qb;
+  const ts = 'COALESCE("receivedAt", "createdAt")';
+  if (includeYesterdayUnread) {
+    const yesterday = getYesterdayBoundsFromDayStart(dayBounds.start);
+    return qb.andWhere(
+      `(${ts} >= :dayStart AND ${ts} <= :dayEnd) OR ("isRead" = false AND ${ts} >= :yStart AND ${ts} <= :yEnd)`,
+      {
+        dayStart: dayBounds.start,
+        dayEnd: dayBounds.end,
+        yStart: yesterday.start,
+        yEnd: yesterday.end,
+      }
+    );
+  }
+  return qb.andWhere(`${ts} >= :start AND ${ts} <= :end`, {
+    start: dayBounds.start,
+    end: dayBounds.end,
+  });
 }
 
 /** Nylas sometimes returns `body` as a string; older/alternate shapes may nest HTML/text. */
@@ -136,13 +194,14 @@ export async function listIncomingMessages(req, res) {
         { search: `%${req.query.search}%` }
       );
     }
-    const dayBounds = getIncomingListDayBounds(req.query);
-    if (dayBounds) {
-      qb.andWhere('COALESCE(m.receivedAt, m.createdAt) >= :start AND COALESCE(m.receivedAt, m.createdAt) <= :end', {
-        start: dayBounds.start,
-        end: dayBounds.end,
-      });
+    if (isQueryFlagTrue(req.query.unreadOnly)) {
+      qb.andWhere('m.isRead = :isRead', { isRead: false });
     }
+    const dayBounds = getIncomingListDayBounds(req.query);
+    applyIncomingReceivedDateFilter(qb, {
+      dayBounds,
+      includeYesterdayUnread: isQueryFlagTrue(req.query.includeYesterdayUnread),
+    });
 
     const [data, total] = await Promise.all([
       qb.orderBy('COALESCE(m.receivedAt, m.createdAt)', 'DESC').skip(skip).take(limit).getMany(),
@@ -170,12 +229,10 @@ export async function getIncomingUnreadCount(req, res) {
       .where('m.isRead = :isRead', { isRead: false })
       .andWhere('m.deletedAt IS NULL');
     const dayBounds = getIncomingListDayBounds(req.query);
-    if (dayBounds) {
-      qb.andWhere('COALESCE(m.receivedAt, m.createdAt) >= :start AND COALESCE(m.receivedAt, m.createdAt) <= :end', {
-        start: dayBounds.start,
-        end: dayBounds.end,
-      });
-    }
+    applyIncomingReceivedDateFilter(qb, {
+      dayBounds,
+      includeYesterdayUnread: isQueryFlagTrue(req.query.includeYesterdayUnread),
+    });
     const unread = await qb.getCount();
     res.json({ unread });
   } catch (error) {
@@ -195,12 +252,10 @@ export async function markAllIncomingAsRead(req, res) {
       .andWhere('"deletedAt" IS NULL');
 
     const dayBounds = getMarkAllReadDayBounds(req.body || {});
-    if (dayBounds) {
-      qb.andWhere('COALESCE(receivedAt, createdAt) >= :start AND COALESCE(receivedAt, createdAt) <= :end', {
-        start: dayBounds.start,
-        end: dayBounds.end,
-      });
-    }
+    applyIncomingReceivedDateFilterForUpdate(qb, {
+      dayBounds,
+      includeYesterdayUnread: isQueryFlagTrue(req.body?.includeYesterdayUnread),
+    });
 
     const result = await qb.execute();
     res.json({ updated: result.affected || 0 });
@@ -489,6 +544,33 @@ export async function deleteIncomingMessage(req, res) {
   } catch (error) {
     console.error('deleteIncomingMessage error:', error);
     res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
+export async function listIncomingMessageReplies(req, res) {
+  try {
+    const result = await listManualRepliesForIncomingMessage(req.params.id);
+    res.json(result);
+  } catch (error) {
+    console.error('listIncomingMessageReplies error:', error);
+    const status = error?.status || 500;
+    return res.status(status).json({ error: error?.message || 'Failed to load replies' });
+  }
+}
+
+export async function replyToIncomingMessage(req, res) {
+  try {
+    const result = await replyToIncomingMessageById(req.params.id, {
+      body: req.body?.body,
+      subject: req.body?.subject,
+      toEmail: req.body?.toEmail,
+      toName: req.body?.toName,
+    });
+    res.json(result);
+  } catch (error) {
+    console.error('replyToIncomingMessage error:', error);
+    const status = error?.status || 500;
+    return res.status(status).json({ error: error?.message || 'Failed to send reply' });
   }
 }
 

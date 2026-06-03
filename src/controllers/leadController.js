@@ -6,6 +6,94 @@ import fs from 'fs/promises';
 import XLSX from 'xlsx';
 import path from 'path';
 import { verifyEmailsBulk } from '../services/millionsService.js';
+import {
+  fetchUncontactedVerifiedLeads,
+  resetLeadsFromReady,
+} from '../services/leadFetchService.js';
+import { countOutboundEmailsInRange } from '../services/outboundEmailStatsService.js';
+import { leadsToCsv } from '../utils/csvExport.js';
+import {
+  formatUncontactedLeadForExtension,
+  sanitizeAiMarkerInName,
+  serializeClientLeadForApi,
+} from '../utils/leadNameSanitize.js';
+
+function parseLocationFilter(query) {
+  const raw = query.location;
+  if (!raw) return [];
+  const list = (Array.isArray(raw) ? raw : String(raw).split(','))
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return list;
+}
+
+function applyLocationFilter(qb, locations, paramPrefix = 'loc') {
+  if (!locations.length) return;
+  const parts = [];
+  const params = {};
+  locations.forEach((loc, i) => {
+    const key = `${paramPrefix}${i}`;
+    parts.push(`(client.location ILIKE :${key} OR client.companyLocation ILIKE :${key})`);
+    params[key] = `%${loc}%`;
+  });
+  qb.andWhere(`(${parts.join(' OR ')})`, params);
+}
+
+/** Shared list filters for GET /leads and CSV export. */
+function applyLeadsListFilters(qb, query, { defaultStatusNew = false } = {}) {
+  if (query.search) {
+    qb.andWhere(
+      '(client.email ILIKE :search OR client.firstName ILIKE :search OR client.lastName ILIKE :search OR client.companyName ILIKE :search)',
+      { search: `%${query.search}%` }
+    );
+  }
+
+  if (query.status) {
+    if (query.status === 'new') {
+      qb.andWhere('(client.status = :status OR client.status IS NULL)', { status: query.status });
+    } else {
+      qb.andWhere('client.status = :status', { status: query.status });
+    }
+  } else if (defaultStatusNew) {
+    qb.andWhere('(client.status = :status OR client.status IS NULL)', { status: 'new' });
+  }
+
+  applyLocationFilter(qb, parseLocationFilter(query));
+
+  if (query.leadFilterIds) {
+    const leadFilterIds = Array.isArray(query.leadFilterIds)
+      ? query.leadFilterIds
+      : query.leadFilterIds.split(',').filter((id) => id.trim());
+    const filterMode = query.leadFilterMode || 'include';
+
+    if (leadFilterIds.length > 0) {
+      if (filterMode === 'exclude') {
+        qb.andWhere(
+          '(client.leadFilterId IS NULL OR client.leadFilterId NOT IN (:...leadFilterIds))',
+          { leadFilterIds }
+        );
+      } else {
+        qb.andWhere('client.leadFilterId IN (:...leadFilterIds)', { leadFilterIds });
+      }
+    }
+  }
+
+  if (query.assignedTo || query.contactedBy) {
+    const assignedTo = query.assignedTo || query.contactedBy;
+    qb.andWhere('client.contactedBy LIKE :assignedTo', { assignedTo: `%${assignedTo}%` });
+  }
+}
+
+function hasLeadsListFilters(query) {
+  return Boolean(
+    query.search ||
+      query.status ||
+      query.location ||
+      query.assignedTo ||
+      query.contactedBy ||
+      query.leadFilterIds
+  );
+}
 
 export async function getLeads(req, res) {
   try {
@@ -19,51 +107,7 @@ export async function getLeads(req, res) {
       .createQueryBuilder('client')
       .where('client.deletedAt IS NULL');
 
-    if (req.query.search) {
-      queryBuilder.andWhere(
-        '(client.email ILIKE :search OR client.firstName ILIKE :search OR client.lastName ILIKE :search OR client.companyName ILIKE :search)',
-        { search: `%${req.query.search}%` }
-      );
-    }
-
-    if (req.query.status) {
-      // Handle both NULL and 'new' as 'new' status (since default is 'new')
-      if (req.query.status === 'new') {
-        queryBuilder.andWhere('(client.status = :status OR client.status IS NULL)', { status: req.query.status });
-      } else {
-        queryBuilder.andWhere('client.status = :status', { status: req.query.status });
-      }
-    }
-
-    if (req.query.location) {
-      queryBuilder.andWhere(
-        '(client.location ILIKE :location OR client.companyLocation ILIKE :location)',
-        { location: `%${req.query.location}%` }
-      );
-    }
-
-    // Filter by leadFilterIds (include or exclude)
-    if (req.query.leadFilterIds) {
-      const leadFilterIds = Array.isArray(req.query.leadFilterIds) 
-        ? req.query.leadFilterIds 
-        : req.query.leadFilterIds.split(',').filter(id => id.trim());
-      const filterMode = req.query.leadFilterMode || 'include'; // 'include' or 'exclude'
-      
-      if (leadFilterIds.length > 0) {
-        if (filterMode === 'exclude') {
-          queryBuilder.andWhere('(client.leadFilterId IS NULL OR client.leadFilterId NOT IN (:...leadFilterIds))', { leadFilterIds });
-        } else {
-          queryBuilder.andWhere('client.leadFilterId IN (:...leadFilterIds)', { leadFilterIds });
-        }
-      }
-    }
-
-    if (req.query.assignedTo || req.query.contactedBy) {
-      // For array fields, we need to check if the value is in the array
-      // TypeORM simple-array is stored as comma-separated string
-      const assignedTo = req.query.assignedTo || req.query.contactedBy;
-      queryBuilder.andWhere('client.contactedBy LIKE :assignedTo', { assignedTo: `%${assignedTo}%` });
-    }
+    applyLeadsListFilters(queryBuilder, req.query);
 
     const dataQuery = queryBuilder
       .orderBy('client.createdAt', 'DESC')
@@ -74,49 +118,7 @@ export async function getLeads(req, res) {
       .createQueryBuilder('client')
       .where('client.deletedAt IS NULL');
 
-    if (req.query.search) {
-      countQuery.andWhere(
-        '(client.email ILIKE :search OR client.firstName ILIKE :search OR client.lastName ILIKE :search OR client.companyName ILIKE :search)',
-        { search: `%${req.query.search}%` }
-      );
-    }
-
-    if (req.query.status) {
-      // Handle both NULL and 'new' as 'new' status (since default is 'new')
-      if (req.query.status === 'new') {
-        countQuery.andWhere('(client.status = :status OR client.status IS NULL)', { status: req.query.status });
-      } else {
-        countQuery.andWhere('client.status = :status', { status: req.query.status });
-      }
-    }
-
-    if (req.query.location) {
-      countQuery.andWhere(
-        '(client.location ILIKE :location OR client.companyLocation ILIKE :location)',
-        { location: `%${req.query.location}%` }
-      );
-    }
-
-    // Filter by leadFilterIds (include or exclude)
-    if (req.query.leadFilterIds) {
-      const leadFilterIds = Array.isArray(req.query.leadFilterIds) 
-        ? req.query.leadFilterIds 
-        : req.query.leadFilterIds.split(',').filter(id => id.trim());
-      const filterMode = req.query.leadFilterMode || 'include'; // 'include' or 'exclude'
-      
-      if (leadFilterIds.length > 0) {
-        if (filterMode === 'exclude') {
-          countQuery.andWhere('(client.leadFilterId IS NULL OR client.leadFilterId NOT IN (:...leadFilterIds))', { leadFilterIds });
-        } else {
-          countQuery.andWhere('client.leadFilterId IN (:...leadFilterIds)', { leadFilterIds });
-        }
-      }
-    }
-
-    if (req.query.assignedTo || req.query.contactedBy) {
-      const assignedTo = req.query.assignedTo || req.query.contactedBy;
-      countQuery.andWhere('client.contactedBy LIKE :assignedTo', { assignedTo: `%${assignedTo}%` });
-    }
+    applyLeadsListFilters(countQuery, req.query);
 
     const [data, total] = await Promise.all([
       dataQuery.getMany(),
@@ -126,7 +128,7 @@ export async function getLeads(req, res) {
     const totalPages = Math.ceil(total / limit);
 
     res.json({
-      data,
+      data: data.map(serializeClientLeadForApi),
       page,
       limit,
       total,
@@ -140,9 +142,9 @@ export async function getLeads(req, res) {
 
 /**
  * Return candidate lead emails for follow-up:
- * - sent by a specific account
- * - last sent on/before now - N days
- * - not deleted, has email, was sent before
+ * - sent by a specific account, not already followed up
+ * - daysAgo / sentOnOrBefore are hints for the extension; Gmail row date applies the cutoff
+ * - not deleted, has email
  */
 export async function getFollowupCandidates(req, res) {
   try {
@@ -157,26 +159,28 @@ export async function getFollowupCandidates(req, res) {
       return res.status(400).json({ error: 'daysAgo must be an integer >= 1' });
     }
 
-    const daysAgo = Math.min(365, daysAgoRaw);
-    const limit = Math.min(1000, Math.max(1, Number.isFinite(limitRaw) ? limitRaw : 400));
-    const cutoff = new Date(Date.now() - daysAgo * 24 * 60 * 60 * 1000);
+    const minDaysSinceSend = Math.min(365, daysAgoRaw);
+    const limit = Math.min(20000, Math.max(1, Number.isFinite(limitRaw) ? limitRaw : 5000));
+
+    const sentOnOrBefore = new Date();
+    sentOnOrBefore.setHours(0, 0, 0, 0);
+    sentOnOrBefore.setDate(sentOnOrBefore.getDate() - minDaysSinceSend);
+    sentOnOrBefore.setHours(23, 59, 59, 999);
 
     const clientRepository = AppDataSource.getRepository(Client);
     const rows = await clientRepository
       .createQueryBuilder('client')
+      .select(['client.email', 'client.lastSent'])
       .where('client.deletedAt IS NULL')
       .andWhere('client.email IS NOT NULL')
       .andWhere("TRIM(client.email) <> ''")
       .andWhere('client.lastSent IS NOT NULL')
-      .andWhere('client.lastSent <= :cutoff', { cutoff })
-      .andWhere('(client.isSent = true OR client.isSent IS NULL)')
       .andWhere('(client.isFollowup = false OR client.isFollowup IS NULL)')
-      // simple-array in TypeORM is stored as comma-separated text.
       .andWhere('LOWER(COALESCE(client.sentBy, \'\')) LIKE :sentBy', {
         sentBy: `%${sentBy}%`,
       })
-      .orderBy('client.lastSent', 'ASC')
-      .take(limit * 3)
+      .orderBy('client.lastSent', 'DESC')
+      .limit(limit)
       .getMany();
 
     const seen = new Set();
@@ -186,13 +190,13 @@ export async function getFollowupCandidates(req, res) {
       if (!email || seen.has(email)) continue;
       seen.add(email);
       emails.push(email);
-      if (emails.length >= limit) break;
     }
 
     res.json({
       sentBy,
-      daysAgo,
-      cutoff: cutoff.toISOString(),
+      daysAgo: minDaysSinceSend,
+      minDaysSinceSend,
+      sentOnOrBefore: sentOnOrBefore.toISOString(),
       totalMatchedRows: rows.length,
       totalCandidateEmails: emails.length,
       emails,
@@ -206,54 +210,15 @@ export async function getFollowupCandidates(req, res) {
 export async function downloadNewLeadsCsv(req, res) {
   try {
     const clientRepository = AppDataSource.getRepository(Client);
-    const leads = await clientRepository
+    const qb = clientRepository
       .createQueryBuilder('client')
-      .where('client.deletedAt IS NULL')
-      .andWhere('(client.status = :status OR client.status IS NULL)', { status: 'new' })
-      .orderBy('client.createdAt', 'DESC')
-      .getMany();
+      .where('client.deletedAt IS NULL');
 
-    const columns = [
-      'id',
-      'email',
-      'firstName',
-      'lastName',
-      'companyName',
-      'jobTitle',
-      'status',
-      'location',
-      'companyLocation',
-      'linkedin',
-      'companyUrl',
-      'industries',
-      'tech',
-      'employees',
-      'contactedBy',
-      'millionsStatus',
-      'isSent',
-      'isReplied',
-      'isFollowup',
-      'lastSent',
-      'createdAt',
-      'updatedAt',
-      'note',
-    ];
+    // Match current table filters when provided; otherwise export all "new" leads.
+    applyLeadsListFilters(qb, req.query, { defaultStatusNew: !hasLeadsListFilters(req.query) });
 
-    const toCsvCell = (value) => {
-      if (value === null || value === undefined) return '';
-      if (Array.isArray(value)) return value.join('; ');
-      const str = String(value)
-        .replace(/\r\n/g, '\n')
-        .replace(/\r/g, '\n')
-        .replace(/\n/g, ' ');
-      return /[",\n]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
-    };
-
-    const lines = [columns.join(',')];
-    for (const lead of leads) {
-      const row = columns.map((k) => toCsvCell(lead[k]));
-      lines.push(row.join(','));
-    }
+    const leads = await qb.orderBy('client.createdAt', 'DESC').getMany();
+    const sanitizedLeads = leads.map(serializeClientLeadForApi);
 
     const now = new Date();
     const pad = (n) => String(n).padStart(2, '0');
@@ -261,9 +226,11 @@ export async function downloadNewLeadsCsv(req, res) {
       now.getUTCHours()
     )}${pad(now.getUTCMinutes())}${pad(now.getUTCSeconds())}`;
 
+    const csvBody = leadsToCsv(sanitizedLeads);
+
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="new-leads-${stamp}.csv"`);
-    res.status(200).send('\uFEFF' + lines.join('\n'));
+    res.status(200).send('\uFEFF' + csvBody);
   } catch (error) {
     console.error('downloadNewLeadsCsv error:', error);
     res.status(500).json({ error: 'Failed to export new leads CSV' });
@@ -292,9 +259,9 @@ export async function createLead(req, res) {
     // Map request body to Client entity fields
     const clientData = {
       email: (req.body.email || req.body.Email || '').toLowerCase(),
-      firstName: req.body.firstName || null,
-      lastName: req.body.lastName || null,
-      companyName: req.body.companyName || req.body.company || null,
+      firstName: sanitizeAiMarkerInName(req.body.firstName) || null,
+      lastName: sanitizeAiMarkerInName(req.body.lastName) || null,
+      companyName: sanitizeAiMarkerInName(req.body.companyName || req.body.company) || null,
       companyUrl: req.body.companyUrl || req.body.website || null,
       linkedin: req.body.linkedin || null,
       jobTitle: req.body.jobTitle || req.body.title || null,
@@ -626,9 +593,9 @@ export async function uploadLeads(req, res) {
 
           const clientData = {
             email: email.toLowerCase().trim(),
-            firstName: firstName || null,
-            lastName: lastName || null,
-            companyName: companyName || null,
+            firstName: sanitizeAiMarkerInName(firstName) || null,
+            lastName: sanitizeAiMarkerInName(lastName) || null,
+            companyName: sanitizeAiMarkerInName(companyName) || null,
             companyUrl: companyUrl || null,
             linkedin: linkedinUrl || null,
             jobTitle: jobTitle || null,
@@ -755,93 +722,27 @@ export async function getUncontactedLeads(req, res) {
     const location = req.query.location;
     const industry = req.query.industry;
     const verifiedOnly = req.query.verifiedOnly !== 'false'; // default true: only verified (good/risky); false = include unverified
+    const excludeClientIds = req.query.excludeClientIds
+      ? String(req.query.excludeClientIds)
+          .split(',')
+          .map((id) => id.trim())
+          .filter(Boolean)
+      : [];
 
-    const clientRepository = AppDataSource.getRepository(Client);
+    const leads = await fetchUncontactedVerifiedLeads({
+      count,
+      verifiedOnly,
+      leadFilterId,
+      leadFilterMode,
+      location,
+      industry,
+      excludeClientIds,
+    });
 
-    // Fetch new uncontacted leads (excluding 'ready' and 'followedup' status - those are managed by extension locally or already followed up)
-    // Only fetch leads that haven't been fetched by any extension yet and haven't been followed up
-    const queryBuilder = clientRepository
-      .createQueryBuilder('client')
-      .where('client.deletedAt IS NULL')
-      .andWhere('(client.isSent = false OR client.isSent IS NULL)') // Only uncontacted leads
-      .andWhere('(client.status != :readyStatus OR client.status IS NULL)', { readyStatus: 'ready' }) // Exclude 'ready' status
-      .andWhere('(client.status != :followedupStatus OR client.status IS NULL)', { followedupStatus: 'followedup' }); // Exclude 'followedup' status
-
-    // When verifiedOnly is true (default), only return leads with 'good' or 'risky' millionsStatus
-    if (verifiedOnly) {
-      queryBuilder.andWhere('client.millionsStatus IN (:...millionsStatuses)', { millionsStatuses: ['good', 'risky'] });
-    }
-
-    // Filter by leadFilterId if provided (include or exclude)
-    if (leadFilterId) {
-      if (leadFilterMode === 'exclude') {
-        // Exclude leads with this filter ID (include NULL and other filter IDs)
-        // Use NOT IN with array to match the pattern used in getLeads
-        queryBuilder.andWhere('(client.leadFilterId IS NULL OR client.leadFilterId NOT IN (:...leadFilterIds))', { 
-          leadFilterIds: [leadFilterId] 
-        });
-      } else {
-        // Include only leads with this filter ID
-        queryBuilder.andWhere('client.leadFilterId = :leadFilterId', { leadFilterId });
-      }
-    }
-
-    // Filter by location if provided
-    if (location) {
-      queryBuilder.andWhere('(client.location ILIKE :location OR client.companyLocation ILIKE :location)', {
-        location: `%${location}%`,
-      });
-    }
-
-    // Filter by industry if provided
-    if (industry) {
-      // For simple-array fields, check if the array contains the industry
-      queryBuilder.andWhere('client.industries LIKE :industry', {
-        industry: `%${industry}%`,
-      });
-    }
-
-    const leads = await queryBuilder
-      .orderBy(
-        `CASE 
-          WHEN client.millionsStatus = 'good' THEN 1 
-          WHEN client.millionsStatus = 'risky' THEN 2 
-          ELSE 3 
-        END`,
-        'ASC'
-      ) // Prioritize 'good' over 'risky'
-      .addOrderBy('client.createdAt', 'DESC') // Then by creation date
-      .take(count)
-      .getMany();
-    
     console.log('[getUncontactedLeads] Found', leads.length, 'leads. Filter mode:', leadFilterMode, 'Filter ID:', leadFilterId);
 
-    // Mark fetched leads as 'ready' so other extensions won't fetch them
-    if (leads.length > 0) {
-      const leadIds = leads.map(lead => lead.id);
-      await clientRepository.update(
-        { id: In(leadIds) },
-        { status: 'ready' }
-      );
-    }
-
     // Format response to match extension expectations
-    const formattedLeads = leads.map(lead => ({
-      id: lead.id,
-      first_name: lead.firstName || '',
-      firstName: lead.firstName || '',
-      company_name: lead.companyName || '',
-      companyName: lead.companyName || '',
-      companyUrl: lead.companyUrl || '',
-      industries: lead.industries || [],
-      tech: lead.tech || [],
-      jobTitle: lead.jobTitle || '',
-      companyLocation: lead.companyLocation || '',
-      email: lead.email || '',
-      icebreaker_title: null, // Can be added later if needed
-      icebreaker: null, // Can be added later if needed
-      used: false,
-    }));
+    const formattedLeads = leads.map(formatUncontactedLeadForExtension);
 
     res.json({
       data: formattedLeads,
@@ -874,7 +775,7 @@ export async function getLeadFilters(req, res) {
 
 export async function markClientAsFollowedUp(req, res) {
   try {
-    const { email } = req.body;
+    const { email, sentBy } = req.body;
 
     if (!email) {
       return res.status(400).json({ error: 'Email is required' });
@@ -891,14 +792,19 @@ export async function markClientAsFollowedUp(req, res) {
       return res.status(404).json({ error: 'Client not found with the provided email' });
     }
 
-    // Prepare update data
     const updateData = {
       isFollowup: true,
       status: 'followedup',
       lastSent: new Date(),
     };
 
-    // Update the client
+    if (sentBy) {
+      const currentSentBy = client.sentBy || [];
+      if (!currentSentBy.includes(sentBy)) {
+        updateData.sentBy = [...currentSentBy, sentBy];
+      }
+    }
+
     await clientRepository.update({ id: client.id }, updateData);
 
     // Return updated client
@@ -906,7 +812,7 @@ export async function markClientAsFollowedUp(req, res) {
       where: { id: client.id },
     });
 
-    return res.json({ message: 'Client marked as followed up', data: updatedClient });
+    return res.json({ message: 'Client marked as followed up', data: serializeClientLeadForApi(updatedClient) });
   } catch (error) {
     console.error('Error marking client as followed up:', error);
     return res.status(500).json({ error: 'Failed to mark client as followed up' });
@@ -967,7 +873,7 @@ export async function markClientAsSent(req, res) {
 
     res.json({
       success: true,
-      data: updatedClient,
+      data: serializeClientLeadForApi(updatedClient),
     });
   } catch (error) {
     console.error('Mark client as sent error:', error);
@@ -1057,13 +963,14 @@ export async function checkLeadsStatus(req, res) {
 
     // Map clients by email for easy lookup
     const clientsMap = new Map();
-    clients.forEach(client => {
+    clients.forEach((client) => {
+      const row = serializeClientLeadForApi(client);
       clientsMap.set(client.email.toLowerCase(), {
-        id: client.id,
-        email: client.email,
-        firstName: client.firstName,
-        lastName: client.lastName,
-        companyName: client.companyName,
+        id: row.id,
+        email: row.email,
+        firstName: row.firstName,
+        lastName: row.lastName,
+        companyName: row.companyName,
         status: client.status,
         isSent: client.isSent,
         isReplied: client.isReplied,
@@ -1117,32 +1024,10 @@ export async function getDashboardKPIs(req, res) {
     const monthStart = new Date(today.getFullYear(), today.getMonth(), 1);
     monthStart.setHours(0, 0, 0, 0);
     
-    // Count emails sent today (isSent = true AND lastSent is today)
-    const emailsSentToday = await clientRepository
-      .createQueryBuilder('client')
-      .where('client.deletedAt IS NULL')
-      .andWhere('client.isSent = :isSent', { isSent: true })
-      .andWhere('client.lastSent >= :today', { today })
-      .andWhere('client.lastSent < :tomorrow', { tomorrow })
-      .getCount();
-    
-    // Count emails sent this week
-    const emailsSentThisWeek = await clientRepository
-      .createQueryBuilder('client')
-      .where('client.deletedAt IS NULL')
-      .andWhere('client.isSent = :isSent', { isSent: true })
-      .andWhere('client.lastSent >= :weekStart', { weekStart })
-      .andWhere('client.lastSent < :tomorrow', { tomorrow })
-      .getCount();
-    
-    // Count emails sent this month
-    const emailsSentThisMonth = await clientRepository
-      .createQueryBuilder('client')
-      .where('client.deletedAt IS NULL')
-      .andWhere('client.isSent = :isSent', { isSent: true })
-      .andWhere('client.lastSent >= :monthStart', { monthStart })
-      .andWhere('client.lastSent < :tomorrow', { tomorrow })
-      .getCount();
+    // Count outbound emails (Nylas marketing sends + Gmail extension sends)
+    const emailsSentToday = await countOutboundEmailsInRange(today, tomorrow);
+    const emailsSentThisWeek = await countOutboundEmailsInRange(weekStart, tomorrow);
+    const emailsSentThisMonth = await countOutboundEmailsInRange(monthStart, tomorrow);
     
     // Count follow-up emails sent today (isFollowup = true AND lastSent is today)
     const followUpEmailsToday = await clientRepository
@@ -1220,16 +1105,10 @@ export async function getEmailsSentInDateRange(req, res) {
       return res.status(400).json({ error: 'startDate must be before or equal to endDate' });
     }
     
-    const clientRepository = AppDataSource.getRepository(Client);
-    
-    // Count emails sent in the date range
-    const emailsSent = await clientRepository
-      .createQueryBuilder('client')
-      .where('client.deletedAt IS NULL')
-      .andWhere('client.isSent = :isSent', { isSent: true })
-      .andWhere('client.lastSent >= :start', { start })
-      .andWhere('client.lastSent <= :end', { end })
-      .getCount();
+    const endExclusive = new Date(end);
+    endExclusive.setMilliseconds(endExclusive.getMilliseconds() + 1);
+
+    const emailsSent = await countOutboundEmailsInRange(start, endExclusive);
     
     res.json({
       success: true,
@@ -1253,21 +1132,11 @@ export async function resetLeadsStatus(req, res) {
       return res.status(400).json({ error: 'Lead IDs array is required' });
     }
 
-    const clientRepository = AppDataSource.getRepository(Client);
-    
-    // Reset status from 'ready' to 'new' for the specified leads
-    const result = await clientRepository
-      .createQueryBuilder()
-      .update(Client)
-      .set({ status: 'new' })
-      .where('id IN (:...leadIds)', { leadIds })
-      .andWhere('status = :readyStatus', { readyStatus: 'ready' })
-      .andWhere('deletedAt IS NULL')
-      .execute();
+    const reset = await resetLeadsFromReady(leadIds);
 
     res.json({
       success: true,
-      reset: result.affected || 0,
+      reset,
     });
   } catch (error) {
     console.error('Reset leads status error:', error);

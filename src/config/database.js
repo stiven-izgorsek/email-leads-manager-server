@@ -15,10 +15,16 @@ import {
   PortfolioTagSchema,
   NylasSlackNotificationSchema,
   IncomingMessageSchema,
+  IncomingMessageReplySchema,
   MessageTypeRuleSchema,
   CompanySchema,
   CompanySavedSearchSchema,
   CrmClientSchema,
+  MarketingAssignmentSchema,
+  MarketingAssignmentLeadSchema,
+  FollowupAssignmentSchema,
+  FollowupAssignmentLeadSchema,
+  CalendarEventSchema,
 } from '../entities/index.js';
 
 dotenv.config();
@@ -46,13 +52,22 @@ export const AppDataSource = new DataSource({
     PortfolioTagSchema,
     NylasSlackNotificationSchema,
     IncomingMessageSchema,
+    IncomingMessageReplySchema,
     MessageTypeRuleSchema,
     CompanySchema,
     CompanySavedSearchSchema,
     CrmClientSchema,
+    MarketingAssignmentSchema,
+    MarketingAssignmentLeadSchema,
+    FollowupAssignmentSchema,
+    FollowupAssignmentLeadSchema,
+    CalendarEventSchema,
   ],
   migrations: ['src/migrations/**/*.js'],
   subscribers: ['src/subscribers/**/*.js'],
+  extra: {
+    max: parseInt(process.env.DB_POOL_MAX || '20', 10),
+  },
 });
 
 export async function connectDatabase() {

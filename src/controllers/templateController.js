@@ -364,69 +364,93 @@ function renderTemplateVariables(template, vars) {
   return result;
 }
 
+/** Shared compose logic for HTTP handler and marketing send pipeline. */
+export async function composeLeadOutboundEmail({
+  lead,
+  accountName = '',
+  accountEmail = '',
+  messageType = 'outreach',
+  industry = '',
+}) {
+  if (!lead || typeof lead !== 'object') {
+    throw new Error('lead is required');
+  }
+  const requestedType =
+    messageType && typeof messageType === 'string' ? messageType : 'outreach';
+  const subjectRepo = AppDataSource.getRepository(Template);
+  const subjectTemplate = await selectSubjectTemplate(subjectRepo);
+  if (!subjectTemplate) {
+    throw new Error('No subject templates found');
+  }
+  const messageTemplate = await selectMessageTemplate(subjectRepo, requestedType, industry);
+  if (!messageTemplate) {
+    throw new Error(`No message templates found for type ${requestedType}`);
+  }
+  const normalizedLead = normalizeLeadVariables(lead);
+  const vars = {
+    ...normalizedLead,
+    senderName: accountName ?? '',
+    email: accountEmail ?? '',
+  };
+  const subject = sanitizeRandomPlaceholders(renderTemplateVariables(subjectTemplate.content, vars));
+  const body = sanitizeRandomPlaceholders(renderTemplateVariables(messageTemplate.content, vars));
+  await incrementTemplateUsedCount(subjectRepo, subjectTemplate.id);
+  await incrementTemplateUsedCount(subjectRepo, messageTemplate.id);
+  return {
+    subject,
+    body,
+    template: body,
+    industry: industry || '',
+    subjectTemplateId: subjectTemplate.id,
+    messageTemplateId: messageTemplate.id,
+  };
+}
+
 export async function composeEmailFromTemplates(req, res) {
   try {
     const { accountName, accountEmail, lead, messageType, industry } = req.body || {};
-    const requestedType = messageType && typeof messageType === 'string' ? messageType : 'outreach';
 
     if (!lead || typeof lead !== 'object') {
       return res.status(400).json({ error: 'lead is required' });
     }
 
-    const subjectRepo = AppDataSource.getRepository(Template);
-
-    const subjectTemplate = await selectSubjectTemplate(subjectRepo);
-
-    if (!subjectTemplate) {
-      return res.status(404).json({ error: 'No subject templates found' });
-    }
-
-    const messageTemplate = await selectMessageTemplate(subjectRepo, requestedType, industry);
-
-    if (!messageTemplate) {
-      return res.status(404).json({ error: `No message templates found for type ${requestedType}` });
-    }
-
-    const normalizedLead = normalizeLeadVariables(lead);
-
-    const senderVars = {
-      senderName: accountName ?? '',
-      email: accountEmail ?? '',
-    };
-
-    const vars = {
-      ...normalizedLead,
-      ...senderVars,
-    };
-
-    const subject = sanitizeRandomPlaceholders(renderTemplateVariables(subjectTemplate.content, vars));
-    const template = sanitizeRandomPlaceholders(renderTemplateVariables(messageTemplate.content, vars));
-
-    await incrementTemplateUsedCount(subjectRepo, subjectTemplate.id);
-    await incrementTemplateUsedCount(subjectRepo, messageTemplate.id);
+    const composed = await composeLeadOutboundEmail({
+      lead,
+      accountName,
+      accountEmail,
+      messageType,
+      industry,
+    });
 
     return res.json({
-      subject,
-      template,
-      industry: industry || '',
-      subjectTemplateId: subjectTemplate.id,
-      messageTemplateId: messageTemplate.id,
+      subject: composed.subject,
+      template: composed.body,
+      industry: composed.industry,
+      subjectTemplateId: composed.subjectTemplateId,
+      messageTemplateId: composed.messageTemplateId,
     });
   } catch (error) {
+    if (error.message?.includes('No subject') || error.message?.includes('No message templates')) {
+      return res.status(404).json({ error: error.message });
+    }
     console.error('composeEmailFromTemplates error:', error);
     return res.status(500).json({ error: 'Internal server error' });
   }
 }
 
-export async function composeAiEmail(req, res) {
-  try {
-    const { accountName, accountEmail, lead, messageType: bodyMessageType } = req.body || {};
-    if (!lead || typeof lead !== 'object') {
-      return res.status(400).json({ error: 'lead is required' });
-    }
+/** AI industry classification + template selection (same pipeline as gmail-extension compose AI). */
+export async function composeLeadOutboundEmailWithAi({
+  lead,
+  accountName = '',
+  accountEmail = '',
+  messageType,
+}) {
+  if (!lead || typeof lead !== 'object') {
+    throw new Error('lead is required');
+  }
 
-    const normalizedLead = normalizeLeadVariables(lead);
-    const requestedMessageType = resolveComposeMessageType(bodyMessageType, lead);
+  const normalizedLead = normalizeLeadVariables(lead);
+  const requestedMessageType = resolveComposeMessageType(messageType, lead);
 
     let websiteSummary = { sourceUrl: normalizedLead.companyUrl || '', pages: [], combinedText: '' };
     try {
@@ -533,15 +557,14 @@ export async function composeAiEmail(req, res) {
           console.warn('[OpenAI] composeAiEmail: falling back to lead-based industries:', msg.slice(0, 300));
         }
       } else {
-        console.error('composeAiEmail error:', error);
-        return res.status(error.status || 500).json({ error: error.message || 'Internal server error' });
+        throw error;
       }
     }
 
     const templateRepository = AppDataSource.getRepository(Template);
     const subjectTemplate = await selectSubjectTemplate(templateRepository);
     if (!subjectTemplate) {
-      return res.status(404).json({ error: 'No subject templates found' });
+      throw new Error('No subject templates found');
     }
 
     const messageTemplate = await selectMessageTemplate(
@@ -550,7 +573,7 @@ export async function composeAiEmail(req, res) {
       selectedIndustry
     );
     if (!messageTemplate) {
-      return res.status(404).json({ error: `No message templates found for type ${requestedMessageType}` });
+      throw new Error(`No message templates found for type ${requestedMessageType}`);
     }
 
     const vars = {
@@ -567,8 +590,9 @@ export async function composeAiEmail(req, res) {
     await incrementTemplateUsedCount(templateRepository, subjectTemplate.id);
     await incrementTemplateUsedCount(templateRepository, messageTemplate.id);
 
-    return res.json({
+    return {
       subject,
+      body: template,
       template,
       category,
       selectedIndustry,
@@ -580,8 +604,41 @@ export async function composeAiEmail(req, res) {
       messageType: requestedMessageType,
       usedAiClassification,
       openAiFailed,
+    };
+}
+
+export async function composeAiEmail(req, res) {
+  try {
+    const { accountName, accountEmail, lead, messageType: bodyMessageType } = req.body || {};
+    if (!lead || typeof lead !== 'object') {
+      return res.status(400).json({ error: 'lead is required' });
+    }
+
+    const result = await composeLeadOutboundEmailWithAi({
+      lead,
+      accountName,
+      accountEmail,
+      messageType: bodyMessageType,
+    });
+
+    return res.json({
+      subject: result.subject,
+      template: result.template,
+      category: result.category,
+      selectedIndustry: result.selectedIndustry,
+      reasoning: result.reasoning,
+      accuracy: result.accuracy,
+      websitePagesUsed: result.websitePagesUsed,
+      subjectTemplateId: result.subjectTemplateId,
+      messageTemplateId: result.messageTemplateId,
+      messageType: result.messageType,
+      usedAiClassification: result.usedAiClassification,
+      openAiFailed: result.openAiFailed,
     });
   } catch (error) {
+    if (error.message?.includes('No subject') || error.message?.includes('No message templates')) {
+      return res.status(404).json({ error: error.message });
+    }
     console.error('composeAiEmail error:', error);
     return res.status(error.status || 500).json({ error: error.message || 'Internal server error' });
   }

@@ -2,6 +2,7 @@ import { AppDataSource } from '../config/database.js';
 import { Brackets } from 'typeorm';
 import { CrmClient, CRM_CLIENT_STATUSES } from '../entities/CrmClient.js';
 import { Client } from '../entities/Client.js';
+import { sanitizeAiMarkerInName, serializeClientLeadForApi } from '../utils/leadNameSanitize.js';
 
 function normalizeStatus(raw, fallback = 'first_connected') {
   const s = String(raw || fallback).toLowerCase().trim();
@@ -76,6 +77,30 @@ function trimOrNull(v) {
   return s.length ? s : null;
 }
 
+function nameFieldOrNull(v) {
+  return sanitizeAiMarkerInName(trimOrNull(v));
+}
+
+function sentByAccountKey(raw) {
+  return String(raw || '').trim().toLowerCase();
+}
+
+/** Same lead may have multiple CRM clients when sent-by mailbox differs. */
+async function findCrmClientDuplicate(repo, { leadId, sentByAccount, excludeId }) {
+  if (!leadId) return null;
+  const qb = repo
+    .createQueryBuilder('c')
+    .where('c.leadId = :leadId', { leadId })
+    .andWhere('c.deletedAt IS NULL')
+    .andWhere("LOWER(TRIM(COALESCE(c.sentByAccount, ''))) = :sentKey", {
+      sentKey: sentByAccountKey(sentByAccount),
+    });
+  if (excludeId) {
+    qb.andWhere('c.id <> :excludeId', { excludeId });
+  }
+  return qb.getOne();
+}
+
 export function serializeCrmClient(row) {
   if (!row) return null;
   const statuses = getStatusesArray(row);
@@ -83,10 +108,10 @@ export function serializeCrmClient(row) {
     id: row.id,
     leadId: row.leadId,
     email: row.email,
-    firstName: row.firstName,
-    lastName: row.lastName,
+    firstName: sanitizeAiMarkerInName(row.firstName),
+    lastName: sanitizeAiMarkerInName(row.lastName),
     country: row.country,
-    companyName: row.companyName,
+    companyName: sanitizeAiMarkerInName(row.companyName),
     jobTitle: row.jobTitle,
     linkedin: row.linkedin,
     connectedAt: row.connectedAt instanceof Date ? row.connectedAt.toISOString() : row.connectedAt,
@@ -340,7 +365,7 @@ export async function getCrmClient(req, res) {
         where: { id: row.leadId, deletedAt: null },
       });
       if (leadRow) {
-        lead = {
+        lead = serializeClientLeadForApi({
           id: leadRow.id,
           email: leadRow.email,
           firstName: leadRow.firstName,
@@ -355,7 +380,7 @@ export async function getCrmClient(req, res) {
           tech: leadRow.tech,
           photoUrl: leadRow.photoUrl,
           status: leadRow.status,
-        };
+        });
       }
     }
 
@@ -384,9 +409,9 @@ function buildLeadFromBody(body, email) {
   const sentByAccount = trimOrNull(body.sentByAccount);
   return {
     email,
-    firstName: trimOrNull(body.firstName),
-    lastName: trimOrNull(body.lastName),
-    companyName: trimOrNull(body.companyName),
+    firstName: nameFieldOrNull(body.firstName),
+    lastName: nameFieldOrNull(body.lastName),
+    companyName: nameFieldOrNull(body.companyName),
     jobTitle: trimOrNull(body.jobTitle),
     linkedin: trimOrNull(body.linkedin),
     companyLocation: trimOrNull(body.country),
@@ -443,11 +468,12 @@ export async function createCrmClient(req, res) {
       }
     }
 
-    // Prevent duplicate CRM client for the same lead.
-    const dup = await repo.findOne({ where: { leadId, deletedAt: null } });
+    const sentByAccount = trimOrNull(body.sentByAccount);
+
+    const dup = await findCrmClientDuplicate(repo, { leadId, sentByAccount });
     if (dup) {
       return res.status(409).json({
-        error: 'A client already exists for this lead',
+        error: 'A client already exists for this lead and sent-by account',
         existingId: dup.id,
       });
     }
@@ -461,14 +487,14 @@ export async function createCrmClient(req, res) {
     const row = repo.create({
       leadId,
       email,
-      firstName: trimOrNull(body.firstName) || trimOrNull(snapshot?.firstName) || null,
-      lastName: trimOrNull(body.lastName) || trimOrNull(snapshot?.lastName) || null,
+      firstName: nameFieldOrNull(body.firstName) || nameFieldOrNull(snapshot?.firstName) || null,
+      lastName: nameFieldOrNull(body.lastName) || nameFieldOrNull(snapshot?.lastName) || null,
       country,
-      companyName: trimOrNull(body.companyName) || trimOrNull(snapshot?.companyName) || null,
+      companyName: nameFieldOrNull(body.companyName) || nameFieldOrNull(snapshot?.companyName) || null,
       jobTitle: trimOrNull(body.jobTitle) || trimOrNull(snapshot?.jobTitle) || null,
       linkedin: trimOrNull(body.linkedin) || trimOrNull(snapshot?.linkedin) || null,
       connectedAt: parseDate(body.connectedAt) || new Date(),
-      sentByAccount: trimOrNull(body.sentByAccount),
+      sentByAccount,
       chatHistory: body.chatHistory != null ? String(body.chatHistory) : null,
       note: body.note != null ? String(body.note) : null,
       rating: parseRating(body.rating),
@@ -507,10 +533,10 @@ export async function updateCrmClient(req, res) {
       if (!email) return res.status(400).json({ error: 'email cannot be empty' });
       existing.email = email;
     }
-    if (body.firstName !== undefined) existing.firstName = trimOrNull(body.firstName);
-    if (body.lastName !== undefined) existing.lastName = trimOrNull(body.lastName);
+    if (body.firstName !== undefined) existing.firstName = nameFieldOrNull(body.firstName);
+    if (body.lastName !== undefined) existing.lastName = nameFieldOrNull(body.lastName);
     if (body.country !== undefined) existing.country = trimOrNull(body.country);
-    if (body.companyName !== undefined) existing.companyName = trimOrNull(body.companyName);
+    if (body.companyName !== undefined) existing.companyName = nameFieldOrNull(body.companyName);
     if (body.jobTitle !== undefined) existing.jobTitle = trimOrNull(body.jobTitle);
     if (body.linkedin !== undefined) existing.linkedin = trimOrNull(body.linkedin);
     if (body.connectedAt !== undefined) existing.connectedAt = parseDate(body.connectedAt);
@@ -527,6 +553,18 @@ export async function updateCrmClient(req, res) {
       if (next) applyStatusesToRow(existing, next);
     }
     if (body.followUpAt !== undefined) existing.followUpAt = parseDate(body.followUpAt);
+
+    const dup = await findCrmClientDuplicate(repo, {
+      leadId: existing.leadId,
+      sentByAccount: existing.sentByAccount,
+      excludeId: existing.id,
+    });
+    if (dup) {
+      return res.status(409).json({
+        error: 'A client already exists for this lead and sent-by account',
+        existingId: dup.id,
+      });
+    }
 
     const saved = await repo.save(existing);
     res.json(serializeCrmClient(saved));
@@ -554,4 +592,32 @@ export async function deleteCrmClient(req, res) {
 
 export async function getCrmClientStatuses(req, res) {
   res.json({ data: CRM_CLIENT_STATUSES });
+}
+
+/** CRM clients per mailbox (`sentByAccount`), for incoming overview tables. */
+export async function getCrmClientCountsBySentAccount(req, res) {
+  try {
+    const repo = AppDataSource.getRepository(CrmClient);
+    const rows = await repo
+      .createQueryBuilder('c')
+      .select('LOWER(TRIM(c.sentByAccount))', 'sentByAccount')
+      .addSelect('COUNT(*)', 'count')
+      .where('c.deletedAt IS NULL')
+      .andWhere('c.sentByAccount IS NOT NULL')
+      .andWhere("TRIM(c.sentByAccount) <> ''")
+      .groupBy('LOWER(TRIM(c.sentByAccount))')
+      .getRawMany();
+
+    const counts = {};
+    for (const row of rows) {
+      const key = String(row.sentByAccount || '').trim().toLowerCase();
+      if (!key) continue;
+      counts[key] = Number(row.count || 0);
+    }
+
+    res.json({ data: counts });
+  } catch (error) {
+    console.error('getCrmClientCountsBySentAccount error:', error);
+    res.status(500).json({ error: 'Failed to load client counts' });
+  }
 }

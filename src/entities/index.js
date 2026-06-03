@@ -11,7 +11,13 @@ export { PortfolioWorkExperience, PortfolioWorkExperienceSchema } from './Portfo
 export { PortfolioTag, PortfolioTagSchema } from './PortfolioTag.js';
 export { NylasSlackNotification, NylasSlackNotificationSchema } from './NylasSlackNotification.js';
 export { IncomingMessage, IncomingMessageSchema } from './IncomingMessage.js';
+export { IncomingMessageReply, IncomingMessageReplySchema } from './IncomingMessageReply.js';
 export { MessageTypeRule, MessageTypeRuleSchema } from './MessageTypeRule.js';
 export { Company, CompanySchema, COMPANY_STATUSES } from './Company.js';
 export { CompanySavedSearch, CompanySavedSearchSchema } from './CompanySavedSearch.js';
 export { CrmClient, CrmClientSchema, CRM_CLIENT_STATUSES } from './CrmClient.js';
+export { MarketingAssignment, MarketingAssignmentSchema } from './MarketingAssignment.js';
+export { MarketingAssignmentLead, MarketingAssignmentLeadSchema } from './MarketingAssignmentLead.js';
+export { FollowupAssignment, FollowupAssignmentSchema } from './FollowupAssignment.js';
+export { FollowupAssignmentLead, FollowupAssignmentLeadSchema } from './FollowupAssignmentLead.js';
+export { CalendarEvent, CalendarEventSchema } from './CalendarEvent.js';

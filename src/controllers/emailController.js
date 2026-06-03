@@ -1,9 +1,190 @@
 import { AppDataSource } from '../config/database.js';
 import { Email } from '../entities/Email.js';
+import { Client } from '../entities/Client.js';
+import { CrmClient } from '../entities/CrmClient.js';
+import { serializeCrmClient } from './crmClientController.js';
 import fs from 'fs/promises';
 import XLSX from 'xlsx';
 import { sleep } from '../utils/nylasRateLimit.js';
 import { probeNylasGrantMessagesList } from '../services/nylasGrantProbeService.js';
+
+function normalizeEmailAddress(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+async function findActiveEmailByAddress(emailRepository, address) {
+  const normalized = normalizeEmailAddress(address);
+  if (!normalized) return null;
+  return emailRepository
+    .createQueryBuilder('email')
+    .where('LOWER(TRIM(email.address)) = :address', { address: normalized })
+    .andWhere('email.deletedAt IS NULL')
+    .getOne();
+}
+
+async function findSoftDeletedEmailByAddress(emailRepository, address) {
+  const normalized = normalizeEmailAddress(address);
+  if (!normalized) return null;
+  return emailRepository
+    .createQueryBuilder('email')
+    .where('LOWER(TRIM(email.address)) = :address', { address: normalized })
+    .andWhere('email.deletedAt IS NOT NULL')
+    .orderBy('email.deletedAt', 'DESC')
+    .getOne();
+}
+
+const VALID_EMAIL_STATUSES = ['new', 'good', 'bad', 'blocked', 'warmingup'];
+
+function applyEmailListFilters(queryBuilder, query) {
+  const includeDeleted =
+    query.includeDeleted === 'true' || query.includeDeleted === '1';
+
+  if (!includeDeleted) {
+    queryBuilder.where('email.deletedAt IS NULL');
+  }
+
+  const exactAddress = normalizeEmailAddress(query.address || '');
+  if (exactAddress) {
+    queryBuilder.andWhere('LOWER(TRIM(email.address)) = :exactAddress', {
+      exactAddress,
+    });
+  } else if (query.search) {
+    queryBuilder.andWhere('email.address ILIKE :search', { search: `%${query.search}%` });
+  }
+
+  const status = String(query.status || '').trim().toLowerCase();
+  if (status && VALID_EMAIL_STATUSES.includes(status)) {
+    queryBuilder.andWhere('email.status = :status', { status });
+  }
+}
+
+function buildEmailPayloadFromBody(body, emailAddress) {
+  const rawGmailUIndex = body.gmailUIndex ?? body.gmail_u_index;
+  const parsedGmailUIndex =
+    rawGmailUIndex === '' || rawGmailUIndex === null || rawGmailUIndex === undefined
+      ? null
+      : Number.parseInt(String(rawGmailUIndex), 10);
+
+  const rawMarketingDailyLimit = body.marketingDailyLimit ?? body.marketing_daily_limit;
+  const parsedMarketingDailyLimit =
+    rawMarketingDailyLimit === '' ||
+    rawMarketingDailyLimit === null ||
+    rawMarketingDailyLimit === undefined
+      ? null
+      : Number.parseInt(String(rawMarketingDailyLimit), 10);
+
+  return {
+    address: emailAddress,
+    firstName: body.firstName || body.first_name || null,
+    lastName: body.lastName || body.last_name || null,
+    marketingDailyLimit:
+      Number.isNaN(parsedMarketingDailyLimit) || parsedMarketingDailyLimit <= 0
+        ? null
+        : parsedMarketingDailyLimit,
+    accountId: body.accountId || null,
+    status: body.status || 'new',
+    password: body.password || null,
+    twoFa: body.twoFa || body['2fa'] || null,
+    recoveryEmail: body.recoveryEmail || null,
+    grantId: body.grantId || body.grant_id || null,
+    nylasKey: body.nylasKey || body.nylas_key || null,
+    chromePath: body.chromePath || body.chrome_path || null,
+    chromeUserDataDir: body.chromeUserDataDir || body.chrome_user_data_dir || null,
+    chromeProfileDirectory: body.chromeProfileDirectory || body.chrome_profile_directory || null,
+    gmailUIndex: Number.isNaN(parsedGmailUIndex) ? null : parsedGmailUIndex,
+  };
+}
+
+export async function getEmailById(req, res) {
+  try {
+    const emailRepository = AppDataSource.getRepository(Email);
+    const email = await emailRepository.findOne({
+      where: { id: req.params.id, deletedAt: null },
+      relations: ['account'],
+    });
+    if (!email) {
+      return res.status(404).json({ error: 'Email not found' });
+    }
+    res.json(email);
+  } catch (error) {
+    console.error('Get email by id error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
+/**
+ * Mailbox detail: email record, leads sent from this address (with lastSent), CRM clients linked to it.
+ */
+export async function getEmailDetail(req, res) {
+  try {
+    const emailRepository = AppDataSource.getRepository(Email);
+    const email = await emailRepository.findOne({
+      where: { id: req.params.id, deletedAt: null },
+      relations: ['account'],
+    });
+    if (!email) {
+      return res.status(404).json({ error: 'Email not found' });
+    }
+
+    const mailbox = normalizeEmailAddress(email.address);
+    const sentLimit = Math.min(500, Math.max(1, parseInt(String(req.query.sentLimit || '200'), 10) || 200));
+    const crmLimit = Math.min(500, Math.max(1, parseInt(String(req.query.crmLimit || '200'), 10) || 200));
+
+    const clientRepository = AppDataSource.getRepository(Client);
+    const sentLeads = await clientRepository
+      .createQueryBuilder('client')
+      .where('client.deletedAt IS NULL')
+      .andWhere('client.lastSent IS NOT NULL')
+      .andWhere("TRIM(COALESCE(client.email, '')) <> ''")
+      .andWhere('LOWER(COALESCE(client.sentBy, \'\')) LIKE :sentBy', { sentBy: `%${mailbox}%` })
+      .orderBy('client.lastSent', 'DESC')
+      .take(sentLimit)
+      .getMany();
+
+    const crmRepo = AppDataSource.getRepository(CrmClient);
+    const crmRows = await crmRepo
+      .createQueryBuilder('c')
+      .where('LOWER(TRIM(COALESCE(c.sentByAccount, \'\'))) = :mailbox', { mailbox })
+      .orderBy('c.updatedAt', 'DESC')
+      .take(crmLimit)
+      .getMany();
+
+    const sentLeadTotal = await clientRepository
+      .createQueryBuilder('client')
+      .where('client.deletedAt IS NULL')
+      .andWhere('client.lastSent IS NOT NULL')
+      .andWhere('LOWER(COALESCE(client.sentBy, \'\')) LIKE :sentBy', { sentBy: `%${mailbox}%` })
+      .getCount();
+
+    const crmTotal = await crmRepo
+      .createQueryBuilder('c')
+      .where('LOWER(TRIM(COALESCE(c.sentByAccount, \'\'))) = :mailbox', { mailbox })
+      .getCount();
+
+    res.json({
+      email,
+      sentLeads: sentLeads.map((row) => ({
+        id: row.id,
+        email: row.email,
+        firstName: row.firstName,
+        lastName: row.lastName,
+        companyName: row.companyName,
+        status: row.status,
+        lastSent: row.lastSent,
+        isSent: row.isSent,
+        isReplied: row.isReplied,
+        isFollowup: row.isFollowup,
+        sentBy: row.sentBy,
+      })),
+      sentLeadsTotal: sentLeadTotal,
+      crmClients: crmRows.map(serializeCrmClient),
+      crmClientsTotal: crmTotal,
+    });
+  } catch (error) {
+    console.error('Get email detail error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}
 
 export async function getEmails(req, res) {
   try {
@@ -15,26 +196,17 @@ export async function getEmails(req, res) {
 
     const queryBuilder = emailRepository
       .createQueryBuilder('email')
-      .leftJoinAndSelect('email.account', 'account')
-      .where('email.deletedAt IS NULL');
+      .leftJoinAndSelect('email.account', 'account');
 
-    if (req.query.search) {
-      queryBuilder.andWhere('email.address ILIKE :search', { search: `%${req.query.search}%` });
-    }
+    applyEmailListFilters(queryBuilder, req.query);
 
     const dataQuery = queryBuilder
       .orderBy('email.createdAt', 'DESC')
       .skip(skip)
       .take(limit);
 
-    // Create a separate query for count
-    const countQuery = emailRepository
-      .createQueryBuilder('email')
-      .where('email.deletedAt IS NULL');
-    
-    if (req.query.search) {
-      countQuery.andWhere('email.address ILIKE :search', { search: `%${req.query.search}%` });
-    }
+    const countQuery = emailRepository.createQueryBuilder('email');
+    applyEmailListFilters(countQuery, req.query);
 
     const [data, total] = await Promise.all([
       dataQuery.getMany(),
@@ -63,43 +235,31 @@ export async function createEmail(req, res) {
     }
 
     const emailRepository = AppDataSource.getRepository(Email);
-    
-    const emailAddress = (req.body.address || req.body.email).toLowerCase();
-    
-    // Check if email already exists
-    const existingEmail = await emailRepository.findOne({
-      where: { address: emailAddress, deletedAt: null },
-    });
+    const emailAddress = normalizeEmailAddress(req.body.address || req.body.email);
+    if (!emailAddress) {
+      return res.status(400).json({ error: 'Email address is required' });
+    }
 
-    if (existingEmail) {
+    const emailData = buildEmailPayloadFromBody(req.body, emailAddress);
+
+    const existingActive = await findActiveEmailByAddress(emailRepository, emailAddress);
+    if (existingActive) {
       return res.status(400).json({ error: 'Email already exists' });
     }
 
-    const rawGmailUIndex = req.body.gmailUIndex ?? req.body.gmail_u_index;
-    const parsedGmailUIndex =
-      rawGmailUIndex === '' || rawGmailUIndex === null || rawGmailUIndex === undefined
-        ? null
-        : Number.parseInt(String(rawGmailUIndex), 10);
-
-    const emailData = {
-      address: emailAddress,
-      accountId: req.body.accountId || null,
-      status: req.body.status || 'new',
-      password: req.body.password || null,
-      twoFa: req.body.twoFa || req.body['2fa'] || null,
-      recoveryEmail: req.body.recoveryEmail || null,
-      grantId: req.body.grantId || req.body.grant_id || null,
-      nylasKey: req.body.nylasKey || req.body.nylas_key || null,
-      chromePath: req.body.chromePath || req.body.chrome_path || null,
-      chromeUserDataDir: req.body.chromeUserDataDir || req.body.chrome_user_data_dir || null,
-      chromeProfileDirectory: req.body.chromeProfileDirectory || req.body.chrome_profile_directory || null,
-      gmailUIndex: Number.isNaN(parsedGmailUIndex) ? null : parsedGmailUIndex,
-    };
+    const softDeleted = await findSoftDeletedEmailByAddress(emailRepository, emailAddress);
+    if (softDeleted) {
+      await emailRepository.update(softDeleted.id, { ...emailData, deletedAt: null });
+      const restored = await emailRepository.findOne({
+        where: { id: softDeleted.id },
+        relations: ['account'],
+      });
+      return res.status(200).json(restored);
+    }
 
     const email = emailRepository.create(emailData);
     const savedEmail = await emailRepository.save(email);
 
-    // Load with relation
     const emailWithAccount = await emailRepository.findOne({
       where: { id: savedEmail.id },
       relations: ['account'],
@@ -134,10 +294,8 @@ export async function updateEmail(req, res) {
         return res.status(400).json({ error: 'Email address is required' });
       }
 
-      if (nextAddress !== email.address) {
-        const existing = await emailRepository.findOne({
-          where: { address: nextAddress, deletedAt: null },
-        });
+      if (nextAddress !== normalizeEmailAddress(email.address)) {
+        const existing = await findActiveEmailByAddress(emailRepository, nextAddress);
         if (existing && existing.id !== email.id) {
           return res.status(400).json({ error: 'Email already exists' });
         }
@@ -146,6 +304,26 @@ export async function updateEmail(req, res) {
     }
 
     if (req.body.status !== undefined) email.status = req.body.status;
+    if (req.body.firstName !== undefined || req.body.first_name !== undefined) {
+      email.firstName = req.body.firstName || req.body.first_name || null;
+    }
+    if (req.body.lastName !== undefined || req.body.last_name !== undefined) {
+      email.lastName = req.body.lastName || req.body.last_name || null;
+    }
+    if (
+      req.body.marketingDailyLimit !== undefined ||
+      req.body.marketing_daily_limit !== undefined
+    ) {
+      const raw =
+        req.body.marketingDailyLimit ?? req.body.marketing_daily_limit;
+      if (raw === '' || raw === null || raw === undefined) {
+        email.marketingDailyLimit = null;
+      } else {
+        const parsed = Number.parseInt(String(raw), 10);
+        email.marketingDailyLimit =
+          Number.isNaN(parsed) || parsed <= 0 ? null : parsed;
+      }
+    }
     if (req.body.accountId !== undefined) email.accountId = req.body.accountId || null;
     if (req.body.password !== undefined) email.password = req.body.password || null;
     if (req.body.twoFa !== undefined || req.body['2fa'] !== undefined) {
@@ -406,6 +584,20 @@ export async function uploadEmails(req, res) {
         try {
           const emailData = {
             address: emailAddress.toLowerCase().trim(),
+            firstName: getField(row, 'firstname', 'first_name', 'first') || null,
+            lastName: getField(row, 'lastname', 'last_name', 'last') || null,
+            marketingDailyLimit: (() => {
+              const raw = getField(
+                row,
+                'marketingdailylimit',
+                'marketing_daily_limit',
+                'dailylimit',
+                'daily_limit'
+              );
+              if (!raw) return null;
+              const n = Number.parseInt(String(raw), 10);
+              return Number.isNaN(n) || n <= 0 ? null : n;
+            })(),
             accountId: getField(row, 'accountid', 'account_id', 'account') || null,
             status: getField(row, 'status') || 'new',
             password: getField(row, 'password', 'pass') || null,

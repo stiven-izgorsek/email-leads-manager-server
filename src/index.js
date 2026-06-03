@@ -18,7 +18,12 @@ import crmClientRoutes from './routes/crmClientRoutes.js';
 import incomingMessageRoutes from './routes/incomingMessageRoutes.js';
 import applicationRoutes from './routes/applicationRoutes.js';
 import calendarRoutes from './routes/calendarRoutes.js';
+import marketingRoutes from './routes/marketingRoutes.js';
+import followupRoutes from './routes/followupRoutes.js';
 import { startNylasUnreadPollingJob } from './services/nylasPollingService.js';
+import { startCalendarSyncJob } from './services/calendarSyncJob.js';
+import { releaseAllOrphanedMarketingRuns } from './services/marketingService.js';
+import { releaseAllOrphanedFollowupRuns } from './services/followupService.js';
 
 // Load environment variables
 dotenv.config();
@@ -60,6 +65,8 @@ app.use('/api/crm-clients', crmClientRoutes);
 app.use('/api', incomingMessageRoutes);
 app.use('/api', applicationRoutes);
 app.use('/api/calendar', calendarRoutes);
+app.use('/api/marketing', marketingRoutes);
+app.use('/api/followup', followupRoutes);
 
 // Error handling middleware
 app.use((err, req, res, next) => {
@@ -88,7 +95,20 @@ app.use((req, res) => {
 async function startServer() {
   try {
     await connectDatabase();
+    const releasedMarketing = await releaseAllOrphanedMarketingRuns('server startup');
+    if (releasedMarketing > 0) {
+      console.log(
+        `[marketing] Cleared ${releasedMarketing} orphaned "running" mailbox flag(s) from before restart — refresh Marketing page`
+      );
+    }
+    const releasedFollowup = await releaseAllOrphanedFollowupRuns('server startup');
+    if (releasedFollowup > 0) {
+      console.log(
+        `[followup] Cleared ${releasedFollowup} orphaned "running" mailbox flag(s) from before restart`
+      );
+    }
     startNylasUnreadPollingJob();
+    startCalendarSyncJob();
     app.listen(PORT, () => {
       console.log(`Server is running on port ${PORT}`);
       console.log(`Health check: http://localhost:${PORT}/health`);

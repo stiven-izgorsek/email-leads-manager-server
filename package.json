@@ -7,6 +7,8 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
+    "migration:run": "node scripts/run-migrations.js",
+    "migration:revert": "node scripts/revert-migration.js",
     "cleanup:client": "node scripts/cleanup-client.js",
     "import:leads": "node scripts/import-leads-csv.js",
     "test": "echo \"Error: no test specified\" && exit 1"

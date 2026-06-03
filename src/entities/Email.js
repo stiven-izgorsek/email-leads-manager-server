@@ -1,9 +1,14 @@
 import { EntitySchema } from 'typeorm';
 
 export class Email {
-  constructor(id, address, accountId, status, password, twoFa, recoveryEmail, grantId, nylasKey, chromePath, chromeUserDataDir, chromeProfileDirectory, gmailUIndex, createdAt, updatedAt, deletedAt) {
+  constructor(id, address, firstName, lastName, marketingDailyLimit, marketingEnabled, followupEnabled, accountId, status, password, twoFa, recoveryEmail, grantId, nylasKey, chromePath, chromeUserDataDir, chromeProfileDirectory, gmailUIndex, createdAt, updatedAt, deletedAt) {
     this.id = id;
     this.address = address;
+    this.firstName = firstName;
+    this.lastName = lastName;
+    this.marketingDailyLimit = marketingDailyLimit;
+    this.marketingEnabled = marketingEnabled;
+    this.followupEnabled = followupEnabled;
     this.accountId = accountId;
     this.status = status;
     this.password = password;
@@ -34,6 +39,35 @@ export const EmailSchema = new EntitySchema({
       type: 'varchar',
       length: 255,
       nullable: false,
+    },
+    firstName: {
+      name: 'first_name',
+      type: 'varchar',
+      length: 255,
+      nullable: true,
+    },
+    lastName: {
+      name: 'last_name',
+      type: 'varchar',
+      length: 255,
+      nullable: true,
+    },
+    marketingDailyLimit: {
+      name: 'marketing_daily_limit',
+      type: 'int',
+      nullable: true,
+    },
+    marketingEnabled: {
+      name: 'marketing_enabled',
+      type: 'boolean',
+      nullable: false,
+      default: true,
+    },
+    followupEnabled: {
+      name: 'followup_enabled',
+      type: 'boolean',
+      nullable: false,
+      default: true,
     },
     accountId: {
       type: 'uuid',

@@ -14,6 +14,8 @@ import {
   markAllIncomingAsRead,
   listLatestUnreadIncoming,
   deleteIncomingMessage,
+  replyToIncomingMessage,
+  listIncomingMessageReplies,
 } from '../controllers/incomingMessageController.js';
 
 const router = express.Router();
@@ -26,6 +28,8 @@ router.delete('/incoming-messages/:id', deleteIncomingMessage);
 router.get('/incoming-messages/counts', listIncomingMessageTypeCounts);
 router.post('/incoming-messages/analyze-period', analyzeIncomingMessagesPeriod);
 router.get('/incoming-messages/:id/content', getIncomingMessageContent);
+router.get('/incoming-messages/:id/replies', listIncomingMessageReplies);
+router.post('/incoming-messages/:id/reply', replyToIncomingMessage);
 
 router.get('/message-type-rules', listMessageTypeRules);
 router.post('/message-type-rules', createMessageTypeRule);
