@@ -25,6 +25,8 @@ import {
   FollowupAssignmentSchema,
   FollowupAssignmentLeadSchema,
   CalendarEventSchema,
+  CalendarEventLocalSchema,
+  CalendarEventLocalExceptionSchema,
 } from '../entities/index.js';
 
 dotenv.config();
@@ -62,6 +64,8 @@ export const AppDataSource = new DataSource({
     FollowupAssignmentSchema,
     FollowupAssignmentLeadSchema,
     CalendarEventSchema,
+    CalendarEventLocalSchema,
+    CalendarEventLocalExceptionSchema,
   ],
   migrations: ['src/migrations/**/*.js'],
   subscribers: ['src/subscribers/**/*.js'],

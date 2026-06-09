@@ -21,3 +21,5 @@ export { MarketingAssignmentLead, MarketingAssignmentLeadSchema } from './Market
 export { FollowupAssignment, FollowupAssignmentSchema } from './FollowupAssignment.js';
 export { FollowupAssignmentLead, FollowupAssignmentLeadSchema } from './FollowupAssignmentLead.js';
 export { CalendarEvent, CalendarEventSchema } from './CalendarEvent.js';
+export { CalendarEventLocal, CalendarEventLocalSchema } from './CalendarEventLocal.js';
+export { CalendarEventLocalException, CalendarEventLocalExceptionSchema } from './CalendarEventLocalException.js';

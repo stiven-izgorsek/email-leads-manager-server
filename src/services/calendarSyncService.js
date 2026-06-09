@@ -10,6 +10,7 @@ import {
   extractMeetingDetails,
 } from './nylasCalendarService.js';
 import { sleep } from '../utils/nylasRateLimit.js';
+import { listExpandedLocalEvents } from './localCalendarService.js';
 
 const DEFAULT_SYNC_DAYS_BACK = 14;
 const DEFAULT_SYNC_DAYS_FORWARD = 120;
@@ -191,6 +192,7 @@ function rowToApiEvent(row, clientByEmail) {
 
   return {
     id: `${row.emailId}:${row.nylasEventId}`,
+    source: 'nylas',
     nylasEventId: row.nylasEventId,
     grantId: row.grantId,
     mailboxId: row.emailId,
@@ -331,6 +333,16 @@ export async function listCalendarEventsFromDb({ startSec, endSec, emailId, emai
 
   const events = rows.map((row) => rowToApiEvent(row, clientByEmail));
 
+  const localEvents = await listExpandedLocalEvents({
+    startSec,
+    endSec,
+    emailIds: ids.length > 0 ? ids : undefined,
+  });
+
+  const merged = [...events, ...localEvents].sort(
+    (a, b) => new Date(a.start).getTime() - new Date(b.start).getTime()
+  );
+
   const lastSynced = await eventRepo
     .createQueryBuilder('ce')
     .select('MAX(ce.synced_at)', 'max')
@@ -339,7 +351,7 @@ export async function listCalendarEventsFromDb({ startSec, endSec, emailId, emai
 
   return {
     range: { start: rangeStart.toISOString(), end: rangeEnd.toISOString() },
-    events,
+    events: merged,
     errors: [],
     lastSyncedAt,
     fromCache: true,

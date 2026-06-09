@@ -3,6 +3,13 @@ import {
   parseUnixRange,
   syncCalendarEventsFromNylas,
 } from '../services/calendarSyncService.js';
+import {
+  createLocalCalendarEvent,
+  updateLocalCalendarEvent,
+  deleteLocalCalendarEvent,
+  cancelLocalOccurrence,
+  parseLocalEventId,
+} from '../services/localCalendarService.js';
 
 function validateRange(rawStart, rawEnd, res) {
   if (!Number.isFinite(rawStart) || !Number.isFinite(rawEnd)) {
@@ -96,5 +103,77 @@ export async function syncCalendarEvents(req, res) {
   } catch (error) {
     console.error('syncCalendarEvents error:', error);
     return res.status(500).json({ error: error.message || 'Failed to sync calendar events' });
+  }
+}
+
+/** POST — create a manual local calendar event. */
+export async function createLocalEventHandler(req, res) {
+  try {
+    const result = await createLocalCalendarEvent(req.body || {});
+    return res.status(201).json({ success: true, ...result });
+  } catch (error) {
+    console.error('createLocalEvent error:', error);
+    const msg = error.message || 'Failed to create event';
+    const status = /required|Invalid|must be|not found/i.test(msg) ? 400 : 500;
+    return res.status(status).json({ error: msg });
+  }
+}
+
+/** PATCH — update a local event (series or single occurrence). */
+export async function updateLocalEventHandler(req, res) {
+  try {
+    const { id } = req.params;
+    const parsed = parseLocalEventId(id) || { masterId: id, occurrenceStart: null };
+    const body = { ...(req.body || {}) };
+    if (!body.occurrenceStart && parsed.occurrenceStart) {
+      body.occurrenceStart = parsed.occurrenceStart;
+    }
+    const result = await updateLocalCalendarEvent(parsed.masterId, body);
+    return res.json({ success: true, ...result });
+  } catch (error) {
+    console.error('updateLocalEvent error:', error);
+    const msg = error.message || 'Failed to update event';
+    const status = /required|Invalid|must be|not found|only valid/i.test(msg) ? 400 : 500;
+    return res.status(status).json({ error: msg });
+  }
+}
+
+/** DELETE — delete series or cancel one occurrence. */
+export async function deleteLocalEventHandler(req, res) {
+  try {
+    const { id } = req.params;
+    const parsed = parseLocalEventId(id) || { masterId: id, occurrenceStart: null };
+    const occurrenceStart =
+      req.query?.occurrenceStart ||
+      req.body?.occurrenceStart ||
+      parsed.occurrenceStart ||
+      null;
+    const result = await deleteLocalCalendarEvent(parsed.masterId, { occurrenceStart });
+    return res.json({ success: true, ...result });
+  } catch (error) {
+    console.error('deleteLocalEvent error:', error);
+    const msg = error.message || 'Failed to delete event';
+    const status = /Invalid|not found/i.test(msg) ? 400 : 500;
+    return res.status(status).json({ error: msg });
+  }
+}
+
+/** POST — cancel a single occurrence of a recurring local event. */
+export async function cancelLocalOccurrenceHandler(req, res) {
+  try {
+    const { id } = req.params;
+    const parsed = parseLocalEventId(id) || { masterId: id, occurrenceStart: null };
+    const occurrenceStart =
+      req.body?.occurrenceStart || parsed.occurrenceStart || req.query?.occurrenceStart;
+    if (!occurrenceStart) {
+      return res.status(400).json({ error: 'occurrenceStart is required' });
+    }
+    const result = await cancelLocalOccurrence(parsed.masterId, occurrenceStart);
+    return res.json({ success: true, ...result });
+  } catch (error) {
+    console.error('cancelLocalOccurrence error:', error);
+    const msg = error.message || 'Failed to cancel occurrence';
+    const status = /Invalid|not found|required/i.test(msg) ? 400 : 500;
+    return res.status(status).json({ error: msg });
   }
 }

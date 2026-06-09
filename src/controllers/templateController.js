@@ -99,6 +99,30 @@ async function findMessageTemplateForIndustryAndSize(templateRepository, message
     .getOne();
 }
 
+/** Normalize industries/tech from DB simple-array, JSON string, or comma-separated text. */
+function normalizeStringListField(value) {
+  if (value == null || value === '') return [];
+  if (Array.isArray(value)) {
+    return value.map((x) => String(x || '').trim()).filter(Boolean);
+  }
+  const raw = String(value).trim();
+  if (!raw) return [];
+  if (raw.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        return parsed.map((x) => String(x || '').trim()).filter(Boolean);
+      }
+    } catch {
+      // fall through
+    }
+  }
+  return raw
+    .split(/[,;|]/)
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+
 function normalizeLeadVariables(lead) {
   return {
     firstName: lead.firstName ?? lead.first_name ?? '',
@@ -106,13 +130,27 @@ function normalizeLeadVariables(lead) {
     companyUrl: lead.companyUrl ?? lead.websiteUrl ?? lead.website_url ?? lead.domain ?? '',
     email: lead.email ?? '',
     jobTitle: lead.jobTitle ?? lead.job_title ?? '',
-    industries: Array.isArray(lead.industries) ? lead.industries : [],
-    tech: Array.isArray(lead.tech) ? lead.tech : [],
+    industries: normalizeStringListField(lead.industries ?? lead.industry),
+    tech: normalizeStringListField(lead.tech),
     companyLocation: lead.companyLocation ?? lead.company_location ?? '',
     icebreakerTitle: lead.icebreakerTitle ?? lead.icebreaker_title ?? '',
     icebreaker: lead.icebreaker ?? '',
   };
 }
+
+/** Tech stack keywords → template category (curated lead tech field is high trust). */
+const TECH_CATEGORY_HINTS = [
+  { category: 'E-commerce', patterns: ['shopify', 'woocommerce', 'magento', 'bigcommerce', 'prestashop'] },
+  { category: 'Fintech', patterns: ['stripe', 'plaid', 'adyen', 'paypal', 'fintech', 'banking', 'payments'] },
+  { category: 'E-learning', patterns: ['moodle', 'canvas', 'teachable', 'thinkific', 'e-learning', 'elearning'] },
+  { category: 'CRM', patterns: ['salesforce', 'hubspot', 'zoho crm', 'pipedrive'] },
+  { category: 'AI-chatbot', patterns: ['openai', 'chatgpt', 'langchain', 'dialogflow', 'chatbot'] },
+  { category: 'AI-healthcare', patterns: ['epic', 'cerner', 'telehealth', 'healthtech'] },
+  { category: 'healthcare', patterns: ['medical', 'hospital', 'pharma', 'biotech'] },
+  { category: 'petcare', patterns: ['pet care', 'veterinary', 'vet clinic'] },
+  { category: 'travel', patterns: ['booking.com', 'amadeus', 'sabre', 'hospitality'] },
+  { category: 'mqtt-energy', patterns: ['mqtt', 'iot energy', 'smart grid', 'solar'] },
+];
 
 const COMPOSE_MESSAGE_TYPES = new Set(['outreach', 'followup', '2nd-followup']);
 
@@ -146,51 +184,148 @@ function resolveComposeMessageType(explicit, lead) {
   return 'outreach';
 }
 
+function categoryMatchVariants(category) {
+  const c = category.toLowerCase();
+  return [c, c.replace(/-/g, ' '), c.replace(/-/g, '')].filter((v) => v.length > 1);
+}
+
 /**
- * Best-effort map CRM lead industries / tech / titles to a template industry bucket when OpenAI is unavailable.
+ * Score how well a category fits lead industries, tech, and company context.
+ * Industries and tech from CRM/Apollo are weighted higher than job title/company name hints.
  */
-function pickIndustryFromLead(normalizedLead) {
-  const industries = Array.isArray(normalizedLead.industries) ? normalizedLead.industries : [];
-  const tech = Array.isArray(normalizedLead.tech) ? normalizedLead.tech : [];
+function scoreCategoryForLead(normalizedLead, category) {
+  const industries = normalizedLead.industries || [];
+  const tech = normalizedLead.tech || [];
+  const variants = categoryMatchVariants(category);
+  let score = 0;
+
+  for (const raw of industries) {
+    const s = String(raw || '').toLowerCase().trim();
+    if (!s) continue;
+    const c = category.toLowerCase();
+    if (s === c || s === category) score += 14;
+    else if (s.includes(c) || c.includes(s)) score += 9;
+    for (const v of variants) {
+      if (v.length > 2 && (s.includes(v) || v.includes(s))) score += 5;
+    }
+  }
+
+  for (const raw of tech) {
+    const s = String(raw || '').toLowerCase().trim();
+    if (!s) continue;
+    for (const hint of TECH_CATEGORY_HINTS) {
+      if (hint.category !== category) continue;
+      for (const p of hint.patterns) {
+        if (s.includes(p) || p.includes(s)) score += 10;
+      }
+    }
+    const c = category.toLowerCase();
+    if (s.includes(c) || c.includes(s)) score += 6;
+  }
+
   const blob = [
-    ...industries.map((x) => String(x || '').toLowerCase()),
-    ...tech.map((x) => String(x || '').toLowerCase()),
     String(normalizedLead.jobTitle || '').toLowerCase(),
     String(normalizedLead.companyName || '').toLowerCase(),
-  ]
-    .join(' ')
-    .replace(/\s+/g, ' ');
+  ].join(' ');
+  for (const v of variants) {
+    if (v.length > 2 && blob.includes(v)) score += 2;
+  }
+
+  return score;
+}
+
+/**
+ * Map CRM lead industries / tech to a template industry bucket (authoritative when Apollo data exists).
+ */
+function pickIndustryFromLead(normalizedLead) {
+  const hasLeadSignals =
+    (normalizedLead.industries?.length || 0) > 0 || (normalizedLead.tech?.length || 0) > 0;
 
   let best = null;
   let bestScore = 0;
 
   for (const cat of COMPANY_CATEGORIES) {
-    const c = cat.toLowerCase();
-    const variants = [c, c.replace(/-/g, ' '), c.replace(/-/g, '')].filter((v) => v.length > 1);
-
-    let score = 0;
-    for (const raw of industries) {
-      const s = String(raw || '').toLowerCase().trim();
-      if (!s) continue;
-      if (s === c) score += 12;
-      else if (s === cat) score += 12;
-      else if (s.includes(c) || c.includes(s)) score += 7;
-      for (const v of variants) {
-        if (v.length > 2 && s.includes(v)) score += 4;
-      }
-    }
-    for (const v of variants) {
-      if (v.length > 2 && blob.includes(v)) score += 2;
-    }
+    const score = scoreCategoryForLead(normalizedLead, cat);
     if (score > bestScore) {
       bestScore = score;
       best = cat;
     }
   }
 
-  if (best && bestScore >= 3) return best;
-  if (best && bestScore > 0) return best;
+  if (best && bestScore >= 4) return best;
+  if (best && bestScore > 0 && hasLeadSignals) return best;
   return 'Other';
+}
+
+/**
+ * Merge website AI classification with lead industries/tech (lead CRM fields are curated and trusted).
+ */
+function reconcileIndustryClassification({
+  aiCategory,
+  aiAccuracy,
+  aiReasoning,
+  normalizedLead,
+  websiteSummary,
+}) {
+  const leadCategory = pickIndustryFromLead(normalizedLead);
+  const leadScore = scoreCategoryForLead(normalizedLead, leadCategory);
+  const aiScore = scoreCategoryForLead(normalizedLead, aiCategory);
+  const websiteText = String(websiteSummary?.combinedText || '').trim();
+  const sparseWebsite = websiteText.length < 250;
+  const hasLeadData =
+    (normalizedLead.industries?.length || 0) > 0 || (normalizedLead.tech?.length || 0) > 0;
+
+  let category = aiCategory;
+  let accuracy = aiAccuracy;
+  let reasoning = aiReasoning;
+  const notes = [];
+
+  if (!hasLeadData) {
+    return { category, selectedIndustry: accuracy < 3 ? 'Other' : category, accuracy, reasoning };
+  }
+
+  if (leadCategory === aiCategory) {
+    accuracy = Math.min(10, Math.max(accuracy, leadScore >= 8 ? 8 : accuracy + 1));
+    notes.push(`Lead industries/tech align with website classification (${leadCategory}).`);
+  } else if (sparseWebsite && leadScore >= 4) {
+    category = leadCategory;
+    accuracy = Math.min(10, Math.max(6, Math.floor(leadScore / 2)));
+    notes.push('Sparse website content; using lead industries and tech.');
+  } else if (leadScore >= 10 && aiAccuracy < 7) {
+    category = leadCategory;
+    accuracy = Math.min(9, Math.max(accuracy, Math.floor(leadScore / 2)));
+    notes.push('Strong lead industry/tech signal overrides low-confidence website guess.');
+  } else if (leadScore >= aiScore + 5 && aiAccuracy <= 6) {
+    category = leadCategory;
+    accuracy = Math.min(8, Math.max(accuracy, Math.floor(leadScore / 2)));
+    notes.push('Lead industries/tech fit better than website-only classification.');
+  } else if (aiCategory === 'unknown' && leadCategory !== 'Other' && leadScore >= 5) {
+    category = leadCategory;
+    accuracy = Math.max(accuracy, 5);
+    notes.push('Website unclear; applied lead industries/tech.');
+  } else if (aiAccuracy >= 8 && aiScore >= leadScore) {
+    notes.push(`Website analysis (${aiCategory}) kept; lead data supports or is neutral.`);
+  } else if (leadScore >= 6 && aiAccuracy < 5) {
+    category = leadCategory;
+    accuracy = Math.max(accuracy, 5);
+    notes.push('Low website confidence; favored lead industries/tech.');
+  }
+
+  const selectedIndustry = accuracy < 3 ? 'Other' : category;
+  if (notes.length) {
+    const leadCtx = [
+      normalizedLead.industries?.length ? `industries: ${normalizedLead.industries.join(', ')}` : '',
+      normalizedLead.tech?.length ? `tech: ${normalizedLead.tech.join(', ')}` : '',
+    ]
+      .filter(Boolean)
+      .join('; ');
+    reasoning = [reasoning, ...notes, leadCtx ? `Lead data: ${leadCtx}.` : '']
+      .filter(Boolean)
+      .join(' ')
+      .trim();
+  }
+
+  return { category, selectedIndustry, accuracy, reasoning };
 }
 
 function isOpenAiComposeFallbackError(err) {
@@ -487,19 +622,28 @@ export async function composeLeadOutboundEmailWithAi({
     try {
       assertOpenAiConfigured();
       const systemPrompt = [
-        'You classify companies into a fixed list of categories based on their website HTML/text content.',
-        'Return only valid JSON.',
-        'The JSON must have keys: category, reasoning, accuracy.',
+        'You classify B2B companies into a fixed list of categories for cold-email template selection.',
+        'Return only valid JSON with keys: category, reasoning, accuracy.',
         `Allowed categories: ${COMPANY_CATEGORIES.join(', ')}.`,
         'Choose exactly one category from the allowed list.',
-        'Do not invent facts not supported by the website/company context.',
-        'Base the decision mainly on website HTML/text content.',
-        'Use accuracy as a number from 0 to 10 indicating confidence in the chosen category.',
-        'If the website content is sparse or unclear, use a lower accuracy and choose the closest unknown category when appropriate.',
+        'Use ALL evidence: (1) lead.industries and lead.tech from CRM/Apollo — these are curated and usually correct;',
+        '(2) website HTML/text; (3) company name, job title, and URL as secondary hints.',
+        'When lead.industries or lead.tech clearly indicate a sector (e.g. "financial services", "e-learning", Shopify stack),',
+        'your category must agree unless the website strongly contradicts it.',
+        'If website content is sparse or generic, rely more on lead.industries and lead.tech and lower accuracy.',
+        'accuracy is 0–10 confidence in the final category.',
+        'Do not invent facts not supported by the provided context.',
       ].join(' ');
 
       const userPrompt = JSON.stringify({
-        lead: normalizedLead,
+        lead: {
+          companyName: normalizedLead.companyName,
+          companyUrl: normalizedLead.companyUrl,
+          jobTitle: normalizedLead.jobTitle,
+          industries: normalizedLead.industries,
+          tech: normalizedLead.tech,
+          companyLocation: normalizedLead.companyLocation,
+        },
         websiteSummary: {
           sourceUrl: websiteSummary.sourceUrl,
           pages: websiteSummary.pages.map((page) => ({
@@ -509,11 +653,12 @@ export async function composeLeadOutboundEmailWithAi({
           combinedText: websiteSummary.combinedText,
         },
         instructions: {
-          goal: 'Classify this company into one allowed category using the website content.',
+          goal:
+            'Pick one allowed category. Weight lead.industries and lead.tech heavily; use website content to confirm or refine.',
           outputFormat: {
             category: 'one string from the allowed category list',
-            reasoning: 'short string',
-            accuracy: 'number from 0 to 10 indicating how confident the classification is',
+            reasoning: 'short string explaining website + lead.industries/tech alignment',
+            accuracy: 'number 0–10',
           },
         },
       });
@@ -541,6 +686,19 @@ export async function composeLeadOutboundEmailWithAi({
         openAiFailed = true;
       } else {
         applyAiClassification(parsed);
+        if (!openAiFailed) {
+          const reconciled = reconcileIndustryClassification({
+            aiCategory: category,
+            aiAccuracy: accuracy,
+            aiReasoning: reasoning,
+            normalizedLead,
+            websiteSummary,
+          });
+          category = reconciled.category;
+          selectedIndustry = reconciled.selectedIndustry;
+          accuracy = reconciled.accuracy;
+          reasoning = reconciled.reasoning;
+        }
       }
     } catch (error) {
       if (isOpenAiComposeFallbackError(error)) {
