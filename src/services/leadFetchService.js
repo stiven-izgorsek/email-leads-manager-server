@@ -128,6 +128,42 @@ export function buildUncontactedLeadsQuery(clientRepo, options = {}) {
     );
 }
 
+/** Quick counts explaining why /uncontacted may return no rows. */
+export async function getUncontactedPoolStats(options = {}) {
+  const clientRepo = AppDataSource.getRepository(Client);
+  const baseQb = clientRepo
+    .createQueryBuilder('client')
+    .where('client.deletedAt IS NULL')
+    .andWhere('(client.isSent = false OR client.isSent IS NULL)')
+    .andWhere(NEW_STATUS_WHERE);
+
+  const newTotal = await baseQb.clone().getCount();
+
+  const verifiedQb = baseQb.clone().andWhere('client.millionsStatus IN (:...millionsStatuses)', {
+    millionsStatuses: ['good', 'risky'],
+  });
+  const newVerified = await verifiedQb.clone().getCount();
+
+  const available = await buildUncontactedLeadsQuery(clientRepo, options).getCount();
+
+  const blockedByPendingMarketing = await verifiedQb
+    .clone()
+    .andWhere(
+      `EXISTS (
+        SELECT 1 FROM marketing_assignment_lead mal
+        WHERE mal.client_id = client.id AND mal.send_status = 'pending'
+      )`
+    )
+    .getCount();
+
+  return {
+    newTotal,
+    newVerifiedGoodOrRisky: newVerified,
+    available,
+    blockedByPendingMarketing,
+  };
+}
+
 export async function fetchUncontactedVerifiedLeads(options = {}) {
   const count = Math.max(1, parseInt(String(options.count), 10) || 1);
 

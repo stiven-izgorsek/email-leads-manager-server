@@ -32,6 +32,41 @@ function messageToMatches(message, leadEmail) {
 }
 
 /**
+ * Load latest stored Nylas send per client for this mailbox (batch).
+ * @returns {Promise<Map<string, { messageId: string|null, subject: string, sentAt: Date|null }>>}
+ */
+export async function loadStoredMarketingNylasMessageMap(emailId, clientIds) {
+  const ids = (clientIds || []).filter(Boolean);
+  const map = new Map();
+  if (!emailId || !ids.length) return map;
+
+  const rows = await AppDataSource.manager.query(
+    `SELECT DISTINCT ON (mal.client_id)
+       mal.client_id AS "clientId",
+       mal.nylas_message_id AS "nylasMessageId",
+       mal.subject AS "subject",
+       mal.sent_at AS "sentAt"
+     FROM marketing_assignment_lead mal
+     INNER JOIN marketing_assignment ma ON ma.id = mal.assignment_id
+     WHERE ma.email_id = $1
+       AND mal.client_id = ANY($2::uuid[])
+       AND mal.send_status = 'sent'
+     ORDER BY mal.client_id, mal.sent_at DESC NULLS LAST, mal."createdAt" DESC`,
+    [emailId, ids]
+  );
+
+  for (const row of rows) {
+    const messageId = String(row.nylasMessageId || '').trim();
+    map.set(row.clientId, {
+      messageId: messageId || null,
+      subject: String(row.subject || '').trim() || '(no subject)',
+      sentAt: row.sentAt || null,
+    });
+  }
+  return map;
+}
+
+/**
  * Prefer Nylas marketing send record, then search Nylas for the outbound message to this lead.
  * @returns {Promise<{ messageId: string, subject: string } | null>}
  */
@@ -43,18 +78,25 @@ export async function resolveOriginalOutboundForFollowup({
   clientId,
   leadEmail,
   lastSent,
+  storedMessageMap,
 }) {
-  const stored = await findStoredMarketingNylasMessage(emailId, clientId);
-  if (stored?.messageId) return stored;
+  const cached = storedMessageMap?.get?.(clientId);
+  if (cached?.messageId) {
+    return { messageId: cached.messageId, subject: cached.subject || '(no subject)' };
+  }
 
-  if (!grantId || !nylasKey || !leadEmail || !lastSent) return null;
+  const stored = cached || (await findStoredMarketingNylasMessage(emailId, clientId));
+  if (stored?.messageId) return { messageId: stored.messageId, subject: stored.subject };
 
+  if (!grantId || !nylasKey || !leadEmail) return null;
+
+  const anchorSent = stored?.sentAt || lastSent;
   return findNylasOutboundToLead({
     grantId,
     nylasKey,
     mailboxAddress,
     leadEmail,
-    lastSent,
+    lastSent: anchorSent,
   });
 }
 
@@ -66,17 +108,20 @@ async function findStoredMarketingNylasMessage(emailId, clientId) {
     .where('ma.emailId = :emailId', { emailId })
     .andWhere('mal.clientId = :clientId', { clientId })
     .andWhere('mal.sendStatus = :sent', { sent: 'sent' })
-    .andWhere('mal.nylasMessageId IS NOT NULL')
-    .andWhere("TRIM(mal.nylasMessageId) <> ''")
     .orderBy('mal.sentAt', 'DESC')
     .addOrderBy('mal.createdAt', 'DESC')
     .getOne();
 
-  if (!row?.nylasMessageId) return null;
-  return {
-    messageId: String(row.nylasMessageId).trim(),
-    subject: String(row.subject || '').trim() || '(no subject)',
-  };
+  if (!row) return null;
+  const messageId = String(row.nylasMessageId || '').trim();
+  if (messageId) {
+    return {
+      messageId,
+      subject: String(row.subject || '').trim() || '(no subject)',
+      sentAt: row.sentAt || null,
+    };
+  }
+  return { messageId: null, subject: String(row.subject || '').trim(), sentAt: row.sentAt || null };
 }
 
 async function fetchNylasMessageById(grantId, nylasKey, messageId) {
@@ -116,8 +161,8 @@ async function findNylasOutboundToLead({ grantId, nylasKey, mailboxAddress, lead
   const sentMs = lastSent instanceof Date ? lastSent.getTime() : new Date(lastSent).getTime();
   if (!Number.isFinite(sentMs)) return null;
 
-  const receivedAfter = Math.floor((sentMs - 3 * 86400000) / 1000);
-  const receivedBefore = Math.floor((sentMs + 2 * 86400000) / 1000);
+  const receivedAfter = Math.floor((sentMs - 7 * 86400000) / 1000);
+  const receivedBefore = Math.floor((sentMs + 3 * 86400000) / 1000);
   const lead = normalizeEmail(leadEmail);
 
   const baseUrls = getNylasBaseUrls();

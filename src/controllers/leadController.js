@@ -8,10 +8,12 @@ import path from 'path';
 import { verifyEmailsBulk } from '../services/millionsService.js';
 import {
   fetchUncontactedVerifiedLeads,
+  getUncontactedPoolStats,
   resetLeadsFromReady,
 } from '../services/leadFetchService.js';
 import { countOutboundEmailsInRange } from '../services/outboundEmailStatsService.js';
 import { leadsToCsv } from '../utils/csvExport.js';
+import { getFirstEmailFromCsvRow } from '../utils/csvLeadImport.js';
 import {
   formatUncontactedLeadForExtension,
   sanitizeAiMarkerInName,
@@ -467,8 +469,8 @@ export async function uploadLeads(req, res) {
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i];
 
-      // Handle different email field names (email, workemail, work_email, etc.)
-      const email = getField(row, 'email', 'workemail', 'work_email', 'e-mail', 'e_mail') || '';
+      // Email: primary column, then Email_2, Email_3, … (ContactOut export)
+      const email = getFirstEmailFromCsvRow(row);
       if (email) {
         try {
           // Handle LinkedIn profile URL - check multiple variations
@@ -741,15 +743,34 @@ export async function getUncontactedLeads(req, res) {
 
     console.log('[getUncontactedLeads] Found', leads.length, 'leads. Filter mode:', leadFilterMode, 'Filter ID:', leadFilterId);
 
-    // Format response to match extension expectations
     const formattedLeads = leads.map(formatUncontactedLeadForExtension);
+
+    const meta = {
+      total: formattedLeads.length,
+      count: formattedLeads.length,
+    };
+
+    if (!formattedLeads.length) {
+      const pool = await getUncontactedPoolStats({
+        verifiedOnly,
+        leadFilterId,
+        leadFilterMode,
+        location,
+        industry,
+        excludeClientIds,
+      });
+      meta.pool = pool;
+      if (pool.available === 0 && pool.blockedByPendingMarketing > 0) {
+        meta.reason =
+          'All verified new leads are already assigned to Marketing outreach (pending). Unassign or send them first.';
+      } else if (pool.available === 0 && verifiedOnly) {
+        meta.reason = 'No Millions-verified (good/risky) new leads available. Try verifiedOnly=false or verify more leads.';
+      }
+    }
 
     res.json({
       data: formattedLeads,
-      meta: {
-        total: formattedLeads.length,
-        count: formattedLeads.length,
-      },
+      meta,
     });
   } catch (error) {
     console.error('Get uncontacted leads error:', error);

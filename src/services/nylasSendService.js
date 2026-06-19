@@ -15,45 +15,80 @@ function nylasSendLog(message, extra) {
   console.log(`[nylas-send] ${new Date().toISOString()} ${message}${suffix}`);
 }
 
+function normalizeRecipientList(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const item of raw) {
+    let email = '';
+    let name = null;
+    if (typeof item === 'string') {
+      email = String(item || '').trim().toLowerCase();
+    } else if (item && typeof item === 'object') {
+      email = String(item.email || '').trim().toLowerCase();
+      name = item.name ? String(item.name).trim() : null;
+    }
+    if (!email || !/^[^\s<>]+@[^\s<>]+$/.test(email) || seen.has(email)) continue;
+    seen.add(email);
+    out.push({ email, name: name || email });
+  }
+  return out;
+}
+
 export async function sendNylasEmail({
   grantId,
   nylasKey,
   toEmail,
   toName,
+  toRecipients,
+  ccRecipients,
+  bccRecipients,
   subject,
   body,
   replyToMessageId,
 }) {
   const gid = String(grantId || '').trim();
   const key = String(nylasKey || '').trim();
-  const to = String(toEmail || '').trim().toLowerCase();
+  const normalizedTo = normalizeRecipientList(toRecipients);
+  const toList =
+    normalizedTo.length > 0
+      ? normalizedTo
+      : toEmail
+        ? normalizeRecipientList([{ email: toEmail, name: toName || toEmail }])
+        : [];
 
-  if (!gid || !key || !to) {
+  if (!gid || !key || !toList.length) {
     nylasSendLog('rejected — missing credentials', {
       hasGrant: Boolean(gid),
       hasKey: Boolean(key),
-      hasTo: Boolean(to),
+      toCount: toList.length,
     });
-    return { ok: false, error: 'grantId, nylasKey, and toEmail are required' };
+    return { ok: false, error: 'grantId, nylasKey, and at least one recipient are required' };
   }
   if (!subject || !body) {
-    nylasSendLog('rejected — missing subject/body', { to });
+    nylasSendLog('rejected — missing subject/body', { to: toList.map((r) => r.email).join(', ') });
     return { ok: false, error: 'subject and body are required' };
   }
 
+  const cc = normalizeRecipientList(ccRecipients);
+  const bcc = normalizeRecipientList(bccRecipients);
   const replyId = String(replyToMessageId || '').trim();
   const payload = {
     subject: String(subject),
     body: formatEmailBodyForHtmlSend(body),
-    to: [{ email: to, name: toName ? String(toName) : to }],
+    to: toList.map(({ email, name }) => ({ email, name: name || email })),
   };
+  if (cc.length) payload.cc = cc.map(({ email, name }) => ({ email, name: name || email }));
+  if (bcc.length) payload.bcc = bcc.map(({ email, name }) => ({ email, name: name || email }));
   if (replyId) {
     payload.reply_to_message_id = replyId;
   }
 
+  const toSummary = toList.map((r) => r.email).join(', ');
   nylasSendLog('request', {
     grantPrefix: gid.slice(0, 8),
-    to,
+    to: toSummary,
+    ccCount: cc.length,
     subject: String(subject).slice(0, 80),
     bodyLen: String(body).length,
     replyToMessageId: replyId ? `${replyId.slice(0, 12)}…` : null,
@@ -82,12 +117,12 @@ export async function sendNylasEmail({
         } catch {
           // ignore parse
         }
-        nylasSendLog('success', { to, httpStatus: response.status, messageId, baseUrl });
+        nylasSendLog('success', { to: toSummary, httpStatus: response.status, messageId, baseUrl });
         return { ok: true, messageId, httpStatus: response.status };
       }
       last = { status: response.status, text };
       nylasSendLog('http error', {
-        to,
+        to: toSummary,
         baseUrl,
         httpStatus: response.status,
         bodyPreview: text.slice(0, 300),
@@ -95,13 +130,13 @@ export async function sendNylasEmail({
       if (response.status === 401 && configuredNylasRegion) break;
     } catch (err) {
       last = { status: 0, text: String(err?.message || err) };
-      nylasSendLog('network error', { to, baseUrl, error: last.text });
+      nylasSendLog('network error', { to: toSummary, baseUrl, error: last.text });
       if (configuredNylasRegion) break;
     }
   }
 
   const snippet = last.text.length > 600 ? `${last.text.slice(0, 600)}…` : last.text;
-  nylasSendLog('failed all endpoints', { to, httpStatus: last.status, error: snippet });
+  nylasSendLog('failed all endpoints', { to: toSummary, httpStatus: last.status, error: snippet });
   return {
     ok: false,
     httpStatus: last.status || undefined,

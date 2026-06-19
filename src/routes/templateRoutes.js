@@ -7,7 +7,8 @@ import {
   generateMessageTemplates,
   updateMessageTemplate,
   composeEmailFromTemplates,
-  composeAiEmail
+  composeAiEmail,
+  renderTemplateContentHttp,
 } from '../controllers/templateController.js';
 
 const router = express.Router();
@@ -25,5 +26,6 @@ router.put('/message-templates/:id', updateMessageTemplate);
 // Compose email (backend selects templates + renders {{...}} placeholders)
 router.post('/compose-email', composeEmailFromTemplates);
 router.post('/compose-ai-email', composeAiEmail);
+router.post('/render-template-content', renderTemplateContentHttp);
 
 export default router;

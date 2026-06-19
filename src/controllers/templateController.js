@@ -541,6 +541,31 @@ export async function composeLeadOutboundEmail({
   };
 }
 
+/** Render template placeholders for manual compose (subject/body snippets). */
+export function renderTemplateContent(content, { lead, accountName, accountEmail } = {}) {
+  const normalizedLead = normalizeLeadVariables(lead || {});
+  const vars = {
+    ...normalizedLead,
+    senderName: accountName ?? '',
+    email: accountEmail ?? '',
+  };
+  return sanitizeRandomPlaceholders(renderTemplateVariables(String(content || ''), vars));
+}
+
+export async function renderTemplateContentHttp(req, res) {
+  try {
+    const { content, lead, accountName, accountEmail } = req.body || {};
+    if (!content || typeof content !== 'string') {
+      return res.status(400).json({ error: 'content is required' });
+    }
+    const rendered = renderTemplateContent(content, { lead, accountName, accountEmail });
+    return res.json({ content: rendered });
+  } catch (error) {
+    console.error('renderTemplateContentHttp error:', error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
 export async function composeEmailFromTemplates(req, res) {
   try {
     const { accountName, accountEmail, lead, messageType, industry } = req.body || {};

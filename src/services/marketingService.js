@@ -15,6 +15,12 @@ import {
 import { sendNylasEmail } from './nylasSendService.js';
 import { sleep } from '../utils/nylasRateLimit.js';
 import { getMailboxTodayStatsByEmailId, getLocalTodayRange } from './mailboxTodayOutboundService.js';
+import {
+  effectiveSentForDailyLimit,
+  getMarketingDailyLimitState,
+  marketingCanSendAnother,
+  resolveDailyLimitFromEmail,
+} from './dailyLimitService.js';
 
 const BLOCKED_EMAIL_STATUSES = new Set(['bad', 'blocked']);
 /** Random wait between sends on the same mailbox: new draw each time (3–5 min by default). */
@@ -268,6 +274,14 @@ async function processMailboxOneRound(workload, roundIndex, totalRounds) {
   const { email, assignment, address } = workload;
   const pending = await countPendingLeads(assignment.id);
   if (pending === 0) return { sent: 0, failed: 0, skipped: true };
+
+  const canSend = await marketingCanSendAnother(email, assignment.assignmentDate);
+  if (!canSend) {
+    marketingLog(address, 'skipped — outreach daily limit reached for this mailbox', {
+      round: roundIndex + 1,
+    });
+    return { sent: 0, failed: 0, skipped: true, limitReached: true };
+  }
 
   await waitForMailboxSendSpacing(assignment.id, address);
 
@@ -575,6 +589,7 @@ export async function getMarketingDashboard(assignmentDate, options = {}) {
     const counts = stats || { assigned: 0, pending: 0, sent: 0, failed: 0 };
     const dailyLimitSentBaseline = assignment?.dailyLimitSentBaseline ?? 0;
     const effectiveSentCount = effectiveSentForDailyLimit(counts.sent, dailyLimitSentBaseline);
+    const outreachDailyLimit = resolveDailyLimitFromEmail(email, 10);
 
     const marketingEnabled = isMarketingEnabledForEmail(email);
     const todayStats = todayStatsMap.get(email.id) || {
@@ -600,6 +615,8 @@ export async function getMarketingDashboard(assignmentDate, options = {}) {
       sentCount: counts.sent,
       dailyLimitSentBaseline,
       effectiveSentCount,
+      dailyLimitRemaining: Math.max(0, outreachDailyLimit - counts.pending - effectiveSentCount),
+      outreachDailyLimit,
       failedCount: counts.failed,
       running: Boolean(assignment?.running),
       canAssign: canAssignToEmail(email),
@@ -643,15 +660,15 @@ export async function assignLeadsToEmail(emailId, count, assignmentDate, filters
   });
   if (!email) throw new Error('Email account not found');
 
-  const remainingSlots = await getRemainingAssignSlotsForEmail(email, date);
-  if (remainingSlots !== null) {
-    requested = Math.min(requested, remainingSlots);
+  const remainingSlots = await getMarketingDailyLimitState(email, date);
+  if (remainingSlots) {
+    requested = Math.min(requested, remainingSlots.remaining);
   }
   const n = requested;
   if (!n) {
     return {
       assigned: 0,
-      message: 'Daily limit already reached (pending + sent meets mailbox limit)',
+      message: 'Outreach daily limit already reached (follow-up limit is separate)',
     };
   }
 
@@ -814,18 +831,10 @@ export async function unassignAllPendingMarketingLeads({ assignmentDate, emailId
 }
 
 function resolveMarketingDailyLimit(row, defaultCount) {
-  const fallback = Math.max(1, Math.min(500, parseInt(String(defaultCount), 10) || 10));
-  const daily = row?.marketingDailyLimit;
-  if (daily != null && Number.isFinite(Number(daily)) && Number(daily) > 0) {
-    return Math.max(1, Math.min(500, parseInt(String(daily), 10)));
-  }
-  return fallback;
-}
-
-function effectiveSentForDailyLimit(sent, baseline) {
-  const raw = Math.max(0, parseInt(String(sent), 10) || 0);
-  const base = Math.max(0, parseInt(String(baseline), 10) || 0);
-  return Math.max(0, raw - base);
+  return resolveDailyLimitFromEmail(
+    { marketingDailyLimit: row?.marketingDailyLimit },
+    defaultCount
+  );
 }
 
 /** Leads still needed today so pending + effective sent reaches the daily limit. */
@@ -837,32 +846,8 @@ function resolveMarketingAssignCount(row, defaultCount) {
 }
 
 async function getRemainingAssignSlotsForEmail(email, assignmentDate) {
-  const date = getAssignmentDateString(assignmentDate);
-  const limit =
-    email.marketingDailyLimit != null &&
-    Number.isFinite(Number(email.marketingDailyLimit)) &&
-    Number(email.marketingDailyLimit) > 0
-      ? Math.max(1, Math.min(500, parseInt(String(email.marketingDailyLimit), 10)))
-      : null;
-
-  const assignmentRepo = AppDataSource.getRepository(MarketingAssignment);
-  const assignment = await assignmentRepo.findOne({ where: { emailId: email.id, assignmentDate: date } });
-  let pending = 0;
-  let sent = 0;
-  let baseline = 0;
-  if (assignment) {
-    const statsMap = await getAssignmentStats([assignment.id]);
-    const counts = statsMap.get(assignment.id) || { pending: 0, sent: 0 };
-    pending = counts.pending || 0;
-    sent = counts.sent || 0;
-    baseline = assignment.dailyLimitSentBaseline || 0;
-  }
-
-  if (limit != null) {
-    const effectiveSent = effectiveSentForDailyLimit(sent, baseline);
-    return Math.max(0, limit - pending - effectiveSent);
-  }
-  return null;
+  const state = await getMarketingDailyLimitState(email, assignmentDate);
+  return state.remaining;
 }
 
 /**
@@ -1046,6 +1031,10 @@ export async function runMarketingForEmail(emailId, assignmentDate) {
 
   try {
     for (let i = 0; i < pendingRows.length; i += 1) {
+      if (!(await marketingCanSendAnother(email, date))) {
+        marketingLog(mb, 'daily outreach limit reached — stopping send loop');
+        break;
+      }
       await waitForMailboxSendSpacing(assignment.id, mb);
 
       const row = await getNextPendingLead(assignment.id);

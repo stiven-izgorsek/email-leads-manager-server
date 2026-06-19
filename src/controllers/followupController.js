@@ -1,5 +1,4 @@
 import {
-  assignFollowupsToAll,
   assignFollowupsToEmail,
   getFollowupAssignmentLeads,
   getFollowupDashboard,
@@ -8,6 +7,7 @@ import {
   runFollowupForAll,
   runFollowupForEmail,
   setFollowupEnabled,
+  startAssignFollowupsToAll,
   stopAllFollowupRuns,
   unassignAllPendingFollowupLeads,
   unassignFollowupLead,
@@ -41,11 +41,12 @@ export async function assignFollowupLeads(req, res) {
 export async function assignFollowupLeadsAll(req, res) {
   try {
     const { countPerAccount, date, daysBefore } = req.body || {};
-    const result = await assignFollowupsToAll(countPerAccount, date, daysBefore ?? 7);
+    const result = startAssignFollowupsToAll(countPerAccount, date, daysBefore ?? 7);
     res.json(result);
   } catch (error) {
     console.error('assignFollowupLeadsAll error:', error);
-    res.status(500).json({ error: error.message || 'Internal server error' });
+    const msg = error.message || 'Internal server error';
+    res.status(/already in progress/i.test(msg) ? 409 : 500).json({ error: msg });
   }
 }
 

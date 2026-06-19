@@ -7,6 +7,7 @@ import fs from 'fs/promises';
 import XLSX from 'xlsx';
 import { sleep } from '../utils/nylasRateLimit.js';
 import { probeNylasGrantMessagesList } from '../services/nylasGrantProbeService.js';
+import { lookupRecipientsByEmails, sendEmailFromMailbox } from '../services/emailComposeService.js';
 
 function normalizeEmailAddress(value) {
   return String(value || '').trim().toLowerCase();
@@ -733,5 +734,32 @@ export async function getNylasIntegrationStatus(req, res) {
   } catch (error) {
     console.error('getNylasIntegrationStatus error:', error);
     res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
+export async function lookupEmailRecipients(req, res) {
+  try {
+    const raw = req.query.emails ?? req.query.email ?? '';
+    const emails =
+      typeof raw === 'string'
+        ? raw.split(',').map((s) => s.trim()).filter(Boolean)
+        : Array.isArray(raw)
+          ? raw
+          : [];
+    const recipients = await lookupRecipientsByEmails(emails);
+    res.json({ recipients });
+  } catch (error) {
+    console.error('lookupEmailRecipients error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
+export async function sendEmailFromMailboxHandler(req, res) {
+  try {
+    const result = await sendEmailFromMailbox(req.params.id, req.body || {});
+    res.json(result);
+  } catch (error) {
+    console.error('sendEmailFromMailbox error:', error);
+    res.status(error.status || 500).json({ error: error.message || 'Internal server error' });
   }
 }

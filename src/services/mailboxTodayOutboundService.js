@@ -1,6 +1,7 @@
 import { AppDataSource } from '../config/database.js';
 import { Client } from '../entities/Client.js';
 import { MarketingAssignmentLead } from '../entities/MarketingAssignmentLead.js';
+import { FollowupAssignmentLead } from '../entities/FollowupAssignmentLead.js';
 
 export function getLocalTodayRange() {
   const today = new Date();
@@ -71,6 +72,25 @@ export async function getMailboxTodayStatsByEmailId(emails) {
     const entry = map.get(emailId);
     entry.nylasMarketingToday = n;
     entry.messagesSentToday += n;
+  }
+
+  const followupMalRepo = AppDataSource.getRepository(FollowupAssignmentLead);
+  const nylasFollowupRows = await followupMalRepo
+    .createQueryBuilder('fal')
+    .innerJoin('fal.assignment', 'fa')
+    .select('fa.emailId', 'emailId')
+    .addSelect('COUNT(*)', 'cnt')
+    .where('fal.sendStatus = :sent', { sent: 'sent' })
+    .andWhere('fal.sentAt >= :today', { today })
+    .andWhere('fal.sentAt < :tomorrow', { tomorrow })
+    .groupBy('fa.emailId')
+    .getRawMany();
+
+  for (const row of nylasFollowupRows) {
+    const emailId = row.emailId;
+    if (!emailId || !map.has(emailId)) continue;
+    const n = parseInt(String(row.cnt), 10) || 0;
+    map.get(emailId).followupsSentToday += n;
   }
 
   const clientRepo = AppDataSource.getRepository(Client);

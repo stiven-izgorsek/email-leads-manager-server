@@ -5,9 +5,6 @@ import { normalizeTextForClassification } from './messageTypeService.js';
 
 const configuredNylasRegion = (process.env.NYLAS_REGION || '').toLowerCase();
 
-/** Classified inbound types that always mean "do not follow up" (includes bounces / blocks). */
-const DEFINITE_REPLY_MESSAGE_TYPES = ['blocked', 'ooo', 'bad', 'interest', 'no_job'];
-
 const BOUNCE_FROM_HINTS = [
   'mailer-daemon',
   'mail delivery',
@@ -64,8 +61,8 @@ function textLooksLikeBounceOrBlock(subject, body) {
 }
 
 /**
- * True if CRM has any stored inbound (polled) message after lastSent that counts as a reply.
- * Includes bounces/blocks (often from mailer-daemon, not the lead address).
+ * True if CRM has any stored inbound (polled) message after lastSent that counts as a reply
+ * for this specific lead. Logic matches fetchFollowupCandidateClients NOT EXISTS filter.
  */
 export async function hasStoredInboundReplySince({
   mailboxAddress,
@@ -85,23 +82,28 @@ export async function hasStoredInboundReplySince({
        AND COALESCE(im."receivedAt", im."createdAt") > $2
        AND (
          LOWER(COALESCE(im."fromEmail", '')) LIKE $3
-         OR im."messageType" = ANY($4::varchar[])
          OR (
-           im."messageType" = 'other'
+           im."messageType" IN ('blocked', 'ooo', 'bad', 'interest', 'no_job')
            AND (
              LOWER(COALESCE(im."fromEmail", '')) LIKE $3
-             OR LOWER(COALESCE(im."fromEmail", '')) LIKE ANY($5::varchar[])
+             OR LOWER(COALESCE(im."subject", '')) LIKE $3
            )
+         )
+         OR (
+           LOWER(COALESCE(im."fromEmail", '')) LIKE '%mailer-daemon%'
+           AND LOWER(COALESCE(im."subject", '')) LIKE $3
+         )
+         OR (
+           LOWER(COALESCE(im."fromEmail", '')) LIKE '%postmaster%'
+           AND LOWER(COALESCE(im."subject", '')) LIKE $3
+         )
+         OR (
+           im."messageType" = 'other'
+           AND LOWER(COALESCE(im."fromEmail", '')) LIKE $3
          )
        )
      LIMIT 1`,
-    [
-      mailbox,
-      since,
-      `%${lead}%`,
-      DEFINITE_REPLY_MESSAGE_TYPES,
-      BOUNCE_FROM_HINTS.map((h) => `%${h}%`),
-    ]
+    [mailbox, since, `%${lead}%`]
   );
   return rows.length > 0;
 }
@@ -118,12 +120,24 @@ function isInboundReplyNylasMessage(message, mailboxAddress, leadEmail) {
 
   const subject = message?.subject || '';
   const body = message?.body || message?.snippet || message?.text || '';
+  const subjectLower = String(subject).toLowerCase();
+  const leadInSubject = !!(lead && subjectLower.includes(lead));
+  const fromStr = fromList.join(' ').toLowerCase();
 
   if (fromIsLead) return true;
-  if (textLooksLikeBounceOrBlock(subject, body)) return true;
 
-  if (toIsMailbox && !fromIsMailbox) {
-    if (fromLooksLikeBounceOrSystem(fromList.join(' '))) return true;
+  if (textLooksLikeBounceOrBlock(subject, body) && (leadInSubject || fromMatchesLead(fromStr, leadEmail))) {
+    return true;
+  }
+
+  if (
+    (fromStr.includes('mailer-daemon') || fromStr.includes('postmaster')) &&
+    leadInSubject
+  ) {
+    return true;
+  }
+
+  if (toIsMailbox && !fromIsMailbox && fromLooksLikeBounceOrSystem(fromStr) && leadInSubject) {
     return true;
   }
 

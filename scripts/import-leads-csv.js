@@ -14,7 +14,7 @@ import fs from 'fs';
 import path from 'path';
 import csv from 'csv-parser';
 import { AppDataSource } from '../src/config/database.js';
-import { Client } from '../src/entities/Client.js';
+import { getFirstEmailFromCsvRow } from '../src/utils/csvLeadImport.js';
 
 dotenv.config();
 
@@ -107,7 +107,7 @@ async function readCsvRows(filePath) {
 }
 
 function rowToClientPayload(row) {
-  const emailRaw = getField(row, 'email');
+  const emailRaw = getFirstEmailFromCsvRow(row);
   if (!emailRaw) return null;
 
   let linkedin = getField(row, 'linkedin');

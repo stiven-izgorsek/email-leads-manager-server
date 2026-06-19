@@ -28,7 +28,32 @@ export async function verifyEmail(email, apiKey, timeout = 10) {
     }
 
     const data = await response.json();
-    
+
+    const apiError = String(data.error || '').trim();
+    if (apiError) {
+      return {
+        success: false,
+        email,
+        status: 'error',
+        error: apiError,
+        result: data.result ?? null,
+        resultcode: data.resultcode ?? null,
+        quality: data.quality ?? null,
+      };
+    }
+
+    if (!data.email) {
+      return {
+        success: false,
+        email,
+        status: 'error',
+        error: 'Millions API returned no email in response',
+        result: data.result ?? null,
+        resultcode: data.resultcode ?? null,
+        quality: data.quality ?? null,
+      };
+    }
+
     // Map Millions quality and result to our millionsStatus
     // quality: "good", "bad", "risky"
     // result: "ok", "catch_all", "unknown", "error", "disposable", "invalid"

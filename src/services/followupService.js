@@ -6,10 +6,16 @@ import { FollowupAssignment } from '../entities/FollowupAssignment.js';
 import { FollowupAssignmentLead } from '../entities/FollowupAssignmentLead.js';
 import { composeLeadOutboundEmail } from '../controllers/templateController.js';
 import { sendNylasEmail } from './nylasSendService.js';
-import { resolveOriginalOutboundForFollowup } from './nylasOriginalMessageService.js';
+import { resolveOriginalOutboundForFollowup, loadStoredMarketingNylasMessageMap } from './nylasOriginalMessageService.js';
 import { leadHasInboundReplySinceSend } from './followupReplyGuardService.js';
 import { sleep } from '../utils/nylasRateLimit.js';
 import { getMailboxTodayStatsByEmailId, getLocalTodayRange } from './mailboxTodayOutboundService.js';
+import {
+  effectiveSentForDailyLimit,
+  followupCanSendAnother,
+  getFollowupDailyLimitState,
+  resolveDailyLimitFromEmail,
+} from './dailyLimitService.js';
 import {
   getAssignmentDateString,
   hasNylasCredentials,
@@ -25,6 +31,17 @@ const DEFAULT_STUCK_RUNNING_MS = 45 * 60 * 1000;
 let followupOrchestratorActive = false;
 /** Set by POST /stop-all; checked between sends and during spacing waits. */
 let followupStopRequested = false;
+let followupAssignAllActive = false;
+/** @type {null | { startedAt: string, finishedAt?: string, accountsTotal?: number, accountsDone?: number, totalAssigned?: number, totalSkippedNoThread?: number, totalSkippedWithReply?: number, error?: string }} */
+let followupAssignAllSummary = null;
+
+export function isFollowupAssignAllActive() {
+  return followupAssignAllActive;
+}
+
+export function getFollowupAssignAllSummary() {
+  return followupAssignAllSummary;
+}
 
 export function clearFollowupStopRequest() {
   followupStopRequested = false;
@@ -107,26 +124,23 @@ export function computeSentOnOrBefore(daysBefore) {
   return { days, cutoff };
 }
 
-function effectiveSentForDailyLimit(sent, baseline) {
-  const raw = Math.max(0, parseInt(String(sent), 10) || 0);
-  const base = Math.max(0, parseInt(String(baseline), 10) || 0);
-  return Math.max(0, raw - base);
-}
-
 function resolveDailyLimit(row, defaultCount) {
-  const fallback = Math.max(1, Math.min(500, parseInt(String(defaultCount), 10) || 10));
-  const daily = row?.marketingDailyLimit;
-  if (daily != null && Number.isFinite(Number(daily)) && Number(daily) > 0) {
-    return Math.max(1, Math.min(500, parseInt(String(daily), 10)));
-  }
-  return fallback;
+  return resolveDailyLimitFromEmail(
+    { marketingDailyLimit: row?.marketingDailyLimit },
+    defaultCount
+  );
 }
 
 function resolveAssignCount(row, defaultCount) {
   const limit = resolveDailyLimit(row, defaultCount);
   const pending = Math.max(0, parseInt(String(row?.pendingCount), 10) || 0);
   const sent = effectiveSentForDailyLimit(row?.sentCount, row?.dailyLimitSentBaseline);
-  return Math.max(0, Math.min(500, limit - pending - sent));
+  const remaining = Math.max(0, limit - pending - sent);
+  const cap = Math.max(1, Math.min(500, parseInt(String(defaultCount), 10) || 10));
+  if (row?.dailyLimitRemaining != null) {
+    return Math.max(0, Math.min(cap, remaining, parseInt(String(row.dailyLimitRemaining), 10) || 0));
+  }
+  return Math.max(0, Math.min(cap, remaining));
 }
 
 async function getAssignmentStats(assignmentIds) {
@@ -191,11 +205,23 @@ async function syncAssignmentTargetCount(assignmentId) {
 
 /**
  * Clients sent from this mailbox at least `daysBefore` ago with no reply / follow-up yet.
+ * @param {object} email
+ * @param {number} daysBefore
+ * @param {string} assignmentDate
+ * @param {number|{ limit?: number, excludeClientIds?: string[] }} limitOrOptions
  */
-export async function fetchFollowupCandidateClients(email, daysBefore, assignmentDate, limit = 500) {
+export async function fetchFollowupCandidateClients(email, daysBefore, assignmentDate, limitOrOptions = 500) {
   const mailbox = String(email.address || '').trim().toLowerCase();
   const { cutoff } = computeSentOnOrBefore(daysBefore);
-  const max = Math.min(500, Math.max(1, parseInt(String(limit), 10) || 500));
+  const opts =
+    typeof limitOrOptions === 'number'
+      ? { limit: limitOrOptions, excludeClientIds: [] }
+      : {
+          limit: limitOrOptions?.limit ?? 500,
+          excludeClientIds: limitOrOptions?.excludeClientIds ?? [],
+        };
+  const max = Math.min(500, Math.max(1, parseInt(String(opts.limit), 10) || 500));
+  const excludeClientIds = (opts.excludeClientIds || []).filter(Boolean);
 
   const clientRepo = AppDataSource.getRepository(Client);
   const qb = clientRepo
@@ -230,7 +256,9 @@ export async function fetchFollowupCandidateClients(email, daysBefore, assignmen
       `NOT EXISTS (
         SELECT 1 FROM followup_assignment_lead fal
         INNER JOIN followup_assignment fa ON fa.id = fal.assignment_id
-        WHERE fal.client_id = client.id AND fa.assignment_date = :assignmentDate
+        WHERE fal.client_id = client.id
+          AND fa.assignment_date = :assignmentDate
+          AND fal.send_status IN ('pending', 'sent')
       )`,
       { assignmentDate }
     )
@@ -265,8 +293,28 @@ export async function fetchFollowupCandidateClients(email, daysBefore, assignmen
           )
       )`
     )
-    .setParameter('mailboxExact', email.address)
-    .orderBy('client.createdAt', 'DESC')
+    .setParameter('mailboxExact', email.address);
+
+  if (excludeClientIds.length) {
+    qb.andWhere('client.id NOT IN (:...excludeClientIds)', { excludeClientIds });
+  }
+
+  qb
+    .orderBy(
+      `(
+        CASE WHEN EXISTS (
+          SELECT 1 FROM marketing_assignment_lead mal_prio
+          INNER JOIN marketing_assignment ma_prio ON ma_prio.id = mal_prio.assignment_id
+          WHERE mal_prio.client_id = client.id
+            AND ma_prio.email_id = :emailId
+            AND mal_prio.send_status = 'sent'
+            AND mal_prio.nylas_message_id IS NOT NULL
+            AND TRIM(mal_prio.nylas_message_id) <> ''
+        ) THEN 0 ELSE 1 END
+      )`,
+      'ASC'
+    )
+    .addOrderBy('client.lastSent', 'ASC')
     .take(max);
 
   return qb.getMany();
@@ -335,6 +383,7 @@ export async function getFollowupDashboard(assignmentDate, options = {}) {
     const counts = stats || { assigned: 0, pending: 0, sent: 0, failed: 0 };
     const baseline = assignment?.dailyLimitSentBaseline ?? 0;
     const effectiveSent = effectiveSentForDailyLimit(counts.sent, baseline);
+    const followupDailyLimit = resolveDailyLimitFromEmail(email, 10);
     const followupEnabled = isFollowupEnabledForEmail(email);
     const todayStats = todayStatsMap.get(email.id) || {
       nylasMarketingToday: 0,
@@ -360,6 +409,8 @@ export async function getFollowupDashboard(assignmentDate, options = {}) {
       sentCount: counts.sent,
       dailyLimitSentBaseline: baseline,
       effectiveSentCount: effectiveSent,
+      dailyLimitRemaining: Math.max(0, followupDailyLimit - counts.pending - effectiveSent),
+      followupDailyLimit,
       failedCount: counts.failed,
       running: Boolean(assignment?.running),
       canAssign: canAssignFollowupToEmail(email),
@@ -381,6 +432,8 @@ export async function getFollowupDashboard(assignmentDate, options = {}) {
     progressDate: today.toISOString().slice(0, 10),
     progressDateEnd: tomorrow.toISOString(),
     nylasOnly,
+    assignAllActive: followupAssignAllActive,
+    assignAllSummary: followupAssignAllSummary,
     rows,
     checkedAt: new Date().toISOString(),
     sendDelayMinMs: sendDelay.minMs,
@@ -424,18 +477,19 @@ export async function assignFollowupsToEmail(emailId, count, assignmentDate, day
     );
   }
 
-  const dashboard = await getFollowupDashboard(date);
-  const row = dashboard.rows.find((r) => r.emailId === emailId);
-  if (row) {
-    const remaining = resolveAssignCount(row, requested);
-    requested = Math.min(requested, remaining);
-  }
+  const limitState = await getFollowupDailyLimitState(email, date);
+  requested = Math.min(requested, limitState.remaining);
   if (!requested) {
-    return { assigned: 0, skippedNoThread: 0, skippedWithReply: 0, message: 'Daily limit already reached' };
+    return {
+      assigned: 0,
+      skippedNoThread: 0,
+      skippedWithReply: 0,
+      message: 'Follow-up daily limit already reached (separate from cold outreach)',
+    };
   }
 
-  const candidates = await fetchFollowupCandidateClients(email, days, date, requested);
-  if (!candidates.length) {
+  const candidatesProbe = await fetchFollowupCandidateClients(email, days, date, 1);
+  if (!candidatesProbe.length) {
     return {
       assigned: 0,
       skippedNoThread: 0,
@@ -449,49 +503,58 @@ export async function assignFollowupsToEmail(emailId, count, assignmentDate, day
   let assigned = 0;
   let skippedNoThread = 0;
   let skippedWithReply = 0;
+  const triedClientIds = new Set();
+  const MAX_POOL_SCAN = 500;
 
-  for (const client of candidates) {
-    if (assigned >= requested) break;
-
-    const replyCheck = await leadHasInboundReplySinceSend({
-      mailboxAddress: email.address,
-      leadEmail: client.email,
-      lastSent: client.lastSent,
-      grantId: email.grantId,
-      nylasKey: email.nylasKey,
-      checkNylas: true,
-    });
-    if (replyCheck.hasReply) {
-      skippedWithReply += 1;
-      continue;
-    }
-
-    const original = await resolveOriginalOutboundForFollowup({
-      emailId: email.id,
-      grantId: email.grantId,
-      nylasKey: email.nylasKey,
-      mailboxAddress: email.address,
-      clientId: client.id,
-      leadEmail: client.email,
-      lastSent: client.lastSent,
-    });
-
-    if (!original?.messageId) {
-      skippedNoThread += 1;
-      continue;
-    }
-
-    await leadRepo.save(
-      leadRepo.create({
-        assignmentId: assignment.id,
-        clientId: client.id,
-        sendStatus: 'pending',
-        replyToMessageId: original.messageId,
-        originalSubject: original.subject,
-      })
+  while (assigned < requested && triedClientIds.size < MAX_POOL_SCAN) {
+    const batchSize = Math.min(
+      200,
+      Math.max(50, (requested - assigned) * 8)
     );
-    assigned += 1;
-    await sleep(80);
+    const batch = await fetchFollowupCandidateClients(email, days, date, {
+      limit: batchSize,
+      excludeClientIds: Array.from(triedClientIds),
+    });
+    if (!batch.length) break;
+
+    const storedMap = await loadStoredMarketingNylasMessageMap(
+      email.id,
+      batch.map((c) => c.id)
+    );
+
+    for (const client of batch) {
+      if (assigned >= requested) break;
+      triedClientIds.add(client.id);
+
+      const original = await resolveOriginalOutboundForFollowup({
+        emailId: email.id,
+        grantId: email.grantId,
+        nylasKey: email.nylasKey,
+        mailboxAddress: email.address,
+        clientId: client.id,
+        leadEmail: client.email,
+        lastSent: client.lastSent,
+        storedMessageMap: storedMap,
+      });
+
+      if (!original?.messageId) {
+        skippedNoThread += 1;
+        continue;
+      }
+
+      await leadRepo.save(
+        leadRepo.create({
+          assignmentId: assignment.id,
+          clientId: client.id,
+          sendStatus: 'pending',
+          replyToMessageId: original.messageId,
+          originalSubject: original.subject,
+        })
+      );
+      assigned += 1;
+    }
+
+    if (batch.length < batchSize) break;
   }
 
   assignment.targetCount = await syncAssignmentTargetCount(assignment.id);
@@ -516,52 +579,147 @@ export async function assignFollowupsToEmail(emailId, count, assignmentDate, day
   };
 }
 
-export async function assignFollowupsToAll(countPerAccount, assignmentDate, daysBefore) {
+export async function assignFollowupsToAll(countPerAccount, assignmentDate, daysBefore, options = {}) {
   const date = getAssignmentDateString(assignmentDate);
   const days = Math.min(365, Math.max(1, parseInt(String(daysBefore), 10) || 7));
   const defaultCount = Math.max(1, Math.min(500, parseInt(String(countPerAccount), 10) || 10));
+  const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
   const dashboard = await getFollowupDashboard(date);
   const eligible = dashboard.rows.filter((r) => r.followupEnabled && r.canAssign);
+  const concurrency = Math.min(
+    8,
+    Math.max(1, parseInt(String(process.env.FOLLOWUP_ASSIGN_ALL_CONCURRENCY || '4'), 10) || 4)
+  );
 
   let totalAssigned = 0;
-  let totalSkipped = 0;
-  const accounts = [];
+  let totalSkippedNoThread = 0;
+  let totalSkippedWithReply = 0;
+  const accounts = new Array(eligible.length);
+  let accountsDone = 0;
 
-  for (const row of eligible) {
+  onProgress?.({ accountsTotal: eligible.length, accountsDone: 0, totalAssigned: 0 });
+
+  async function processRow(row, index) {
     const count = resolveAssignCount(row, defaultCount);
     if (count === 0) {
-      accounts.push({
+      accounts[index] = {
         emailId: row.emailId,
         address: row.address,
         assigned: 0,
         skippedNoThread: 0,
+        skippedWithReply: 0,
         skipped: true,
         message: 'Daily limit already reached',
-      });
-      continue;
+      };
+      accountsDone += 1;
+      onProgress?.({ accountsDone, totalAssigned, totalSkippedNoThread, totalSkippedWithReply });
+      return;
     }
     try {
       const result = await assignFollowupsToEmail(row.emailId, count, date, days);
       totalAssigned += result.assigned || 0;
-      totalSkipped += (result.skippedNoThread || 0) + (result.skippedWithReply || 0);
-      accounts.push({
+      totalSkippedNoThread += result.skippedNoThread || 0;
+      totalSkippedWithReply += result.skippedWithReply || 0;
+      accounts[index] = {
         emailId: row.emailId,
         address: row.address,
         assigned: result.assigned || 0,
         skippedNoThread: result.skippedNoThread || 0,
         skippedWithReply: result.skippedWithReply || 0,
-      });
+      };
     } catch (err) {
-      accounts.push({
+      accounts[index] = {
         emailId: row.emailId,
         address: row.address,
         assigned: 0,
         error: err.message || String(err),
-      });
+      };
+    }
+    accountsDone += 1;
+    onProgress?.({ accountsDone, totalAssigned, totalSkippedNoThread, totalSkippedWithReply });
+  }
+
+  let nextIndex = 0;
+  async function worker() {
+    while (true) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= eligible.length) break;
+      await processRow(eligible[index], index);
     }
   }
 
-  return { totalAssigned, totalSkippedNoThread: totalSkipped, daysBefore: days, accounts };
+  const workers = Array.from({ length: Math.min(concurrency, eligible.length || 1) }, () => worker());
+  await Promise.all(workers);
+
+  return {
+    totalAssigned,
+    totalSkippedNoThread,
+    totalSkippedWithReply,
+    daysBefore: days,
+    accounts,
+  };
+}
+
+export function startAssignFollowupsToAll(countPerAccount, assignmentDate, daysBefore) {
+  if (followupAssignAllActive) {
+    throw new Error('Auto-assign is already in progress. Refresh to see updated counts.');
+  }
+
+  followupAssignAllActive = true;
+  followupAssignAllSummary = {
+    startedAt: new Date().toISOString(),
+    accountsTotal: 0,
+    accountsDone: 0,
+    totalAssigned: 0,
+    totalSkippedNoThread: 0,
+    totalSkippedWithReply: 0,
+  };
+
+  void assignFollowupsToAll(countPerAccount, assignmentDate, daysBefore, {
+    onProgress: (update) => {
+      followupAssignAllSummary = {
+        ...followupAssignAllSummary,
+        ...update,
+      };
+    },
+  })
+    .then((result) => {
+      const failed = (result.accounts || []).filter((a) => a.error);
+      followupAssignAllSummary = {
+        ...followupAssignAllSummary,
+        finishedAt: new Date().toISOString(),
+        totalAssigned: result.totalAssigned,
+        totalSkippedNoThread: result.totalSkippedNoThread,
+        totalSkippedWithReply: result.totalSkippedWithReply,
+        accountsFailed: failed.length,
+        error:
+          failed.length && !result.totalAssigned
+            ? failed[0].error || 'All mailboxes failed to assign'
+            : followupAssignAllSummary?.error,
+      };
+      followupLog(null, 'assign-all finished', {
+        totalAssigned: result.totalAssigned,
+        accounts: result.accounts?.length ?? 0,
+      });
+    })
+    .catch((err) => {
+      followupAssignAllSummary = {
+        ...followupAssignAllSummary,
+        finishedAt: new Date().toISOString(),
+        error: err.message || String(err),
+      };
+      followupLog(null, 'assign-all failed', { error: err.message });
+    })
+    .finally(() => {
+      followupAssignAllActive = false;
+    });
+
+  return {
+    started: true,
+    message:
+      'Assigning follow-ups in background. Assigned/Pending counts will update mailbox by mailbox — refresh or wait a few minutes.',
+  };
 }
 
 async function markClientFollowedUp(client, mailboxAddress) {
@@ -779,6 +937,11 @@ async function processMailboxOneRound(workload, roundIndex, totalRounds) {
   const { email, assignment, address } = workload;
   const pending = await countPendingLeads(assignment.id);
   if (pending === 0) return { sent: 0, failed: 0, skipped: true };
+
+  if (!(await followupCanSendAnother(email, assignment.assignmentDate))) {
+    followupLog(address, 'daily follow-up limit reached — skipping send', { round: roundIndex + 1 });
+    return { sent: 0, failed: 0, skipped: true, limitReached: true };
+  }
 
   await waitForMailboxSendSpacing(assignment.id, address);
   if (isFollowupStopRequested()) return { sent: 0, failed: 0, skipped: true };
@@ -1027,6 +1190,10 @@ export async function runFollowupForEmail(emailId, assignmentDate) {
   try {
     for (let i = 0; i < pendingCount; i += 1) {
       if (stoppedByUser()) break;
+      if (!(await followupCanSendAnother(email, date))) {
+        followupLog(mb, 'daily follow-up limit reached — stopping send loop');
+        break;
+      }
       await waitForMailboxSendSpacing(assignment.id, mb);
       if (stoppedByUser()) break;
       const row = await getNextPendingLead(assignment.id);
