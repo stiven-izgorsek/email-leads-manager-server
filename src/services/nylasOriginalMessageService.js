@@ -124,7 +124,7 @@ async function findStoredMarketingNylasMessage(emailId, clientId) {
   return { messageId: null, subject: String(row.subject || '').trim(), sentAt: row.sentAt || null };
 }
 
-async function fetchNylasMessageById(grantId, nylasKey, messageId) {
+export async function fetchNylasMessageById(grantId, nylasKey, messageId) {
   const gid = String(grantId || '').trim();
   const key = String(nylasKey || '').trim();
   const mid = String(messageId || '').trim();

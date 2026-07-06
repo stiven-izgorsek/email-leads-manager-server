@@ -1168,6 +1168,49 @@ export async function resetLeadsStatus(req, res) {
 // In-memory storage for verification job status
 const verificationJobs = new Map();
 
+function parseIncludeErrorFlag(value) {
+  return value === true || value === 'true' || value === '1' || value === 1;
+}
+
+function isNewLeadEligibleForMillionsVerify(client, includeError = false) {
+  if (!client.email || String(client.email).trim() === '') return false;
+  const millionsStatus = client.millionsStatus
+    ? String(client.millionsStatus).trim().toLowerCase()
+    : '';
+  if (!millionsStatus) return true;
+  return includeError && millionsStatus === 'error';
+}
+
+async function fetchNewLeadsForVerification(clientRepository) {
+  return clientRepository
+    .createQueryBuilder('client')
+    .where('client.deletedAt IS NULL')
+    .andWhere('(client.status = :status OR client.status IS NULL)', { status: 'new' })
+    .getMany();
+}
+
+function summarizeNewLeadsVerification(clients, includeError = false) {
+  const clientsToVerify = clients.filter((client) =>
+    isNewLeadEligibleForMillionsVerify(client, includeError)
+  );
+  const unverifiedCount = clients.filter((client) =>
+    isNewLeadEligibleForMillionsVerify(client, false)
+  ).length;
+  const errorCount = clients.filter((client) => {
+    if (!client.email || String(client.email).trim() === '') return false;
+    return String(client.millionsStatus || '').trim().toLowerCase() === 'error';
+  }).length;
+
+  return {
+    clientsToVerify,
+    count: clientsToVerify.length,
+    totalNew: clients.length,
+    alreadyVerified: clients.length - clientsToVerify.length,
+    unverifiedCount,
+    errorCount,
+  };
+}
+
 /**
  * Start bulk email verification with Millions API
  */
@@ -1338,26 +1381,16 @@ export async function bulkVerifyAllNew(req, res) {
       });
     }
 
+    const includeError = parseIncludeErrorFlag(req.body?.includeError);
     const clientRepository = AppDataSource.getRepository(Client);
-    
-    // Fetch all clients with status "new" that have emails and are not already verified
-    // Handle both NULL and 'new' as 'new' status (since default is 'new')
-    const clients = await clientRepository
-      .createQueryBuilder('client')
-      .where('client.deletedAt IS NULL')
-      .andWhere('(client.status = :status OR client.status IS NULL)', { status: 'new' })
-      .getMany();
-
-    // Filter out clients without emails or already verified.
-    // Verify only "Not Verified" (null/empty) for "Verify All New" flow.
-    const clientsToVerify = clients.filter(client => {
-      return client.email && 
-             client.email.trim() !== '' && 
-             (!client.millionsStatus || String(client.millionsStatus).trim() === '');
-    });
+    const clients = await fetchNewLeadsForVerification(clientRepository);
+    const { clientsToVerify } = summarizeNewLeadsVerification(clients, includeError);
 
     if (clientsToVerify.length === 0) {
-      return res.status(400).json({ error: 'No valid emails to verify. All "new" status leads are either missing emails or already verified.' });
+      const errorMessage = includeError
+        ? 'No valid emails to verify. All "new" status leads are either missing emails, already verified, or have no error status to retry.'
+        : 'No valid emails to verify. All "new" status leads are either missing emails or already verified.';
+      return res.status(400).json({ error: errorMessage });
     }
 
     const emails = clientsToVerify.map(c => c.email);
@@ -1427,7 +1460,10 @@ export async function bulkVerifyAllNew(req, res) {
       success: true,
       jobId,
       total: emails.length,
-      message: 'Verification started for all "new" status leads',
+      includeError,
+      message: includeError
+        ? 'Verification started for all "new" status leads (including error status retries)'
+        : 'Verification started for all "new" status leads',
     });
   } catch (error) {
     console.error('Bulk verify all new error:', error);
@@ -1445,28 +1481,18 @@ export async function bulkVerifyAllNew(req, res) {
  */
 export async function getNewLeadsVerificationCount(req, res) {
   try {
+    const includeError = parseIncludeErrorFlag(req.query.includeError);
     const clientRepository = AppDataSource.getRepository(Client);
-    
-    // Fetch all clients with status "new" that have emails and are not already verified
-    // Handle both NULL and 'new' as 'new' status (since default is 'new')
-    const clients = await clientRepository
-      .createQueryBuilder('client')
-      .where('client.deletedAt IS NULL')
-      .andWhere('(client.status = :status OR client.status IS NULL)', { status: 'new' })
-      .getMany();
-
-    // Filter out clients without emails or already verified.
-    // Verify only "Not Verified" (null/empty) for "Verify All New" flow.
-    const clientsToVerify = clients.filter(client => {
-      return client.email && 
-             client.email.trim() !== '' && 
-             (!client.millionsStatus || String(client.millionsStatus).trim() === '');
-    });
+    const clients = await fetchNewLeadsForVerification(clientRepository);
+    const summary = summarizeNewLeadsVerification(clients, includeError);
 
     res.json({
-      count: clientsToVerify.length,
-      totalNew: clients.length,
-      alreadyVerified: clients.length - clientsToVerify.length,
+      count: summary.count,
+      totalNew: summary.totalNew,
+      alreadyVerified: summary.alreadyVerified,
+      unverifiedCount: summary.unverifiedCount,
+      errorCount: summary.errorCount,
+      includeError,
     });
   } catch (error) {
     console.error('Get new leads verification count error:', error);

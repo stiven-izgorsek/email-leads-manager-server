@@ -7,7 +7,7 @@ import { FollowupAssignmentLead } from '../entities/FollowupAssignmentLead.js';
 import { composeLeadOutboundEmail } from '../controllers/templateController.js';
 import { sendNylasEmail } from './nylasSendService.js';
 import { resolveOriginalOutboundForFollowup, loadStoredMarketingNylasMessageMap } from './nylasOriginalMessageService.js';
-import { leadHasInboundReplySinceSend } from './followupReplyGuardService.js';
+import { leadIsEligibleForFollowup } from './followupReplyGuardService.js';
 import { sleep } from '../utils/nylasRateLimit.js';
 import { getMailboxTodayStatsByEmailId, getLocalTodayRange } from './mailboxTodayOutboundService.js';
 import {
@@ -290,6 +290,14 @@ export async function fetchFollowupCandidateClients(email, daysBefore, assignmen
               im."messageType" = 'other'
               AND LOWER(COALESCE(im."fromEmail", '')) LIKE ('%' || LOWER(TRIM("client"."email")) || '%')
             )
+            OR (
+              im."messageType" = 'blocked'
+              AND (
+                LOWER(COALESCE(im."fromEmail", '')) LIKE '%mailer-daemon%'
+                OR LOWER(COALESCE(im."fromEmail", '')) LIKE '%postmaster%'
+                OR LOWER(COALESCE(im."fromEmail", '')) LIKE '%mail delivery%'
+              )
+            )
           )
       )`
     )
@@ -539,6 +547,20 @@ export async function assignFollowupsToEmail(emailId, count, assignmentDate, day
 
       if (!original?.messageId) {
         skippedNoThread += 1;
+        continue;
+      }
+
+      const eligibility = await leadIsEligibleForFollowup({
+        mailboxAddress: email.address,
+        leadEmail: client.email,
+        lastSent: client.lastSent,
+        grantId: email.grantId,
+        nylasKey: email.nylasKey,
+        originalMessageId: original.messageId,
+        checkNylas: true,
+      });
+      if (!eligibility.eligible) {
+        skippedWithReply += 1;
         continue;
       }
 
@@ -792,21 +814,22 @@ async function sendOneFollowupLead(email, assignment, leadRow, meta = {}) {
     return { sent: 0, failed: 1 };
   }
 
-  const replyCheck = await leadHasInboundReplySinceSend({
+  const eligibility = await leadIsEligibleForFollowup({
     mailboxAddress: email.address,
     leadEmail: client.email,
     lastSent: client.lastSent,
     grantId: email.grantId,
     nylasKey: email.nylasKey,
+    originalMessageId: leadRow.replyToMessageId,
     checkNylas: true,
   });
-  if (replyCheck.hasReply) {
+  if (!eligibility.eligible) {
     leadRow.sendStatus = 'failed';
-    leadRow.errorMessage = `Skipped: inbound reply detected (${replyCheck.source}) — includes bounces, blocks, OOO, and lead replies`;
+    leadRow.errorMessage = `Skipped: thread has reply or delivery issue (${eligibility.reason})`;
     await leadRepo.save(leadRow);
-    followupLog(mb, 'skipped — reply detected before send', {
+    followupLog(mb, 'skipped — ineligible thread before send', {
       ...meta,
-      source: replyCheck.source,
+      reason: eligibility.reason,
       to: client.email,
     });
     return { sent: 0, failed: 1 };
