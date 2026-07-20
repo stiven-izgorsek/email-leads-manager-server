@@ -268,6 +268,7 @@ export async function fetchFollowupCandidateClients(email, daysBefore, assignmen
         WHERE im."emailAddress" = :mailboxExact
           AND im."deletedAt" IS NULL
           AND im."messageType" <> 'ignored_sender'
+          AND im."messageType" <> 'hide_sender'
           AND COALESCE(im."receivedAt", im."createdAt") > "client"."lastSent"
           AND (
             LOWER(COALESCE(im."fromEmail", '')) LIKE ('%' || LOWER(TRIM("client"."email")) || '%')

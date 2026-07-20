@@ -28,14 +28,19 @@
     "csv-parser": "^3.0.0",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
+    "imapflow": "^1.4.7",
     "jsonwebtoken": "^9.0.2",
+    "mailparser": "^3.9.14",
     "multer": "^1.4.5-lts.1",
+    "nodemailer": "^9.0.3",
     "pg": "^8.16.3",
     "reflect-metadata": "^0.2.2",
     "typeorm": "^0.3.28",
     "xlsx": "^0.18.5"
   },
   "devDependencies": {
-    "@types/node": "^20.10.6"
+    "@types/mailparser": "^3.4.6",
+    "@types/node": "^20.10.6",
+    "@types/nodemailer": "^8.0.1"
   }
 }

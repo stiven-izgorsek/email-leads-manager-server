@@ -21,9 +21,12 @@ import calendarRoutes from './routes/calendarRoutes.js';
 import marketingRoutes from './routes/marketingRoutes.js';
 import followupRoutes from './routes/followupRoutes.js';
 import { startNylasUnreadPollingJob } from './services/nylasPollingService.js';
+import { startImapUnreadPollingJob } from './services/imapPollingService.js';
 import { startCalendarSyncJob } from './services/calendarSyncJob.js';
 import { releaseAllOrphanedMarketingRuns } from './services/marketingService.js';
 import { releaseAllOrphanedFollowupRuns } from './services/followupService.js';
+import { ensureDefaultHiddenSenderEntries } from './services/incomingSenderFilterService.js';
+import { ensureEcomLuxuryOutreachTemplates } from './services/ecomLuxuryTemplateSeed.js';
 
 // Load environment variables
 dotenv.config();
@@ -95,6 +98,8 @@ app.use((req, res) => {
 async function startServer() {
   try {
     await connectDatabase();
+    await ensureDefaultHiddenSenderEntries();
+    await ensureEcomLuxuryOutreachTemplates();
     const releasedMarketing = await releaseAllOrphanedMarketingRuns('server startup');
     if (releasedMarketing > 0) {
       console.log(
@@ -108,6 +113,7 @@ async function startServer() {
       );
     }
     startNylasUnreadPollingJob();
+    startImapUnreadPollingJob();
     startCalendarSyncJob();
     app.listen(PORT, () => {
       console.log(`Server is running on port ${PORT}`);

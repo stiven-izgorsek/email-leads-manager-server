@@ -47,6 +47,7 @@ export function formatUncontactedLeadForExtension(lead) {
     companyUrl: lead.companyUrl || '',
     industries: lead.industries || [],
     tech: lead.tech || [],
+    templateIndustry: lead.templateIndustry || '',
     jobTitle: lead.jobTitle || '',
     companyLocation: lead.companyLocation || '',
     email: lead.email || '',

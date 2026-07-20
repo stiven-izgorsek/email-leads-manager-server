@@ -12,6 +12,7 @@ export { PortfolioTag, PortfolioTagSchema } from './PortfolioTag.js';
 export { NylasSlackNotification, NylasSlackNotificationSchema } from './NylasSlackNotification.js';
 export { IncomingMessage, IncomingMessageSchema } from './IncomingMessage.js';
 export { IncomingMessageReply, IncomingMessageReplySchema } from './IncomingMessageReply.js';
+export { HiddenSenderEntry, HiddenSenderEntrySchema } from './HiddenSenderEntry.js';
 export { MessageTypeRule, MessageTypeRuleSchema } from './MessageTypeRule.js';
 export { Company, CompanySchema, COMPANY_STATUSES } from './Company.js';
 export { CompanySavedSearch, CompanySavedSearchSchema } from './CompanySavedSearch.js';

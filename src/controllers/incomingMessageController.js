@@ -8,6 +8,10 @@ import {
   ensureDefaultMessageTypeRules,
   loadMessageTypeRules,
 } from '../services/messageTypeService.js';
+import {
+  applyExcludeHiddenSenders,
+  applyExcludeHiddenSendersForUpdate,
+} from '../services/incomingSenderFilterService.js';
 import { analyzeNylasMessagesForPeriod } from '../services/nylasPeriodAnalysisService.js';
 import {
   replyToIncomingMessageById,
@@ -73,6 +77,21 @@ function getMarkAllReadDayBounds(body) {
   const end = new Date();
   end.setHours(23, 59, 59, 999);
   return { start, end };
+}
+
+/** Exclude App Password / SMTP rows when excludeSmtp is set. */
+function applyExcludeSmtp(qb, alias = 'm') {
+  qb.andWhere(`(${alias}.source IS NULL OR ${alias}.source <> :appPasswordSource)`, {
+    appPasswordSource: 'app_password',
+  });
+  return qb;
+}
+
+function applyExcludeSmtpForUpdate(qb) {
+  qb.andWhere('("source" IS NULL OR "source" <> :appPasswordSource)', {
+    appPasswordSource: 'app_password',
+  });
+  return qb;
 }
 
 function isQueryFlagTrue(value) {
@@ -181,6 +200,12 @@ export async function listIncomingMessages(req, res) {
 
     const repo = AppDataSource.getRepository(IncomingMessage);
     const qb = repo.createQueryBuilder('m').where('m.deletedAt IS NULL');
+    if (!isQueryFlagTrue(req.query.includeHidden)) {
+      await applyExcludeHiddenSenders(qb, 'm');
+    }
+    if (isQueryFlagTrue(req.query.excludeSmtp)) {
+      applyExcludeSmtp(qb, 'm');
+    }
 
     if (req.query.emailAddress) {
       qb.andWhere('m.emailAddress ILIKE :emailAddress', { emailAddress: `%${req.query.emailAddress}%` });
@@ -228,6 +253,12 @@ export async function getIncomingUnreadCount(req, res) {
       .createQueryBuilder('m')
       .where('m.isRead = :isRead', { isRead: false })
       .andWhere('m.deletedAt IS NULL');
+    if (!isQueryFlagTrue(req.query.includeHidden)) {
+      await applyExcludeHiddenSenders(qb, 'm');
+    }
+    if (isQueryFlagTrue(req.query.excludeSmtp)) {
+      applyExcludeSmtp(qb, 'm');
+    }
     const dayBounds = getIncomingListDayBounds(req.query);
     applyIncomingReceivedDateFilter(qb, {
       dayBounds,
@@ -250,6 +281,12 @@ export async function markAllIncomingAsRead(req, res) {
       .set({ isRead: true })
       .where('isRead = :isRead', { isRead: false })
       .andWhere('"deletedAt" IS NULL');
+    if (!isQueryFlagTrue(req.body?.includeHidden)) {
+      await applyExcludeHiddenSendersForUpdate(qb);
+    }
+    if (isQueryFlagTrue(req.body?.excludeSmtp)) {
+      applyExcludeSmtpForUpdate(qb);
+    }
 
     const dayBounds = getMarkAllReadDayBounds(req.body || {});
     applyIncomingReceivedDateFilterForUpdate(qb, {
@@ -273,6 +310,10 @@ export async function listLatestUnreadIncoming(req, res) {
       .createQueryBuilder('m')
       .where('m.isRead = :isRead', { isRead: false })
       .andWhere('m.deletedAt IS NULL');
+    await applyExcludeHiddenSenders(qb, 'm');
+    if (isQueryFlagTrue(req.query.excludeSmtp)) {
+      applyExcludeSmtp(qb, 'm');
+    }
     const todayOnly = String(req.query.todayOnly || 'true').toLowerCase() !== 'false';
     if (todayOnly) {
       const start = new Date();
@@ -296,6 +337,7 @@ export async function listLatestUnreadIncoming(req, res) {
         emailAddress: r.emailAddress,
         fromEmail: r.fromEmail || '',
         subject: r.subject || '',
+        source: r.source || 'nylas',
       })),
     });
   } catch (error) {
@@ -307,9 +349,9 @@ export async function listLatestUnreadIncoming(req, res) {
 export async function listIncomingMessageTypeCounts(req, res) {
   try {
     const repo = AppDataSource.getRepository(IncomingMessage);
-    const rows = await repo
-      .createQueryBuilder('m')
-      .where('m.deletedAt IS NULL')
+    const qb = repo.createQueryBuilder('m').where('m.deletedAt IS NULL');
+    await applyExcludeHiddenSenders(qb, 'm');
+    const rows = await qb
       .select('m.emailAddress', 'emailAddress')
       .addSelect('m.messageType', 'messageType')
       .addSelect('COUNT(*)', 'count')
@@ -583,6 +625,32 @@ export async function getIncomingMessageContent(req, res) {
     const incoming = await incomingRepo.findOne({ where: { id, deletedAt: IsNull() } });
     if (!incoming) return res.status(404).json({ error: 'Incoming message not found' });
 
+    if (!incoming.isRead) {
+      incoming.isRead = true;
+      await incomingRepo.save(incoming);
+    }
+
+    const source = String(incoming.source || 'nylas').toLowerCase();
+
+    // App-password IMAP messages store body locally at ingest time.
+    if (source === 'app_password') {
+      const body = incoming.bodyHtml || incoming.bodyText || '';
+      return res.json({
+        id: incoming.id,
+        messageId: incoming.messageId,
+        emailAddress: incoming.emailAddress,
+        subject: incoming.subject || '',
+        body,
+        snippet: (incoming.bodyText || '').slice(0, 200),
+        from: incoming.fromEmail ? [incoming.fromEmail] : [],
+        to: incoming.toEmail ? [incoming.toEmail] : [],
+        date: incoming.receivedAt ? Math.floor(new Date(incoming.receivedAt).getTime() / 1000) : null,
+        receivedAt: incoming.receivedAt || null,
+        isRead: true,
+        source: 'app_password',
+      });
+    }
+
     const emailRepo = AppDataSource.getRepository(Email);
     const mailbox = await emailRepo.findOne({
       where: { address: incoming.emailAddress, deletedAt: null },
@@ -593,11 +661,6 @@ export async function getIncomingMessageContent(req, res) {
 
     const message = await fetchNylasMessageById(mailbox.grantId, mailbox.nylasKey, incoming.messageId);
     if (!message) return res.status(404).json({ error: 'Message not found in Nylas' });
-
-    if (!incoming.isRead) {
-      incoming.isRead = true;
-      await incomingRepo.save(incoming);
-    }
 
     const body = extractNylasMessageBody(message);
     res.json({
@@ -612,6 +675,7 @@ export async function getIncomingMessageContent(req, res) {
       date: message.date || null,
       receivedAt: incoming.receivedAt || null,
       isRead: true,
+      source: 'nylas',
     });
   } catch (error) {
     console.error('getIncomingMessageContent error:', error);

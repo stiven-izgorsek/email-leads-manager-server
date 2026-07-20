@@ -1,17 +1,19 @@
 import { EntitySchema } from 'typeorm';
 
 export class Email {
-  constructor(id, address, firstName, lastName, marketingDailyLimit, marketingEnabled, followupEnabled, accountId, status, password, twoFa, recoveryEmail, grantId, nylasKey, chromePath, chromeUserDataDir, chromeProfileDirectory, gmailUIndex, createdAt, updatedAt, deletedAt) {
+  constructor(id, address, firstName, lastName, marketingDailyLimit, marketingAssignDefault, marketingEnabled, followupEnabled, accountId, status, password, appPassword, twoFa, recoveryEmail, grantId, nylasKey, chromePath, chromeUserDataDir, chromeProfileDirectory, gmailUIndex, createdAt, updatedAt, deletedAt) {
     this.id = id;
     this.address = address;
     this.firstName = firstName;
     this.lastName = lastName;
     this.marketingDailyLimit = marketingDailyLimit;
+    this.marketingAssignDefault = marketingAssignDefault;
     this.marketingEnabled = marketingEnabled;
     this.followupEnabled = followupEnabled;
     this.accountId = accountId;
     this.status = status;
     this.password = password;
+    this.appPassword = appPassword;
     this.twoFa = twoFa;
     this.recoveryEmail = recoveryEmail;
     this.grantId = grantId;
@@ -57,6 +59,11 @@ export const EmailSchema = new EntitySchema({
       type: 'int',
       nullable: true,
     },
+    marketingAssignDefault: {
+      name: 'marketing_assign_default',
+      type: 'int',
+      nullable: true,
+    },
     marketingEnabled: {
       name: 'marketing_enabled',
       type: 'boolean',
@@ -80,6 +87,11 @@ export const EmailSchema = new EntitySchema({
       default: 'new',
     },
     password: {
+      type: 'varchar',
+      nullable: true,
+    },
+    appPassword: {
+      name: 'app_password',
       type: 'varchar',
       nullable: true,
     },

@@ -6,6 +6,7 @@ import {
   getMarketingDashboardHandler,
   releaseStuckMarketingRunsHandler,
   setMarketingEnabledHandler,
+  setMarketingAssignDefaultHandler,
   startMarketingForAll,
   startMarketingForEmail,
   unassignMarketingLeadHandler,
@@ -18,6 +19,7 @@ const router = express.Router();
 router.get('/dashboard', getMarketingDashboardHandler);
 router.get('/assignments/:emailId/leads', getAssignmentLeadsHandler);
 router.patch('/emails/:emailId/enabled', setMarketingEnabledHandler);
+router.patch('/emails/:emailId/assign-default', setMarketingAssignDefaultHandler);
 router.delete('/assignments/leads/:assignmentLeadId', unassignMarketingLeadHandler);
 router.post('/unassign-all-pending', unassignAllPendingMarketingLeadsHandler);
 router.post('/assign', assignMarketingLeads);

@@ -31,10 +31,32 @@ export const IncomingMessageSchema = new EntitySchema({
       length: 255,
       nullable: true,
     },
+    toEmail: {
+      name: 'to_email',
+      type: 'varchar',
+      length: 255,
+      nullable: true,
+    },
     messageType: {
       type: 'varchar',
       length: 100,
       default: 'other',
+    },
+    /** 'nylas' | 'app_password' */
+    source: {
+      type: 'varchar',
+      length: 32,
+      default: 'nylas',
+    },
+    bodyHtml: {
+      name: 'body_html',
+      type: 'text',
+      nullable: true,
+    },
+    bodyText: {
+      name: 'body_text',
+      type: 'text',
+      nullable: true,
     },
     receivedAt: {
       type: 'timestamp',

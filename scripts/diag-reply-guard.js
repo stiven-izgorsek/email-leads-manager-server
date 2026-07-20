@@ -35,6 +35,7 @@ for (const c of batch.slice(0, 5)) {
      FROM incoming_message im
      WHERE im."emailAddress" = $1 AND im."deletedAt" IS NULL
        AND im."messageType" <> 'ignored_sender'
+       AND im."messageType" <> 'hide_sender'
        AND COALESCE(im."receivedAt", im."createdAt") > $2
      ORDER BY COALESCE(im."receivedAt", im."createdAt") ASC LIMIT 8`,
     [email.address, c.lastSent]

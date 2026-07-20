@@ -7,6 +7,7 @@ import {
   runMarketingForAll,
   runMarketingForEmail,
   setMarketingEnabled,
+  setMarketingAssignDefault,
   unassignMarketingLead,
   unassignAllPendingMarketingLeads,
   resetDailySentCount,
@@ -14,15 +15,23 @@ import {
 
 export async function getMarketingDashboardHandler(req, res) {
   try {
+    const channel =
+      req.query.channel === 'smtp'
+        ? 'smtp'
+        : req.query.channel === 'any'
+          ? 'any'
+          : 'nylas';
     const nylasOnly =
-      req.query.nylasOnly === 'false' || req.query.nylasOnly === '0'
-        ? false
-        : true;
-    const data = await getMarketingDashboard(req.query.date, { nylasOnly });
+      channel === 'nylas'
+        ? req.query.nylasOnly === 'false' || req.query.nylasOnly === '0'
+          ? false
+          : true
+        : false;
+    const data = await getMarketingDashboard(req.query.date, { nylasOnly, channel });
     const runningCount = (data.rows || []).filter((r) => r.running).length;
     if (runningCount > 0) {
       console.log(
-        `[marketing] GET dashboard date=${data.assignmentDate}: ${runningCount} mailbox(es) marked running in DB`
+        `[marketing] GET dashboard date=${data.assignmentDate} channel=${data.channel}: ${runningCount} mailbox(es) marked running in DB`
       );
     }
     res.json(data);
@@ -34,22 +43,34 @@ export async function getMarketingDashboardHandler(req, res) {
 
 export async function assignMarketingLeads(req, res) {
   try {
-    const { emailId, count, date } = req.body || {};
+    const { emailId, count, date, leadFilterId, leadFilterIds, leadFilterMode, channel } =
+      req.body || {};
     if (!emailId) return res.status(400).json({ error: 'emailId is required' });
-    const result = await assignLeadsToEmail(emailId, count, date);
+    const result = await assignLeadsToEmail(emailId, count, date, {
+      leadFilterId,
+      leadFilterIds,
+      leadFilterMode,
+      channel: channel === 'smtp' ? 'smtp' : 'nylas',
+    });
     res.json(result);
   } catch (error) {
     console.error('assignMarketingLeads error:', error);
     const msg = error.message || 'Internal server error';
-    const status = /not found|not eligible|Cannot assign|Nylas/i.test(msg) ? 400 : 500;
+    const status = /not found|not eligible|Cannot assign|Nylas|App Password/i.test(msg) ? 400 : 500;
     res.status(status).json({ error: msg });
   }
 }
 
 export async function assignMarketingLeadsAll(req, res) {
   try {
-    const { countPerAccount, date } = req.body || {};
-    const result = await assignLeadsToAll(countPerAccount, date);
+    const { countPerAccount, date, leadFilterId, leadFilterIds, leadFilterMode, channel } =
+      req.body || {};
+    const result = await assignLeadsToAll(countPerAccount, date, {
+      leadFilterId,
+      leadFilterIds,
+      leadFilterMode,
+      channel: channel === 'smtp' ? 'smtp' : 'nylas',
+    });
     res.json(result);
   } catch (error) {
     console.error('assignMarketingLeadsAll error:', error);
@@ -60,9 +81,13 @@ export async function assignMarketingLeadsAll(req, res) {
 export async function startMarketingForEmail(req, res) {
   try {
     const { emailId } = req.params;
-    const { date } = req.body || {};
-    console.log(`[marketing] API POST /start/${emailId} date=${date || 'today'}`);
-    const result = await runMarketingForEmail(emailId, date);
+    const { date, channel } = req.body || {};
+    console.log(
+      `[marketing] API POST /start/${emailId} date=${date || 'today'} channel=${channel || 'nylas'}`
+    );
+    const result = await runMarketingForEmail(emailId, date, {
+      channel: channel === 'smtp' ? 'smtp' : 'nylas',
+    });
     res.json(result);
   } catch (error) {
     console.error('startMarketingForEmail error:', error);
@@ -85,6 +110,24 @@ export async function setMarketingEnabledHandler(req, res) {
     console.error('setMarketingEnabled error:', error);
     const msg = error.message || 'Internal server error';
     const status = /not found|required/i.test(msg) ? 400 : 500;
+    res.status(status).json({ error: msg });
+  }
+}
+
+export async function setMarketingAssignDefaultHandler(req, res) {
+  try {
+    const { emailId } = req.params;
+    const { assignDefault, marketingAssignDefault } = req.body || {};
+    const value = assignDefault ?? marketingAssignDefault;
+    if (value === undefined) {
+      return res.status(400).json({ error: 'assignDefault is required' });
+    }
+    const result = await setMarketingAssignDefault(emailId, value);
+    res.json(result);
+  } catch (error) {
+    console.error('setMarketingAssignDefault error:', error);
+    const msg = error.message || 'Internal server error';
+    const status = /not found|must be between/i.test(msg) ? 400 : 500;
     res.status(status).json({ error: msg });
   }
 }
@@ -166,13 +209,18 @@ export async function resetDailySentCountHandler(req, res) {
 
 export async function startMarketingForAll(req, res) {
   try {
-    const { date } = req.body || {};
-    console.log(`[marketing] API POST /start-all date=${date || 'today'}`);
-    const result = await runMarketingForAll(date);
+    const { date, channel } = req.body || {};
+    console.log(
+      `[marketing] API POST /start-all date=${date || 'today'} channel=${channel || 'nylas'}`
+    );
+    const result = await runMarketingForAll(date, {
+      channel: channel === 'smtp' ? 'smtp' : 'nylas',
+    });
     console.log('[marketing] API POST /start-all response', {
       started: result.started,
       skipped: result.skipped,
       concurrency: result.concurrency,
+      channel: result.channel,
     });
     res.json(result);
   } catch (error) {

@@ -13,6 +13,7 @@ import {
   composeLeadOutboundEmailWithAi,
 } from '../controllers/templateController.js';
 import { sendNylasEmail } from './nylasSendService.js';
+import { sendSmtpEmail, hasAppPasswordCredentials } from './smtpSendService.js';
 import { sleep } from '../utils/nylasRateLimit.js';
 import { getMailboxTodayStatsByEmailId, getLocalTodayRange } from './mailboxTodayOutboundService.js';
 import {
@@ -202,18 +203,44 @@ async function sendOneMarketingLead(email, assignment, leadRow, meta = {}) {
       subject: String(composed.subject || '').slice(0, 60),
     });
 
-    const result = await sendNylasEmail({
-      grantId: email.grantId,
-      nylasKey: email.nylasKey,
-      toEmail: client.email,
-      toName: [client.firstName, client.lastName].filter(Boolean).join(' ') || client.email,
-      subject: composed.subject,
-      body: composed.body,
-    });
+    const useSmtp = hasAppPasswordCredentials(email) && !hasNylasCredentials(email);
+    // Prefer Nylas when both are present; SMTP path used for app-password-only mailboxes
+    // and when channel is smtp. Channel passed via meta.channel.
+    const channel = meta.channel || (hasNylasCredentials(email) ? 'nylas' : 'smtp');
+
+    let result;
+    if (channel === 'smtp' || (useSmtp && channel !== 'nylas')) {
+      if (!hasAppPasswordCredentials(email)) {
+        leadRow.sendStatus = 'failed';
+        leadRow.errorMessage = 'Mailbox is missing Google App Password';
+        leadRow.subject = composed.subject;
+        leadRow.body = composed.body;
+        await leadRepo.save(leadRow);
+        return { sent: 0, failed: 1 };
+      }
+      result = await sendSmtpEmail({
+        fromEmail: email.address,
+        fromName: accountName,
+        appPassword: email.appPassword,
+        toEmail: client.email,
+        toName: [client.firstName, client.lastName].filter(Boolean).join(' ') || client.email,
+        subject: composed.subject,
+        body: composed.body,
+      });
+    } else {
+      result = await sendNylasEmail({
+        grantId: email.grantId,
+        nylasKey: email.nylasKey,
+        toEmail: client.email,
+        toName: [client.firstName, client.lastName].filter(Boolean).join(' ') || client.email,
+        subject: composed.subject,
+        body: composed.body,
+      });
+    }
 
     if (!result.ok) {
       leadRow.sendStatus = 'failed';
-      leadRow.errorMessage = result.error || 'Nylas send failed';
+      leadRow.errorMessage = result.error || (channel === 'smtp' ? 'SMTP send failed' : 'Nylas send failed');
       leadRow.subject = composed.subject;
       leadRow.body = composed.body;
       await leadRepo.save(leadRow);
@@ -228,7 +255,7 @@ async function sendOneMarketingLead(email, assignment, leadRow, meta = {}) {
     leadRow.errorMessage = null;
     await leadRepo.save(leadRow);
     await markClientSent(client, email.address);
-    marketingLog(mb, 'lead sent', { ...meta, nylasMessageId: result.messageId });
+    marketingLog(mb, 'lead sent', { ...meta, channel, messageId: result.messageId });
     return { sent: 1, failed: 0 };
   } catch (err) {
     leadRow.sendStatus = 'failed';
@@ -249,7 +276,7 @@ async function loadMarketingWorkloads(date, eligibleRows) {
       where: { id: row.emailId, deletedAt: null },
       relations: ['account'],
     });
-    if (!email || !canAssignToEmail(email)) continue;
+    if (!email || !canAssignToEmail(email, row.marketingChannel || 'nylas')) continue;
 
     const assignment = await assignmentRepo.findOne({
       where: { emailId: row.emailId, assignmentDate: date },
@@ -265,6 +292,7 @@ async function loadMarketingWorkloads(date, eligibleRows) {
       email,
       assignment,
       initialPending: pending,
+      channel: row.marketingChannel || 'nylas',
     });
   }
   return workloads;
@@ -292,6 +320,7 @@ async function processMailboxOneRound(workload, roundIndex, totalRounds) {
     round: roundIndex + 1,
     totalRounds,
     pendingBefore: pending,
+    channel: workload.channel || 'nylas',
   });
 }
 
@@ -452,6 +481,8 @@ export function hasNylasCredentials(emailRow) {
   return Boolean(String(emailRow?.grantId || '').trim() && String(emailRow?.nylasKey || '').trim());
 }
 
+export { hasAppPasswordCredentials };
+
 /** DB-only check: grant ID + Nylas API key present (no live Nylas call). */
 export function getNylasCredentialsStatus(emailRow) {
   if (hasNylasCredentials(emailRow)) {
@@ -464,14 +495,21 @@ export function isMarketingEnabledForEmail(emailRow) {
   return emailRow?.marketingEnabled !== false;
 }
 
-export function canAssignToEmail(emailRow) {
+/**
+ * @param {'nylas'|'smtp'|'any'} [channel='nylas']
+ */
+export function canAssignToEmail(emailRow, channel = 'nylas') {
   if (!isMarketingEnabledForEmail(emailRow)) return false;
   if (isEmailAccountBlocked(emailRow)) return false;
+  if (channel === 'smtp') return hasAppPasswordCredentials(emailRow);
+  if (channel === 'any') {
+    return hasNylasCredentials(emailRow) || hasAppPasswordCredentials(emailRow);
+  }
   return hasNylasCredentials(emailRow);
 }
 
-export function canRunMarketing(emailRow, stats) {
-  if (!canAssignToEmail(emailRow)) return false;
+export function canRunMarketing(emailRow, stats, channel = 'nylas') {
+  if (!canAssignToEmail(emailRow, channel)) return false;
   if (marketingOrchestratorActive) return false;
   if (stats?.running) return false;
   return (stats?.pending || 0) > 0;
@@ -513,6 +551,78 @@ async function getOrCreateAssignment(emailId, assignmentDate) {
   return row;
 }
 
+/**
+ * Move still-pending (unsent) leads from past assignments into the current-day assignment
+ * so leads assigned on a previous day (e.g. Friday) but never sent still appear as assigned
+ * today and can be started. Only runs when `targetDate` is the real current local day, and
+ * only touches assignments that are not actively running. Idempotent.
+ */
+async function carryForwardPendingMarketingAssignments(targetDate, emailId = null) {
+  if (targetDate !== getAssignmentDateString()) return { moved: 0 };
+
+  const assignmentRepo = AppDataSource.getRepository(MarketingAssignment);
+  const leadRepo = AppDataSource.getRepository(MarketingAssignmentLead);
+
+  const pastQb = assignmentRepo
+    .createQueryBuilder('a')
+    .where('a.assignmentDate < :date', { date: targetDate })
+    .andWhere('a.running = false');
+  if (emailId) pastQb.andWhere('a.emailId = :emailId', { emailId });
+  const pastAssignments = await pastQb.getMany();
+  if (!pastAssignments.length) return { moved: 0 };
+
+  const pastIds = pastAssignments.map((a) => a.id);
+  const pendingRows = await leadRepo
+    .createQueryBuilder('mal')
+    .select('mal.assignmentId', 'assignmentId')
+    .addSelect('COUNT(*)', 'cnt')
+    .where('mal.assignmentId IN (:...ids)', { ids: pastIds })
+    .andWhere("mal.sendStatus = 'pending'")
+    .groupBy('mal.assignmentId')
+    .getRawMany();
+  const pendingByAssignment = new Map(
+    pendingRows.map((r) => [r.assignmentId, parseInt(String(r.cnt), 10) || 0])
+  );
+
+  let moved = 0;
+  const affectedTargets = new Set();
+  const affectedSources = new Set();
+
+  for (const src of pastAssignments) {
+    if ((pendingByAssignment.get(src.id) || 0) <= 0) continue;
+    const target = await getOrCreateAssignment(src.emailId, targetDate);
+    if (target.id === src.id) continue;
+    const res = await leadRepo.update(
+      { assignmentId: src.id, sendStatus: 'pending' },
+      { assignmentId: target.id }
+    );
+    const cnt = res.affected || 0;
+    if (cnt > 0) {
+      moved += cnt;
+      affectedTargets.add(target.id);
+      affectedSources.add(src.id);
+    }
+  }
+
+  for (const id of affectedTargets) {
+    await syncAssignmentTargetCount(id);
+    await assignmentRepo.update({ id }, { status: 'assigned', lastError: null });
+  }
+  for (const id of affectedSources) {
+    await syncAssignmentTargetCount(id);
+  }
+
+  if (moved > 0) {
+    marketingLog(null, 'carried forward unsent leads into today', {
+      moved,
+      targetDate,
+      sources: affectedSources.size,
+    });
+  }
+
+  return { moved };
+}
+
 async function getAssignmentStats(assignmentIds) {
   if (!assignmentIds.length) return new Map();
   const rows = await AppDataSource.getRepository(MarketingAssignmentLead)
@@ -547,24 +657,66 @@ export async function setMarketingEnabled(emailId, enabled) {
   const email = await emailRepo.findOne({ where: { id: emailId, deletedAt: null } });
   if (!email) throw new Error('Email account not found');
   const next = Boolean(enabled);
-  if (next && !hasNylasCredentials(email)) {
-    throw new Error('Grant ID and Nylas API key are required before enabling marketing');
+  if (next && !hasNylasCredentials(email) && !hasAppPasswordCredentials(email)) {
+    throw new Error('Grant ID + Nylas API key, or Google App Password, are required before enabling marketing');
   }
   email.marketingEnabled = next;
   await emailRepo.save(email);
   return { emailId: email.id, address: email.address, marketingEnabled: email.marketingEnabled };
 }
 
+export async function setMarketingAssignDefault(emailId, assignDefault) {
+  const emailRepo = AppDataSource.getRepository(Email);
+  const email = await emailRepo.findOne({ where: { id: emailId, deletedAt: null } });
+  if (!email) throw new Error('Email account not found');
+
+  const raw = assignDefault;
+  if (raw === null || raw === undefined || raw === '') {
+    email.marketingAssignDefault = null;
+  } else {
+    const n = parseInt(String(raw), 10);
+    if (!Number.isFinite(n) || n < 1 || n > 500) {
+      throw new Error('assignDefault must be between 1 and 500');
+    }
+    email.marketingAssignDefault = n;
+  }
+
+  await emailRepo.save(email);
+  return {
+    emailId: email.id,
+    address: email.address,
+    marketingAssignDefault: email.marketingAssignDefault,
+  };
+}
+
 export async function getMarketingDashboard(assignmentDate, options = {}) {
   const date = getAssignmentDateString(assignmentDate);
-  /** Default true (marketing). Pass nylasOnly=false for all email accounts (overview). */
-  const nylasOnly = options.nylasOnly !== false && options.nylasOnly !== 'false';
+  const channel = options.channel === 'smtp' ? 'smtp' : options.channel === 'any' ? 'any' : 'nylas';
+  /** Legacy: when channel not set explicitly via options.channel, nylasOnly still applies. */
+  const nylasOnly =
+    options.channel != null
+      ? channel === 'nylas'
+      : options.nylasOnly !== false && options.nylasOnly !== 'false';
+
+  // Bring forward leads assigned on a previous day but never sent, so they appear today.
+  if (options.carryForward !== false) {
+    try {
+      await carryForwardPendingMarketingAssignments(date);
+    } catch (err) {
+      marketingLog(null, 'carry-forward failed (continuing)', { error: err.message || String(err) });
+    }
+  }
+
   const emailRepo = AppDataSource.getRepository(Email);
   let emailQb = emailRepo
     .createQueryBuilder('email')
     .leftJoinAndSelect('email.account', 'account')
     .where('email.deletedAt IS NULL');
-  if (nylasOnly) {
+  if (channel === 'smtp') {
+    emailQb = emailQb.andWhere(
+      `(email.app_password IS NOT NULL AND TRIM(email.app_password) <> '')`
+    );
+  } else if (nylasOnly || channel === 'nylas') {
     emailQb = emailQb.andWhere(
       `(email.grant_id IS NOT NULL AND TRIM(email.grant_id) <> '')
        AND (email.nylas_key IS NOT NULL AND TRIM(email.nylas_key) <> '')`
@@ -603,8 +755,11 @@ export async function getMarketingDashboard(assignmentDate, options = {}) {
       emailId: email.id,
       address: email.address,
       nylasConnected: hasNylasCredentials(email),
+      hasAppPassword: hasAppPasswordCredentials(email),
+      marketingChannel: channel,
       marketingEnabled,
       marketingDailyLimit: email.marketingDailyLimit ?? null,
+      marketingAssignDefault: email.marketingAssignDefault ?? null,
       emailStatus: email.status,
       nylasStatus: nylas.status,
       nylasDetail: nylas.detail,
@@ -619,11 +774,15 @@ export async function getMarketingDashboard(assignmentDate, options = {}) {
       outreachDailyLimit,
       failedCount: counts.failed,
       running: Boolean(assignment?.running),
-      canAssign: canAssignToEmail(email),
-      canRun: canRunMarketing(email, {
-        pending: counts.pending,
-        running: assignment?.running,
-      }),
+      canAssign: canAssignToEmail(email, channel === 'any' ? 'any' : channel),
+      canRun: canRunMarketing(
+        email,
+        {
+          pending: counts.pending,
+          running: assignment?.running,
+        },
+        channel === 'any' ? 'any' : channel
+      ),
       lastError: assignment?.lastError || null,
       messagesSentToday: todayStats.messagesSentToday,
       followupsSentToday: todayStats.followupsSentToday,
@@ -638,7 +797,8 @@ export async function getMarketingDashboard(assignmentDate, options = {}) {
     assignmentDate: date,
     progressDate: today.toISOString().slice(0, 10),
     progressDateEnd: tomorrow.toISOString(),
-    nylasOnly,
+    nylasOnly: channel === 'nylas' || nylasOnly,
+    channel,
     rows,
     checkedAt: new Date().toISOString(),
     sendDelayMinMs: sendDelay.minMs,
@@ -650,6 +810,7 @@ export async function getMarketingDashboard(assignmentDate, options = {}) {
 
 export async function assignLeadsToEmail(emailId, count, assignmentDate, filters = {}) {
   const date = getAssignmentDateString(assignmentDate);
+  const channel = filters.channel === 'smtp' ? 'smtp' : 'nylas';
   let requested = Math.min(500, Math.max(0, parseInt(String(count), 10) || 0));
   if (!requested) throw new Error('count must be at least 1');
 
@@ -672,14 +833,16 @@ export async function assignLeadsToEmail(emailId, count, assignmentDate, filters
     };
   }
 
-  if (!canAssignToEmail(email)) {
+  if (!canAssignToEmail(email, channel)) {
     if (!isMarketingEnabledForEmail(email)) {
       throw new Error('Marketing is disabled for this mailbox');
     }
     throw new Error(
       isEmailAccountBlocked(email)
         ? `Cannot assign leads to account with status "${email.status}"`
-        : 'Grant ID and Nylas API key are required for this mailbox'
+        : channel === 'smtp'
+          ? 'Google App Password is required for this mailbox'
+          : 'Grant ID and Nylas API key are required for this mailbox'
     );
   }
 
@@ -689,6 +852,7 @@ export async function assignLeadsToEmail(emailId, count, assignmentDate, filters
     verifiedOnly: true,
     assignmentDate: date,
     leadFilterId: filters.leadFilterId,
+    leadFilterIds: filters.leadFilterIds,
     leadFilterMode: filters.leadFilterMode,
     location: filters.location,
     industry: filters.industry,
@@ -896,10 +1060,11 @@ export async function resetDailySentCount(assignmentDate, emailId = null) {
   };
 }
 
-export async function assignLeadsToAll(countPerAccount, assignmentDate) {
+export async function assignLeadsToAll(countPerAccount, assignmentDate, filters = {}) {
   const date = getAssignmentDateString(assignmentDate);
+  const channel = filters.channel === 'smtp' ? 'smtp' : 'nylas';
   const defaultCount = Math.max(1, Math.min(500, parseInt(String(countPerAccount), 10) || 0));
-  const dashboard = await getMarketingDashboard(date);
+  const dashboard = await getMarketingDashboard(date, { channel });
   const eligible = dashboard.rows.filter((r) => r.marketingEnabled && r.canAssign);
   if (!eligible.length) {
     return { totalAssigned: 0, accounts: [] };
@@ -927,7 +1092,10 @@ export async function assignLeadsToAll(countPerAccount, assignmentDate) {
       continue;
     }
     try {
-      const result = await assignLeadsToEmail(row.emailId, count, date);
+      const result = await assignLeadsToEmail(row.emailId, count, date, {
+        ...filters,
+        channel,
+      });
       totalAssigned += result.assigned || 0;
       accounts.push({
         emailId: row.emailId,
@@ -936,6 +1104,7 @@ export async function assignLeadsToAll(countPerAccount, assignmentDate) {
         requestedCount: count,
         dailyLimit,
         alreadyAllocated,
+        message: result.message || null,
         usedDailyLimit: row.marketingDailyLimit != null && row.marketingDailyLimit > 0,
       });
     } catch (err) {
@@ -946,12 +1115,12 @@ export async function assignLeadsToAll(countPerAccount, assignmentDate) {
         requestedCount: count,
         dailyLimit,
         alreadyAllocated,
-        usedDailyLimit: row.marketingDailyLimit != null && row.marketingDailyLimit > 0,
         error: err.message || String(err),
       });
     }
   }
-  return { totalAssigned, accounts };
+
+  return { totalAssigned, accounts, channel };
 }
 
 async function markClientSent(client, mailboxAddress) {
@@ -971,8 +1140,9 @@ async function markClientSent(client, mailboxAddress) {
   );
 }
 
-export async function runMarketingForEmail(emailId, assignmentDate) {
+export async function runMarketingForEmail(emailId, assignmentDate, options = {}) {
   const date = getAssignmentDateString(assignmentDate);
+  const channel = options.channel === 'smtp' ? 'smtp' : 'nylas';
   const emailRepo = AppDataSource.getRepository(Email);
   const email = await emailRepo.findOne({
     where: { id: emailId, deletedAt: null },
@@ -985,14 +1155,25 @@ export async function runMarketingForEmail(emailId, assignmentDate) {
   }
 
   const mb = email.address;
-  marketingLog(mb, 'run started', { emailId, assignmentDate: date });
+  marketingLog(mb, 'run started', { emailId, assignmentDate: date, channel });
 
   if (!isMarketingEnabledForEmail(email)) {
     throw new Error('Marketing is disabled for this mailbox');
   }
 
-  if (!canAssignToEmail(email)) {
-    throw new Error('Mailbox is not eligible for marketing (status or missing Nylas credentials)');
+  if (!canAssignToEmail(email, channel)) {
+    throw new Error(
+      channel === 'smtp'
+        ? 'Mailbox is not eligible for SMTP marketing (status or missing App Password)'
+        : 'Mailbox is not eligible for marketing (status or missing Nylas credentials)'
+    );
+  }
+
+  // Pull any unsent leads from previous days into today's assignment for this mailbox first.
+  try {
+    await carryForwardPendingMarketingAssignments(date, emailId);
+  } catch (err) {
+    marketingLog(mb, 'carry-forward failed (continuing)', { error: err.message || String(err) });
   }
 
   const assignmentRepo = AppDataSource.getRepository(MarketingAssignment);
@@ -1023,7 +1204,7 @@ export async function runMarketingForEmail(emailId, assignmentDate) {
   marketingLog(mb, 'claimed assignment', {
     assignmentId: assignment.id,
     pending: pendingRows.length,
-    grantIdPrefix: String(email.grantId || '').slice(0, 8),
+    channel,
   });
 
   let sent = 0;
@@ -1044,6 +1225,7 @@ export async function runMarketingForEmail(emailId, assignmentDate) {
         index: i + 1,
         total: pendingRows.length,
         mode: 'single-mailbox',
+        channel,
       });
       sent += result.sent;
       failed += result.failed;
@@ -1058,7 +1240,7 @@ export async function runMarketingForEmail(emailId, assignmentDate) {
       }
       await assignmentRepo.save(fresh);
     }
-    marketingLog(mb, 'run finished', { sent, failed, total: pendingRows.length });
+    marketingLog(mb, 'run finished', { sent, failed, total: pendingRows.length, channel });
   }
 
   return { sent, failed, total: pendingRows.length };
@@ -1068,8 +1250,9 @@ export async function runMarketingForEmail(emailId, assignmentDate) {
  * Start-all: round-robin batches — each batch sends one email per mailbox, then the next batch,
  * repeating for message #2, #3, … with random 3–5 min spacing per mailbox between its own sends.
  */
-export async function runMarketingForAll(assignmentDate) {
+export async function runMarketingForAll(assignmentDate, options = {}) {
   const date = getAssignmentDateString(assignmentDate);
+  const channel = options.channel === 'smtp' ? 'smtp' : 'nylas';
 
   if (marketingOrchestratorActive) {
     throw new Error('Marketing send is already in progress. Wait for it to finish or use Reset stuck sending.');
@@ -1084,7 +1267,7 @@ export async function runMarketingForAll(assignmentDate) {
     marketingLog(null, 'released stale running assignments before start-all', { count: released });
   }
 
-  const dashboard = await getMarketingDashboard(date);
+  const dashboard = await getMarketingDashboard(date, { channel });
   const enabledRows = dashboard.rows.filter((r) => r.marketingEnabled);
   const eligible = enabledRows.filter(
     (r) => r.canAssign && (r.pendingCount || 0) > 0 && !r.running
@@ -1098,7 +1281,12 @@ export async function runMarketingForAll(assignmentDate) {
     if (marketingOrchestratorActive) reason = 'orchestrator already running';
     else if (row.running) reason = 'already running';
     else if ((row.pendingCount || 0) === 0) reason = 'no pending leads — assign first';
-    else if (!row.canAssign) reason = 'missing Nylas setup or blocked status';
+    else if (!row.canAssign) {
+      reason =
+        channel === 'smtp'
+          ? 'missing App Password or blocked status'
+          : 'missing Nylas setup or blocked status';
+    }
     skipped.push({ emailId: row.emailId, address: row.address, reason });
   }
 
@@ -1107,6 +1295,7 @@ export async function runMarketingForAll(assignmentDate) {
     skipped: skipped.length,
     batchSize,
     assignmentDate: date,
+    channel,
   });
 
   if (eligible.length > 0) {
@@ -1123,9 +1312,10 @@ export async function runMarketingForAll(assignmentDate) {
     emailIds: eligible.map((r) => r.emailId),
     concurrency: batchSize,
     releasedStaleRunning: released,
+    channel,
     message:
       eligible.length > 0
-        ? `Round-robin started for ${eligible.length} mailbox(es): batches of ${batchSize} send one email each, then the next batch, then message #2 for all, etc. (random 3–5 min between sends on the same mailbox). Watch logs [marketing] / [nylas-send].`
+        ? `Round-robin started for ${eligible.length} mailbox(es): batches of ${batchSize} send one email each, then the next batch, then message #2 for all, etc. (random 3–5 min between sends on the same mailbox). Watch logs [marketing] / [nylas-send] / [smtp-send].`
         : 'No mailboxes were started. Assign leads and ensure accounts are enabled with pending sends.',
   };
 }

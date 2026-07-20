@@ -3,34 +3,11 @@ import { Template } from '../entities/Template.js';
 import { Like } from 'typeorm';
 import { createChatCompletion, assertOpenAiConfigured } from '../services/applicationService.js';
 import { fetchWebsiteContentSummary } from '../services/websiteContentService.js';
-
-const COMPANY_CATEGORIES = [
-  'AI-image',
-  'AI-chatbot',
-  'AI-healthcare',
-  'AI-automation',
-  'AI-audio',
-  'AI-CRM',
-  'AI-unknown',
-  'CRM',
-  'E-commerce',
-  'E-learning',
-  'Fintech',
-  'Document-generation',
-  'healthcare',
-  'petcare',
-  'manufacturing-furniture',
-  'manufacturing-pump',
-  'manufacturing-unknown',
-  'mqtt-energy',
-  'travel',
-  'unknown',
-];
-
-const TEMPLATE_INDUSTRIES = [
-  ...COMPANY_CATEGORIES,
-  'Other',
-];
+import {
+  COMPANY_CATEGORIES,
+  TEMPLATE_INDUSTRIES,
+  resolveForcedTemplateIndustry,
+} from '../constants/templateIndustries.js';
 
 const TEMPLATE_SIZES = ['long', 'short', 'normal'];
 
@@ -41,6 +18,8 @@ const INDUSTRY_GENERATION_NOTES = {
   petcare:
     'The industry key "petcare" means pet care: products and services for pets\' health, wellbeing, and daily needs—analogous to healthcare, but for companion animals.',
   healthcare: 'Human healthcare, medical, wellness, or patient-facing health technology and services.',
+  'ecom+luxury':
+    'Cross-vertical customer brands (fashion, luxury goods, marketing, consumer services, grocery, commercial real estate, etc.). Do not list those sub-industries in the copy. Lead with digital customer experience and growth platforms; highlight e-commerce as a core strength while also allowing SaaS tooling, payments/checkout, and service-ops software as natural adjacent skills.',
 };
 
 function sanitizeRandomPlaceholders(templateContent) {
@@ -135,6 +114,7 @@ function normalizeLeadVariables(lead) {
     companyLocation: lead.companyLocation ?? lead.company_location ?? '',
     icebreakerTitle: lead.icebreakerTitle ?? lead.icebreaker_title ?? '',
     icebreaker: lead.icebreaker ?? '',
+    templateIndustry: String(lead.templateIndustry ?? lead.template_industry ?? '').trim(),
   };
 }
 
@@ -517,7 +497,8 @@ export async function composeLeadOutboundEmail({
   if (!subjectTemplate) {
     throw new Error('No subject templates found');
   }
-  const messageTemplate = await selectMessageTemplate(subjectRepo, requestedType, industry);
+  const effectiveIndustry = resolveForcedTemplateIndustry(lead, industry);
+  const messageTemplate = await selectMessageTemplate(subjectRepo, requestedType, effectiveIndustry);
   if (!messageTemplate) {
     throw new Error(`No message templates found for type ${requestedType}`);
   }
@@ -535,7 +516,7 @@ export async function composeLeadOutboundEmail({
     subject,
     body,
     template: body,
-    industry: industry || '',
+    industry: effectiveIndustry || '',
     subjectTemplateId: subjectTemplate.id,
     messageTemplateId: messageTemplate.id,
   };
@@ -604,119 +585,146 @@ export async function composeLeadOutboundEmailWithAi({
   accountName = '',
   accountEmail = '',
   messageType,
+  industry = '',
 }) {
   if (!lead || typeof lead !== 'object') {
     throw new Error('lead is required');
   }
 
-  const normalizedLead = normalizeLeadVariables(lead);
   const requestedMessageType = resolveComposeMessageType(messageType, lead);
+  const forcedIndustry = resolveForcedTemplateIndustry(lead, industry);
+  if (forcedIndustry) {
+    const composed = await composeLeadOutboundEmail({
+      lead,
+      accountName,
+      accountEmail,
+      messageType: requestedMessageType,
+      industry: forcedIndustry,
+    });
+    return {
+      subject: composed.subject,
+      body: composed.body,
+      template: composed.body,
+      category: forcedIndustry,
+      selectedIndustry: forcedIndustry,
+      reasoning: `Forced by templateIndustry (${forcedIndustry}); skipped website/AI analysis.`,
+      accuracy: 10,
+      websitePagesUsed: [],
+      subjectTemplateId: composed.subjectTemplateId,
+      messageTemplateId: composed.messageTemplateId,
+      messageType: requestedMessageType,
+      usedAiClassification: false,
+      openAiFailed: false,
+    };
+  }
 
-    let websiteSummary = { sourceUrl: normalizedLead.companyUrl || '', pages: [], combinedText: '' };
+  const normalizedLead = normalizeLeadVariables(lead);
+
+  let websiteSummary = { sourceUrl: normalizedLead.companyUrl || '', pages: [], combinedText: '' };
+  try {
+    websiteSummary = await fetchWebsiteContentSummary(normalizedLead.companyUrl);
+  } catch {
+    // Non-fatal: OpenAI can still classify from lead fields; fallback uses industries only.
+  }
+
+  let category = 'unknown';
+  let selectedIndustry = 'Other';
+  let reasoning = '';
+  let accuracy = 0;
+  let usedAiClassification = false;
+
+  const applyAiClassification = (parsed) => {
+    const rawAccuracy = Number(parsed.accuracy);
+    accuracy = Number.isFinite(rawAccuracy) ? rawAccuracy : 0;
+    const rawCategory = String(parsed.category || '').trim();
+    category = COMPANY_CATEGORIES.includes(rawCategory) ? rawCategory : 'unknown';
+    selectedIndustry = accuracy < 3 ? 'Other' : category;
+    reasoning = String(parsed.reasoning || '').trim();
+    usedAiClassification = true;
+  };
+
+  const applyLeadFallback = (reason) => {
+    selectedIndustry = pickIndustryFromLead(normalizedLead);
+    category = selectedIndustry;
+    reasoning = reason;
+    accuracy = 0;
+    usedAiClassification = false;
+  };
+
+  let openAiFailed = false;
+  try {
+    assertOpenAiConfigured();
+    const systemPrompt = [
+      'You classify B2B companies into a fixed list of categories for cold-email template selection.',
+      'Return only valid JSON with keys: category, reasoning, accuracy.',
+      `Allowed categories: ${COMPANY_CATEGORIES.join(', ')}.`,
+      'Choose exactly one category from the allowed list.',
+      'Use ALL evidence: (1) lead.industries and lead.tech from CRM/Apollo — these are curated and usually correct;',
+      '(2) website HTML/text; (3) company name, job title, and URL as secondary hints.',
+      'When lead.industries or lead.tech clearly indicate a sector (e.g. "financial services", "e-learning", Shopify stack),',
+      'your category must agree unless the website strongly contradicts it.',
+      'If website content is sparse or generic, rely more on lead.industries and lead.tech and lower accuracy.',
+      'accuracy is 0–10 confidence in the final category.',
+      'Do not invent facts not supported by the provided context.',
+    ].join(' ');
+
+    const userPrompt = JSON.stringify({
+      lead: {
+        companyName: normalizedLead.companyName,
+        companyUrl: normalizedLead.companyUrl,
+        jobTitle: normalizedLead.jobTitle,
+        industries: normalizedLead.industries,
+        tech: normalizedLead.tech,
+        companyLocation: normalizedLead.companyLocation,
+      },
+      websiteSummary: {
+        sourceUrl: websiteSummary.sourceUrl,
+        pages: websiteSummary.pages.map((page) => ({
+          url: page.url,
+          title: page.title,
+        })),
+        combinedText: websiteSummary.combinedText,
+      },
+      instructions: {
+        goal:
+          'Pick one allowed category. Weight lead.industries and lead.tech heavily; use website content to confirm or refine.',
+        outputFormat: {
+          category: 'one string from the allowed category list',
+          reasoning: 'short string explaining website + lead.industries/tech alignment',
+          accuracy: 'number 0–10',
+        },
+      },
+    });
+
+    const raw = await createChatCompletion([
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ]);
+
+    let parsed;
     try {
-      websiteSummary = await fetchWebsiteContentSummary(normalizedLead.companyUrl);
+      parsed = JSON.parse(raw);
     } catch {
-      // Non-fatal: OpenAI can still classify from lead fields; fallback uses industries only.
+      try {
+        const fenced = raw.match(/\{[\s\S]*\}/);
+        parsed = fenced ? JSON.parse(fenced[0]) : null;
+      } catch {
+        parsed = null;
+      }
     }
 
-    let category = 'unknown';
-    let selectedIndustry = 'Other';
-    let reasoning = '';
-    let accuracy = 0;
-    let usedAiClassification = false;
-
-    const applyAiClassification = (parsed) => {
-      const rawAccuracy = Number(parsed.accuracy);
-      accuracy = Number.isFinite(rawAccuracy) ? rawAccuracy : 0;
-      const rawCategory = String(parsed.category || '').trim();
-      category = COMPANY_CATEGORIES.includes(rawCategory) ? rawCategory : 'unknown';
-      selectedIndustry = accuracy < 3 ? 'Other' : category;
-      reasoning = String(parsed.reasoning || '').trim();
-      usedAiClassification = true;
-    };
-
-    const applyLeadFallback = (reason) => {
-      selectedIndustry = pickIndustryFromLead(normalizedLead);
-      category = selectedIndustry;
-      reasoning = reason;
-      accuracy = 0;
-      usedAiClassification = false;
-    };
-
-    let openAiFailed = false;
-    try {
-      assertOpenAiConfigured();
-      const systemPrompt = [
-        'You classify B2B companies into a fixed list of categories for cold-email template selection.',
-        'Return only valid JSON with keys: category, reasoning, accuracy.',
-        `Allowed categories: ${COMPANY_CATEGORIES.join(', ')}.`,
-        'Choose exactly one category from the allowed list.',
-        'Use ALL evidence: (1) lead.industries and lead.tech from CRM/Apollo — these are curated and usually correct;',
-        '(2) website HTML/text; (3) company name, job title, and URL as secondary hints.',
-        'When lead.industries or lead.tech clearly indicate a sector (e.g. "financial services", "e-learning", Shopify stack),',
-        'your category must agree unless the website strongly contradicts it.',
-        'If website content is sparse or generic, rely more on lead.industries and lead.tech and lower accuracy.',
-        'accuracy is 0–10 confidence in the final category.',
-        'Do not invent facts not supported by the provided context.',
-      ].join(' ');
-
-      const userPrompt = JSON.stringify({
-        lead: {
-          companyName: normalizedLead.companyName,
-          companyUrl: normalizedLead.companyUrl,
-          jobTitle: normalizedLead.jobTitle,
-          industries: normalizedLead.industries,
-          tech: normalizedLead.tech,
-          companyLocation: normalizedLead.companyLocation,
-        },
-        websiteSummary: {
-          sourceUrl: websiteSummary.sourceUrl,
-          pages: websiteSummary.pages.map((page) => ({
-            url: page.url,
-            title: page.title,
-          })),
-          combinedText: websiteSummary.combinedText,
-        },
-        instructions: {
-          goal:
-            'Pick one allowed category. Weight lead.industries and lead.tech heavily; use website content to confirm or refine.',
-          outputFormat: {
-            category: 'one string from the allowed category list',
-            reasoning: 'short string explaining website + lead.industries/tech alignment',
-            accuracy: 'number 0–10',
-          },
-        },
-      });
-
-      const raw = await createChatCompletion([
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt },
-      ]);
-
-      let parsed;
-      try {
-        parsed = JSON.parse(raw);
-      } catch {
-        try {
-          const fenced = raw.match(/\{[\s\S]*\}/);
-          parsed = fenced ? JSON.parse(fenced[0]) : null;
-        } catch {
-          parsed = null;
-        }
-      }
-
-      if (!parsed || typeof parsed !== 'object') {
-        console.warn('[OpenAI] composeAiEmail: unparseable or empty AI JSON; using lead industries.');
-        applyLeadFallback('OpenAI returned an unusable response; using lead industries for template selection.');
-        openAiFailed = true;
-      } else {
-        applyAiClassification(parsed);
-        if (!openAiFailed) {
-          const reconciled = reconcileIndustryClassification({
-            aiCategory: category,
-            aiAccuracy: accuracy,
-            aiReasoning: reasoning,
-            normalizedLead,
+    if (!parsed || typeof parsed !== 'object') {
+      console.warn('[OpenAI] composeAiEmail: unparseable or empty AI JSON; using lead industries.');
+      applyLeadFallback('OpenAI returned an unusable response; using lead industries for template selection.');
+      openAiFailed = true;
+    } else {
+      applyAiClassification(parsed);
+      if (!openAiFailed) {
+        const reconciled = reconcileIndustryClassification({
+          aiCategory: category,
+          aiAccuracy: accuracy,
+          aiReasoning: reasoning,
+          normalizedLead,
             websiteSummary,
           });
           category = reconciled.category;
@@ -792,7 +800,7 @@ export async function composeLeadOutboundEmailWithAi({
 
 export async function composeAiEmail(req, res) {
   try {
-    const { accountName, accountEmail, lead, messageType: bodyMessageType } = req.body || {};
+    const { accountName, accountEmail, lead, messageType: bodyMessageType, industry } = req.body || {};
     if (!lead || typeof lead !== 'object') {
       return res.status(400).json({ error: 'lead is required' });
     }
@@ -802,6 +810,7 @@ export async function composeAiEmail(req, res) {
       accountName,
       accountEmail,
       messageType: bodyMessageType,
+      industry,
     });
 
     return res.json({

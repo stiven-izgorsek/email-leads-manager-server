@@ -17,6 +17,12 @@ import {
   replyToIncomingMessage,
   listIncomingMessageReplies,
 } from '../controllers/incomingMessageController.js';
+import {
+  listHiddenSenderEntries,
+  listHiddenSenderValues,
+  createHiddenSenderEntry,
+  deleteHiddenSenderEntry,
+} from '../controllers/hiddenSenderController.js';
 
 const router = express.Router();
 
@@ -30,6 +36,11 @@ router.post('/incoming-messages/analyze-period', analyzeIncomingMessagesPeriod);
 router.get('/incoming-messages/:id/content', getIncomingMessageContent);
 router.get('/incoming-messages/:id/replies', listIncomingMessageReplies);
 router.post('/incoming-messages/:id/reply', replyToIncomingMessage);
+
+router.get('/hidden-senders', listHiddenSenderEntries);
+router.get('/hidden-senders/values', listHiddenSenderValues);
+router.post('/hidden-senders', createHiddenSenderEntry);
+router.delete('/hidden-senders/:idOrValue', deleteHiddenSenderEntry);
 
 router.get('/message-type-rules', listMessageTypeRules);
 router.post('/message-type-rules', createMessageTypeRule);

@@ -8,6 +8,12 @@ import {
   ensureDefaultMessageTypeRules,
   loadMessageTypeRules,
 } from './messageTypeService.js';
+import {
+  isIgnoredMarketingSender,
+  isHiddenSender,
+  MESSAGE_TYPE_IGNORED_SENDER,
+  MESSAGE_TYPE_HIDE_SENDER,
+} from './incomingSenderFilterService.js';
 import { NYLAS_LIST_PAGE_LIMIT, parseNylas429RetryDelayMs, sleep } from '../utils/nylasRateLimit.js';
 
 const POLL_MS = Math.min(
@@ -41,38 +47,6 @@ function normalizeList(items) {
     if (item?.email) return item.email;
     return '';
   }).filter(Boolean);
-}
-
-/** Sender domains we skip classifying and never notify Slack for (marketing / platform mail). */
-const IGNORED_SENDER_EMAIL_DOMAINS = ['linkedin.com', 'xing.com', 'medium.com', 'indeed.com'];
-
-/**
- * @param {string} addr
- * @returns {string}
- */
-function domainFromEmailAddress(addr) {
-  const raw = String(addr || '').trim().toLowerCase();
-  const angle = raw.match(/<([^>]+)>/);
-  const inner = (angle ? angle[1] : raw).trim();
-  const at = inner.lastIndexOf('@');
-  if (at === -1) return '';
-  return inner.slice(at + 1);
-}
-
-/**
- * True if any From address uses one of {@link IGNORED_SENDER_EMAIL_DOMAINS} (host or subdomain).
- * @param {string[]} fromAddresses
- */
-function isIgnoredMarketingSender(fromAddresses) {
-  const list = Array.isArray(fromAddresses) ? fromAddresses : [];
-  for (const item of list) {
-    const domain = domainFromEmailAddress(item);
-    if (!domain) continue;
-    for (const suffix of IGNORED_SENDER_EMAIL_DOMAINS) {
-      if (domain === suffix || domain.endsWith('.' + suffix)) return true;
-    }
-  }
-  return false;
 }
 
 function getMessageBody(message) {
@@ -293,6 +267,28 @@ async function fetchUnreadMessagesForMailbox(emailRow) {
     const body = getMessageBody(message);
     const receivedAt = message?.date ? new Date(message.date * 1000) : null;
 
+    if (await isHiddenSender(fromAddresses)) {
+      try {
+        await incomingRepo.save(
+          incomingRepo.create({
+            emailAddress: emailRow.address,
+            messageId,
+            subject,
+            fromEmail: fromAddresses[0] || null,
+            messageType: MESSAGE_TYPE_HIDE_SENDER,
+            receivedAt,
+            isRead: true,
+            source: 'nylas',
+          })
+        );
+      } catch (error) {
+        if (error?.code !== '23505') {
+          console.error('[NYLAS] Failed storing hide-sender incoming message:', error.message || error);
+        }
+      }
+      continue;
+    }
+
     if (isIgnoredMarketingSender(fromAddresses)) {
       try {
         await incomingRepo.save(
@@ -301,9 +297,10 @@ async function fetchUnreadMessagesForMailbox(emailRow) {
             messageId,
             subject,
             fromEmail: fromAddresses[0] || null,
-            messageType: 'ignored_sender',
+            messageType: MESSAGE_TYPE_IGNORED_SENDER,
             receivedAt,
             isRead: false,
+            source: 'nylas',
           })
         );
       } catch (error) {
@@ -367,6 +364,7 @@ async function fetchUnreadMessagesForMailbox(emailRow) {
           messageType,
           receivedAt,
             isRead: false,
+          source: 'nylas',
         })
       );
     } catch (error) {

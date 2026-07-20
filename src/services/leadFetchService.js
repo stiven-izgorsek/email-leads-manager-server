@@ -51,6 +51,7 @@ export function buildUncontactedLeadsQuery(clientRepo, options = {}) {
   const {
     verifiedOnly = true,
     leadFilterId,
+    leadFilterIds,
     leadFilterMode = 'include',
     location,
     industry,
@@ -81,13 +82,19 @@ export function buildUncontactedLeadsQuery(clientRepo, options = {}) {
     });
   }
 
-  if (leadFilterId) {
+  const filterIds = Array.isArray(leadFilterIds)
+    ? leadFilterIds.map((id) => String(id || '').trim()).filter(Boolean)
+    : leadFilterId
+      ? [String(leadFilterId).trim()].filter(Boolean)
+      : [];
+
+  if (filterIds.length > 0) {
     if (leadFilterMode === 'exclude') {
       qb.andWhere('(client.leadFilterId IS NULL OR client.leadFilterId NOT IN (:...leadFilterIds))', {
-        leadFilterIds: [leadFilterId],
+        leadFilterIds: filterIds,
       });
     } else {
-      qb.andWhere('client.leadFilterId = :leadFilterId', { leadFilterId });
+      qb.andWhere('client.leadFilterId IN (:...leadFilterIds)', { leadFilterIds: filterIds });
     }
   }
 

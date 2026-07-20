@@ -80,6 +80,7 @@ export async function hasStoredInboundReplySince({
      WHERE im."emailAddress" = $1
        AND im."deletedAt" IS NULL
        AND im."messageType" <> 'ignored_sender'
+       AND im."messageType" <> 'hide_sender'
        AND COALESCE(im."receivedAt", im."createdAt") > $2
        AND (
          LOWER(COALESCE(im."fromEmail", '')) LIKE $3

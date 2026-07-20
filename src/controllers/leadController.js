@@ -272,6 +272,10 @@ export async function createLead(req, res) {
       status: req.body.status || 'new',
       contactedBy: req.body.contactedBy || (req.body.assignedTo ? [req.body.assignedTo] : null),
       industries: req.body.industries || null,
+      templateIndustry: (() => {
+        const raw = String(req.body.templateIndustry || req.body.template_industry || '').trim();
+        return raw || null;
+      })(),
       tech: req.body.tech || null,
       employees: req.body.employees || null,
       photoUrl: req.body.photoUrl || null,
@@ -350,6 +354,11 @@ export async function uploadLeads(req, res) {
         console.error('Error parsing LeadFilter:', err);
       }
     }
+
+    const uploadTemplateIndustry = (() => {
+      const raw = String(req.body.templateIndustry || req.body.template_industry || '').trim();
+      return raw || null;
+    })();
 
     // Read and parse file (CSV or XLSX)
     const filePath = req.file.path;
@@ -613,6 +622,11 @@ export async function uploadLeads(req, res) {
               if (!value) return null;
               return Array.isArray(value) ? value : value.split(',').map(i => i.trim()).filter(i => i);
             })(),
+            templateIndustry: (() => {
+              const fromRow = getField(row, 'templateindustry', 'template_industry', 'templateIndustry');
+              const raw = String(fromRow || uploadTemplateIndustry || '').trim();
+              return raw || null;
+            })(),
             tech: (() => {
               const value = getField(row, 'tech', 'technologies', 'technology');
               if (!value) return null;
@@ -646,6 +660,11 @@ export async function uploadLeads(req, res) {
             // Update lastName if it's missing in DB but present in upload
             if (!existing.lastName && clientData.lastName) {
               updateData.lastName = clientData.lastName;
+              needsUpdate = true;
+            }
+
+            if (!existing.templateIndustry && clientData.templateIndustry) {
+              updateData.templateIndustry = clientData.templateIndustry;
               needsUpdate = true;
             }
 
@@ -915,7 +934,7 @@ export async function bulkUpdateLeads(req, res) {
     }
 
     // Only allow updating specific fields
-    const allowedFields = ['status', 'isSent', 'isReplied', 'lastSent', 'contactedBy'];
+    const allowedFields = ['status', 'isSent', 'isReplied', 'lastSent', 'contactedBy', 'templateIndustry'];
     const updateData = {};
     
     for (const field of allowedFields) {
@@ -934,6 +953,13 @@ export async function bulkUpdateLeads(req, res) {
             updateData[field] = updates[field];
           } else {
             updateData[field] = null;
+          }
+        } else if (field === 'templateIndustry') {
+          const raw = updates[field];
+          if (raw === null || raw === '') {
+            updateData[field] = null;
+          } else {
+            updateData[field] = String(raw).trim() || null;
           }
         } else {
           updateData[field] = updates[field];

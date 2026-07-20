@@ -85,6 +85,7 @@ function buildEmailPayloadFromBody(body, emailAddress) {
     accountId: body.accountId || null,
     status: body.status || 'new',
     password: body.password || null,
+    appPassword: body.appPassword || body.app_password || null,
     twoFa: body.twoFa || body['2fa'] || null,
     recoveryEmail: body.recoveryEmail || null,
     grantId: body.grantId || body.grant_id || null,
@@ -327,6 +328,9 @@ export async function updateEmail(req, res) {
     }
     if (req.body.accountId !== undefined) email.accountId = req.body.accountId || null;
     if (req.body.password !== undefined) email.password = req.body.password || null;
+    if (req.body.appPassword !== undefined || req.body.app_password !== undefined) {
+      email.appPassword = req.body.appPassword || req.body.app_password || null;
+    }
     if (req.body.twoFa !== undefined || req.body['2fa'] !== undefined) {
       email.twoFa = req.body.twoFa || req.body['2fa'] || null;
     }

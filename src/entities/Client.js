@@ -1,7 +1,7 @@
 import { EntitySchema } from 'typeorm';
 
 export class Client {
-  constructor(id, firstName, lastName, linkedin, companyName, companyUrl, industries, status, sentBy, lastSent, tech, companyLocation, email, emailStatus, location, contactedBy, jobTitle, photoUrl, employees, isSent, isReplied, isFollowup, note, leadFilterId, millionsStatus, createdAt, updatedAt, deletedAt) {
+  constructor(id, firstName, lastName, linkedin, companyName, companyUrl, industries, templateIndustry, status, sentBy, lastSent, tech, companyLocation, email, emailStatus, location, contactedBy, jobTitle, photoUrl, employees, isSent, isReplied, isFollowup, note, leadFilterId, millionsStatus, createdAt, updatedAt, deletedAt) {
     this.id = id;
     this.firstName = firstName;
     this.lastName = lastName;
@@ -9,6 +9,7 @@ export class Client {
     this.companyName = companyName;
     this.companyUrl = companyUrl;
     this.industries = industries;
+    this.templateIndustry = templateIndustry;
     this.status = status;
     this.sentBy = sentBy;
     this.lastSent = lastSent;
@@ -69,6 +70,12 @@ export const ClientSchema = new EntitySchema({
     },
     industries: {
       type: 'simple-array',
+      nullable: true,
+    },
+    /** Forced cold-message template industry (skips AI website classify when set). */
+    templateIndustry: {
+      type: 'varchar',
+      length: 100,
       nullable: true,
     },
     status: {
