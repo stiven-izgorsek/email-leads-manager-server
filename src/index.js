@@ -20,6 +20,7 @@ import applicationRoutes from './routes/applicationRoutes.js';
 import calendarRoutes from './routes/calendarRoutes.js';
 import marketingRoutes from './routes/marketingRoutes.js';
 import followupRoutes from './routes/followupRoutes.js';
+import apolloAccountRoutes from './routes/apolloAccountRoutes.js';
 import { startNylasUnreadPollingJob } from './services/nylasPollingService.js';
 import { startImapUnreadPollingJob } from './services/imapPollingService.js';
 import { startCalendarSyncJob } from './services/calendarSyncJob.js';
@@ -70,6 +71,7 @@ app.use('/api', applicationRoutes);
 app.use('/api/calendar', calendarRoutes);
 app.use('/api/marketing', marketingRoutes);
 app.use('/api/followup', followupRoutes);
+app.use('/api/apollo-accounts', apolloAccountRoutes);
 
 // Error handling middleware
 app.use((err, req, res, next) => {

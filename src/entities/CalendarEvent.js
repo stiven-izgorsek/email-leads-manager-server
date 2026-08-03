@@ -21,6 +21,7 @@ export class CalendarEvent {
     organizerEmail,
     participantsJson,
     syncedAt,
+    deletedAt,
     createdAt,
     updatedAt
   ) {
@@ -43,6 +44,7 @@ export class CalendarEvent {
     this.organizerEmail = organizerEmail;
     this.participantsJson = participantsJson;
     this.syncedAt = syncedAt;
+    this.deletedAt = deletedAt;
     this.createdAt = createdAt;
     this.updatedAt = updatedAt;
   }
@@ -156,6 +158,11 @@ export const CalendarEventSchema = new EntitySchema({
       name: 'synced_at',
       type: 'timestamp',
       nullable: false,
+    },
+    deletedAt: {
+      name: 'deleted_at',
+      type: 'timestamp',
+      nullable: true,
     },
     createdAt: {
       type: 'timestamp',

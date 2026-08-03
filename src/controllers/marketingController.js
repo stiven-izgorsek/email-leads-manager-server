@@ -8,10 +8,16 @@ import {
   runMarketingForEmail,
   setMarketingEnabled,
   setMarketingAssignDefault,
+  stopMarketingForEmail,
   unassignMarketingLead,
   unassignAllPendingMarketingLeads,
   resetDailySentCount,
 } from '../services/marketingService.js';
+import {
+  listPendingDomainBlockAlerts,
+  dismissDomainBlockAlert,
+  confirmStopForDomainBlockAlert,
+} from '../services/domainBlockAlertService.js';
 
 export async function getMarketingDashboardHandler(req, res) {
   try {
@@ -63,13 +69,23 @@ export async function assignMarketingLeads(req, res) {
 
 export async function assignMarketingLeadsAll(req, res) {
   try {
-    const { countPerAccount, date, leadFilterId, leadFilterIds, leadFilterMode, channel } =
-      req.body || {};
+    const {
+      countPerAccount,
+      date,
+      leadFilterId,
+      leadFilterIds,
+      leadFilterMode,
+      channel,
+      continent,
+      assignFraction,
+    } = req.body || {};
     const result = await assignLeadsToAll(countPerAccount, date, {
       leadFilterId,
       leadFilterIds,
       leadFilterMode,
       channel: channel === 'smtp' ? 'smtp' : 'nylas',
+      continent,
+      assignFraction,
     });
     res.json(result);
   } catch (error) {
@@ -226,5 +242,56 @@ export async function startMarketingForAll(req, res) {
   } catch (error) {
     console.error('startMarketingForAll error:', error);
     res.status(500).json({ error: error.message || 'Internal server error' });
+  }
+}
+
+export async function stopMarketingForEmailHandler(req, res) {
+  try {
+    const { emailId } = req.params;
+    const { date } = req.body || {};
+    const result = await stopMarketingForEmail(emailId, date);
+    res.json(result);
+  } catch (error) {
+    console.error('stopMarketingForEmail error:', error);
+    const msg = error.message || 'Internal server error';
+    const status = /required|not found/i.test(msg) ? 400 : 500;
+    res.status(status).json({ error: msg });
+  }
+}
+
+export async function listDomainBlockAlertsHandler(req, res) {
+  try {
+    const alerts = await listPendingDomainBlockAlerts();
+    res.json({ alerts });
+  } catch (error) {
+    console.error('listDomainBlockAlerts error:', error);
+    res.status(500).json({ error: error.message || 'Internal server error' });
+  }
+}
+
+export async function dismissDomainBlockAlertHandler(req, res) {
+  try {
+    const { id } = req.params;
+    const alert = await dismissDomainBlockAlert(id);
+    res.json({ alert });
+  } catch (error) {
+    console.error('dismissDomainBlockAlert error:', error);
+    const msg = error.message || 'Internal server error';
+    const status = /not found/i.test(msg) ? 404 : 500;
+    res.status(status).json({ error: msg });
+  }
+}
+
+export async function confirmDomainBlockAlertHandler(req, res) {
+  try {
+    const { id } = req.params;
+    const { date } = req.body || {};
+    const result = await confirmStopForDomainBlockAlert(id, date);
+    res.json(result);
+  } catch (error) {
+    console.error('confirmDomainBlockAlert error:', error);
+    const msg = error.message || 'Internal server error';
+    const status = /not found/i.test(msg) ? 404 : 500;
+    res.status(status).json({ error: msg });
   }
 }

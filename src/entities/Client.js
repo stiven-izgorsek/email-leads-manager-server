@@ -1,13 +1,14 @@
 import { EntitySchema } from 'typeorm';
 
 export class Client {
-  constructor(id, firstName, lastName, linkedin, companyName, companyUrl, industries, templateIndustry, status, sentBy, lastSent, tech, companyLocation, email, emailStatus, location, contactedBy, jobTitle, photoUrl, employees, isSent, isReplied, isFollowup, note, leadFilterId, millionsStatus, createdAt, updatedAt, deletedAt) {
+  constructor(id, firstName, lastName, linkedin, companyName, companyUrl, companyLinkedin, industries, templateIndustry, status, sentBy, lastSent, tech, companyLocation, email, emailStatus, location, contactedBy, jobTitle, photoUrl, employees, isSent, isReplied, isFollowup, note, leadFilterId, millionsStatus, apolloEmailStatus, apolloSuggestedEmail, apolloEmailCheckedAt, createdAt, updatedAt, deletedAt) {
     this.id = id;
     this.firstName = firstName;
     this.lastName = lastName;
     this.linkedin = linkedin;
     this.companyName = companyName;
     this.companyUrl = companyUrl;
+    this.companyLinkedin = companyLinkedin;
     this.industries = industries;
     this.templateIndustry = templateIndustry;
     this.status = status;
@@ -28,6 +29,9 @@ export class Client {
     this.note = note;
     this.leadFilterId = leadFilterId;
     this.millionsStatus = millionsStatus;
+    this.apolloEmailStatus = apolloEmailStatus;
+    this.apolloSuggestedEmail = apolloSuggestedEmail;
+    this.apolloEmailCheckedAt = apolloEmailCheckedAt;
     this.createdAt = createdAt;
     this.updatedAt = updatedAt;
     this.deletedAt = deletedAt;
@@ -64,6 +68,13 @@ export const ClientSchema = new EntitySchema({
       nullable: true,
     },
     companyUrl: {
+      type: 'varchar',
+      length: 500,
+      nullable: true,
+    },
+    /** Company LinkedIn page URL — used to keep one lead per company on upload. */
+    companyLinkedin: {
+      name: 'company_linkedin',
       type: 'varchar',
       length: 500,
       nullable: true,
@@ -160,6 +171,28 @@ export const ClientSchema = new EntitySchema({
     millionsStatus: {
       type: 'varchar',
       length: 50,
+      nullable: true,
+    },
+    /**
+     * Result of Apollo LinkedIn email enrichment:
+     * updated | no_email | email_conflict | error
+     */
+    apolloEmailStatus: {
+      name: 'apollo_email_status',
+      type: 'varchar',
+      length: 50,
+      nullable: true,
+    },
+    /** Email Apollo returned when it conflicted with another lead. */
+    apolloSuggestedEmail: {
+      name: 'apollo_suggested_email',
+      type: 'varchar',
+      length: 255,
+      nullable: true,
+    },
+    apolloEmailCheckedAt: {
+      name: 'apollo_email_checked_at',
+      type: 'timestamp',
       nullable: true,
     },
     createdAt: {

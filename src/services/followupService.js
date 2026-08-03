@@ -842,6 +842,7 @@ async function sendOneFollowupLead(email, assignment, leadRow, meta = {}) {
       accountName: accountDisplayName(email),
       accountEmail: email.address,
       messageType: 'followup',
+      isSignatureAdded: email.isSignatureAdded === true,
     });
 
     const threadSubject = String(leadRow.originalSubject || composed.subject || '').trim();

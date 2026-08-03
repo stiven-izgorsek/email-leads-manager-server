@@ -8,6 +8,7 @@ import XLSX from 'xlsx';
 import { sleep } from '../utils/nylasRateLimit.js';
 import { probeNylasGrantMessagesList } from '../services/nylasGrantProbeService.js';
 import { lookupRecipientsByEmails, sendEmailFromMailbox } from '../services/emailComposeService.js';
+import { parseIsSignatureAdded } from '../utils/stripSignatureClosing.js';
 
 function normalizeEmailAddress(value) {
   return String(value || '').trim().toLowerCase();
@@ -94,6 +95,10 @@ function buildEmailPayloadFromBody(body, emailAddress) {
     chromeUserDataDir: body.chromeUserDataDir || body.chrome_user_data_dir || null,
     chromeProfileDirectory: body.chromeProfileDirectory || body.chrome_profile_directory || null,
     gmailUIndex: Number.isNaN(parsedGmailUIndex) ? null : parsedGmailUIndex,
+    isSignatureAdded: parseIsSignatureAdded(
+      body.isSignatureAdded ?? body.is_signature_added,
+      false
+    ),
   };
 }
 
@@ -215,10 +220,64 @@ export async function getEmails(req, res) {
       countQuery.getCount(),
     ]);
 
+    const mailboxes = [
+      ...new Set(data.map((row) => normalizeEmailAddress(row.address)).filter(Boolean)),
+    ];
+
+    const crmCounts = {};
+    const sentCounts = {};
+    if (mailboxes.length) {
+      const crmRepo = AppDataSource.getRepository(CrmClient);
+      const clientRepository = AppDataSource.getRepository(Client);
+
+      const [crmRows, sentRows] = await Promise.all([
+        crmRepo
+          .createQueryBuilder('c')
+          .select('LOWER(TRIM(c.sentByAccount))', 'sentByAccount')
+          .addSelect('COUNT(*)', 'count')
+          .where('c.deletedAt IS NULL')
+          .andWhere('c.sentByAccount IS NOT NULL')
+          .andWhere("TRIM(c.sentByAccount) <> ''")
+          .andWhere('LOWER(TRIM(c.sentByAccount)) IN (:...mailboxes)', { mailboxes })
+          .groupBy('LOWER(TRIM(c.sentByAccount))')
+          .getRawMany(),
+        Promise.all(
+          mailboxes.map(async (mailbox) => {
+            const count = await clientRepository
+              .createQueryBuilder('client')
+              .where('client.deletedAt IS NULL')
+              .andWhere('client.lastSent IS NOT NULL')
+              .andWhere('LOWER(COALESCE(client.sentBy, \'\')) LIKE :sentBy', {
+                sentBy: `%${mailbox}%`,
+              })
+              .getCount();
+            return { mailbox, count };
+          })
+        ),
+      ]);
+
+      for (const row of crmRows) {
+        const key = String(row.sentByAccount || '').trim().toLowerCase();
+        if (key) crmCounts[key] = Number(row.count || 0);
+      }
+      for (const row of sentRows) {
+        sentCounts[row.mailbox] = Number(row.count || 0);
+      }
+    }
+
+    const enriched = data.map((row) => {
+      const key = normalizeEmailAddress(row.address);
+      return {
+        ...row,
+        crmClientsCount: crmCounts[key] || 0,
+        sentMessagesCount: sentCounts[key] || 0,
+      };
+    });
+
     const totalPages = Math.ceil(total / limit);
 
     res.json({
-      data,
+      data: enriched,
       page,
       limit,
       total,
@@ -357,6 +416,12 @@ export async function updateEmail(req, res) {
           ? null
           : Number.parseInt(String(nextUIndex), 10);
       email.gmailUIndex = Number.isNaN(parsedUIndex) ? null : parsedUIndex;
+    }
+    if (req.body.isSignatureAdded !== undefined || req.body.is_signature_added !== undefined) {
+      email.isSignatureAdded = parseIsSignatureAdded(
+        req.body.isSignatureAdded ?? req.body.is_signature_added,
+        false
+      );
     }
 
     const updatedEmail = await emailRepository.save(email);

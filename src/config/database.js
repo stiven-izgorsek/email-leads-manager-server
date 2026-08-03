@@ -28,6 +28,8 @@ import {
   CalendarEventSchema,
   CalendarEventLocalSchema,
   CalendarEventLocalExceptionSchema,
+  ApolloAccountSchema,
+  MarketingDomainBlockAlertSchema,
 } from '../entities/index.js';
 
 dotenv.config();
@@ -68,6 +70,8 @@ export const AppDataSource = new DataSource({
     CalendarEventSchema,
     CalendarEventLocalSchema,
     CalendarEventLocalExceptionSchema,
+    ApolloAccountSchema,
+    MarketingDomainBlockAlertSchema,
   ],
   migrations: ['src/migrations/**/*.js'],
   subscribers: ['src/subscribers/**/*.js'],

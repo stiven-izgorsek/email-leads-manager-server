@@ -49,13 +49,13 @@ export const CalendarEventLocalSchema = new EntitySchema({
     emailId: {
       name: 'email_id',
       type: 'uuid',
-      nullable: false,
+      nullable: true,
     },
     mailboxEmail: {
       name: 'mailbox_email',
       type: 'varchar',
       length: 255,
-      nullable: false,
+      nullable: true,
     },
     title: {
       type: 'varchar',

@@ -22,6 +22,12 @@ import {
   marketingCanSendAnother,
   resolveDailyLimitFromEmail,
 } from './dailyLimitService.js';
+import {
+  getContinentLocationKeywords,
+  normalizeAssignFraction,
+  normalizeMarketingContinent,
+  resolveFractionalAssignCount,
+} from '../utils/continentLocations.js';
 
 const BLOCKED_EMAIL_STATUSES = new Set(['bad', 'blocked']);
 /** Random wait between sends on the same mailbox: new draw each time (3–5 min by default). */
@@ -118,6 +124,9 @@ async function releaseStaleRunningAssignments(assignmentDate) {
 
 /** Only one start-all orchestrator at a time. */
 let marketingOrchestratorActive = false;
+/** emailIds requested to pause mid-run (single-mailbox or start-all). */
+const marketingStopEmailIds = new Set();
+let marketingStopAllRequested = false;
 
 export function isMarketingOrchestratorActive() {
   return marketingOrchestratorActive;
@@ -127,6 +136,33 @@ function chunkArray(arr, size) {
   const out = [];
   for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
   return out;
+}
+
+export function requestMarketingStopForEmail(emailId) {
+  if (emailId) marketingStopEmailIds.add(String(emailId));
+}
+
+export function clearMarketingStopForEmail(emailId) {
+  if (emailId) marketingStopEmailIds.delete(String(emailId));
+}
+
+function isMarketingStopRequestedForEmail(emailId) {
+  if (marketingStopAllRequested) return true;
+  if (!emailId) return false;
+  return marketingStopEmailIds.has(String(emailId));
+}
+
+/** Sleep in small chunks so Pause can interrupt spacing waits. */
+async function sleepUnlessMarketingStopped(ms, emailId = null) {
+  const chunkMs = 500;
+  let remaining = Math.max(0, ms);
+  while (remaining > 0) {
+    if (isMarketingStopRequestedForEmail(emailId)) return false;
+    const step = Math.min(chunkMs, remaining);
+    await sleep(step);
+    remaining -= step;
+  }
+  return !isMarketingStopRequestedForEmail(emailId);
 }
 
 async function setAssignmentsRunning(assignmentIds, running) {
@@ -139,13 +175,13 @@ async function setAssignmentsRunning(assignmentIds, running) {
   }
 }
 
-async function waitForMailboxSendSpacing(assignmentId, mailbox) {
+async function waitForMailboxSendSpacing(assignmentId, mailbox, emailId = null) {
   const leadRepo = AppDataSource.getRepository(MarketingAssignmentLead);
   const lastSent = await leadRepo.findOne({
     where: { assignmentId, sendStatus: 'sent' },
     order: { sentAt: 'DESC' },
   });
-  if (!lastSent?.sentAt) return;
+  if (!lastSent?.sentAt) return true;
 
   const elapsed = Date.now() - new Date(lastSent.sentAt).getTime();
   const requiredMs = getRandomMarketingSendDelayMs();
@@ -155,8 +191,9 @@ async function waitForMailboxSendSpacing(assignmentId, mailbox) {
       elapsedSec: Math.round(elapsed / 1000),
       requiredSec: Math.round(requiredMs / 1000),
     });
-    await sleep(waitMs);
+    return sleepUnlessMarketingStopped(waitMs, emailId);
   }
+  return !isMarketingStopRequestedForEmail(emailId);
 }
 
 async function getNextPendingLead(assignmentId) {
@@ -197,6 +234,7 @@ async function sendOneMarketingLead(email, assignment, leadRow, meta = {}) {
       lead: client,
       accountName,
       accountEmail: email.address,
+      isSignatureAdded: email.isSignatureAdded === true,
     });
     marketingLog(mb, 'compose done', {
       ms: Date.now() - composeStarted,
@@ -299,7 +337,11 @@ async function loadMarketingWorkloads(date, eligibleRows) {
 }
 
 async function processMailboxOneRound(workload, roundIndex, totalRounds) {
-  const { email, assignment, address } = workload;
+  const { email, assignment, address, emailId } = workload;
+  if (isMarketingStopRequestedForEmail(emailId)) {
+    marketingLog(address, 'paused — stop requested');
+    return { sent: 0, failed: 0, skipped: true, stopped: true };
+  }
   const pending = await countPendingLeads(assignment.id);
   if (pending === 0) return { sent: 0, failed: 0, skipped: true };
 
@@ -311,7 +353,11 @@ async function processMailboxOneRound(workload, roundIndex, totalRounds) {
     return { sent: 0, failed: 0, skipped: true, limitReached: true };
   }
 
-  await waitForMailboxSendSpacing(assignment.id, address);
+  const ok = await waitForMailboxSendSpacing(assignment.id, address, emailId);
+  if (!ok) {
+    marketingLog(address, 'paused during spacing wait');
+    return { sent: 0, failed: 0, skipped: true, stopped: true };
+  }
 
   const leadRow = await getNextPendingLead(assignment.id);
   if (!leadRow) return { sent: 0, failed: 0, skipped: true };
@@ -370,13 +416,19 @@ async function runMarketingRoundRobin(eligible, date, batchSize) {
     });
 
     for (let round = 0; round < maxRounds; round += 1) {
+      if (marketingStopAllRequested) {
+        marketingLog(null, 'round-robin stopped by user');
+        break;
+      }
       const roundNum = round + 1;
       const batches = chunkArray(workloads, batchSize);
 
       marketingLog(null, `message round ${roundNum}/${maxRounds}`, { batches: batches.length });
 
       for (let b = 0; b < batches.length; b += 1) {
-        const batch = batches[b];
+        if (marketingStopAllRequested) break;
+        const batch = batches[b].filter((w) => !isMarketingStopRequestedForEmail(w.emailId));
+        if (!batch.length) continue;
         const batchFrom = b * batchSize + 1;
         const batchTo = batchFrom + batch.length - 1;
         marketingLog(null, `round ${roundNum} batch accounts ${batchFrom}-${batchTo}`, {
@@ -405,6 +457,10 @@ async function runMarketingRoundRobin(eligible, date, batchSize) {
     return { totalSent, totalFailed };
   } finally {
     marketingOrchestratorActive = false;
+    marketingStopAllRequested = false;
+    for (const w of eligible || []) {
+      clearMarketingStopForEmail(w.emailId);
+    }
   }
 }
 
@@ -443,13 +499,14 @@ export function isMarketingAiComposeEnabled() {
   return v !== 'false' && v !== '0' && v !== 'no' && v !== 'off';
 }
 
-async function composeForMarketingSend({ lead, accountName, accountEmail }) {
+async function composeForMarketingSend({ lead, accountName, accountEmail, isSignatureAdded }) {
   if (isMarketingAiComposeEnabled()) {
     return composeLeadOutboundEmailWithAi({
       lead,
       accountName,
       accountEmail,
       messageType: 'outreach',
+      isSignatureAdded,
     });
   }
   return composeLeadOutboundEmail({
@@ -457,6 +514,7 @@ async function composeForMarketingSend({ lead, accountName, accountEmail }) {
     accountName,
     accountEmail,
     messageType: 'outreach',
+    isSignatureAdded,
   });
 }
 
@@ -679,6 +737,8 @@ export async function setMarketingAssignDefault(emailId, assignDefault) {
       throw new Error('assignDefault must be between 1 and 500');
     }
     email.marketingAssignDefault = n;
+    // Keep outreach daily limit in sync with the saved assign count
+    email.marketingDailyLimit = n;
   }
 
   await emailRepo.save(email);
@@ -686,6 +746,7 @@ export async function setMarketingAssignDefault(emailId, assignDefault) {
     emailId: email.id,
     address: email.address,
     marketingAssignDefault: email.marketingAssignDefault,
+    marketingDailyLimit: email.marketingDailyLimit,
   };
 }
 
@@ -855,6 +916,7 @@ export async function assignLeadsToEmail(emailId, count, assignmentDate, filters
     leadFilterIds: filters.leadFilterIds,
     leadFilterMode: filters.leadFilterMode,
     location: filters.location,
+    locations: filters.locations,
     industry: filters.industry,
   });
   if (!leads.length) {
@@ -1064,19 +1126,39 @@ export async function assignLeadsToAll(countPerAccount, assignmentDate, filters 
   const date = getAssignmentDateString(assignmentDate);
   const channel = filters.channel === 'smtp' ? 'smtp' : 'nylas';
   const defaultCount = Math.max(1, Math.min(500, parseInt(String(countPerAccount), 10) || 0));
+  const continent = normalizeMarketingContinent(filters.continent);
+  const assignFraction = normalizeAssignFraction(filters.assignFraction);
+  const continentLocations = getContinentLocationKeywords(continent);
+  const assignFilters = {
+    ...filters,
+    channel,
+    ...(continentLocations.length ? { locations: continentLocations } : {}),
+  };
+
   const dashboard = await getMarketingDashboard(date, { channel });
   const eligible = dashboard.rows.filter((r) => r.marketingEnabled && r.canAssign);
   if (!eligible.length) {
-    return { totalAssigned: 0, accounts: [] };
+    return {
+      totalAssigned: 0,
+      accounts: [],
+      continent,
+      assignFraction: continent ? assignFraction || 'all' : null,
+    };
   }
 
   const accounts = [];
   let totalAssigned = 0;
   for (const row of eligible) {
-    const count = resolveMarketingAssignCount(row, defaultCount);
+    const remaining = resolveMarketingAssignCount(row, defaultCount);
     const dailyLimit = resolveMarketingDailyLimit(row, defaultCount);
     const alreadyAllocated =
       (row.pendingCount || 0) + effectiveSentForDailyLimit(row.sentCount, row.dailyLimitSentBaseline);
+    const count = resolveFractionalAssignCount(
+      remaining,
+      dailyLimit,
+      continent ? assignFraction || 'all' : null,
+      Boolean(continent)
+    );
     if (count === 0) {
       accounts.push({
         emailId: row.emailId,
@@ -1086,16 +1168,13 @@ export async function assignLeadsToAll(countPerAccount, assignmentDate, filters 
         dailyLimit,
         alreadyAllocated,
         skipped: true,
-        message: 'Daily limit already reached',
+        message: remaining === 0 ? 'Daily limit already reached' : 'Assign count resolved to 0',
         usedDailyLimit: row.marketingDailyLimit != null && row.marketingDailyLimit > 0,
       });
       continue;
     }
     try {
-      const result = await assignLeadsToEmail(row.emailId, count, date, {
-        ...filters,
-        channel,
-      });
+      const result = await assignLeadsToEmail(row.emailId, count, date, assignFilters);
       totalAssigned += result.assigned || 0;
       accounts.push({
         emailId: row.emailId,
@@ -1120,7 +1199,13 @@ export async function assignLeadsToAll(countPerAccount, assignmentDate, filters 
     }
   }
 
-  return { totalAssigned, accounts, channel };
+  return {
+    totalAssigned,
+    accounts,
+    channel,
+    continent,
+    assignFraction: continent ? assignFraction || 'all' : null,
+  };
 }
 
 async function markClientSent(client, mailboxAddress) {
@@ -1209,14 +1294,26 @@ export async function runMarketingForEmail(emailId, assignmentDate, options = {}
 
   let sent = 0;
   let failed = 0;
+  let stopped = false;
+  clearMarketingStopForEmail(emailId);
 
   try {
     for (let i = 0; i < pendingRows.length; i += 1) {
+      if (isMarketingStopRequestedForEmail(emailId)) {
+        stopped = true;
+        marketingLog(mb, 'paused by user — stopping send loop');
+        break;
+      }
       if (!(await marketingCanSendAnother(email, date))) {
         marketingLog(mb, 'daily outreach limit reached — stopping send loop');
         break;
       }
-      await waitForMailboxSendSpacing(assignment.id, mb);
+      const spacingOk = await waitForMailboxSendSpacing(assignment.id, mb, emailId);
+      if (!spacingOk) {
+        stopped = true;
+        marketingLog(mb, 'paused during spacing wait');
+        break;
+      }
 
       const row = await getNextPendingLead(assignment.id);
       if (!row) break;
@@ -1231,19 +1328,56 @@ export async function runMarketingForEmail(emailId, assignmentDate, options = {}
       failed += result.failed;
     }
   } finally {
+    clearMarketingStopForEmail(emailId);
     const fresh = await assignmentRepo.findOne({ where: { id: assignment.id } });
     if (fresh) {
       fresh.running = false;
-      fresh.status = failed > 0 && sent === 0 ? 'failed' : sent > 0 ? 'completed' : 'assigned';
-      if (failed > 0 && sent === 0) {
-        fresh.lastError = 'All sends failed for this batch';
+      if (stopped) {
+        fresh.status = 'assigned';
+        fresh.lastError = 'Stopped by user';
+      } else {
+        fresh.status = failed > 0 && sent === 0 ? 'failed' : sent > 0 ? 'completed' : 'assigned';
+        if (failed > 0 && sent === 0) {
+          fresh.lastError = 'All sends failed for this batch';
+        }
       }
       await assignmentRepo.save(fresh);
     }
-    marketingLog(mb, 'run finished', { sent, failed, total: pendingRows.length, channel });
+    marketingLog(mb, 'run finished', { sent, failed, stopped, total: pendingRows.length, channel });
   }
 
-  return { sent, failed, total: pendingRows.length };
+  return { sent, failed, stopped, total: pendingRows.length };
+}
+
+/**
+ * Pause marketing for one mailbox (mid single-run or start-all).
+ * Clears running flag and requests cooperative stop of the send loop.
+ */
+export async function stopMarketingForEmail(emailId, assignmentDate) {
+  if (!emailId) throw new Error('emailId is required');
+  const date = getAssignmentDateString(assignmentDate);
+  requestMarketingStopForEmail(emailId);
+
+  const assignmentRepo = AppDataSource.getRepository(MarketingAssignment);
+  const assignment = await assignmentRepo.findOne({
+    where: { emailId, assignmentDate: date },
+  });
+
+  const wasRunning = Boolean(assignment?.running);
+  if (assignment?.running) {
+    assignment.running = false;
+    if (assignment.status === 'running') assignment.status = 'assigned';
+    assignment.lastError = 'Stopped by user';
+    await assignmentRepo.save(assignment);
+  }
+
+  marketingLog(null, 'stop requested for mailbox', { emailId, assignmentDate: date });
+  return {
+    emailId,
+    assignmentDate: date,
+    stopped: true,
+    wasRunning,
+  };
 }
 
 /**

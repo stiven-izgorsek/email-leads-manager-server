@@ -136,6 +136,8 @@ const DELIVERY_FAILURE_PATTERNS = [
   /\breturned\s+mail\b/i,
   /\bundeliverable\b/i,
   /\bbounce\b/i,
+  /policy that prohibited/i,
+  /support\.google\.com\/a\/answer\/172179/i,
 ];
 
 const AUTO_ACKNOWLEDGEMENT_PATTERNS = [

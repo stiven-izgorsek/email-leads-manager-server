@@ -10,6 +10,7 @@ import {
   ensureDefaultMessageTypeRules,
   loadMessageTypeRules,
 } from './messageTypeService.js';
+import { maybeCreateDomainBlockAlert } from './domainBlockAlertService.js';
 import {
   isIgnoredMarketingSender,
   isHiddenSender,
@@ -334,6 +335,18 @@ async function fetchUnreadMessagesForMailbox(emailRow) {
           if (error?.code !== '23505') {
             console.error('[IMAP] Failed storing incoming message:', error.message || error);
           }
+        }
+
+        try {
+          await maybeCreateDomainBlockAlert({
+            mailboxAddress: user,
+            externalMessageId: messageId,
+            subject,
+            body: bodyForClassify,
+            fromEmail: fromAddresses.join(', '),
+          });
+        } catch (error) {
+          console.error('[IMAP] Domain-block alert failed:', error.message || error);
         }
       }
     } finally {

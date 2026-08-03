@@ -1,7 +1,7 @@
 import { EntitySchema } from 'typeorm';
 
 export class Email {
-  constructor(id, address, firstName, lastName, marketingDailyLimit, marketingAssignDefault, marketingEnabled, followupEnabled, accountId, status, password, appPassword, twoFa, recoveryEmail, grantId, nylasKey, chromePath, chromeUserDataDir, chromeProfileDirectory, gmailUIndex, createdAt, updatedAt, deletedAt) {
+  constructor(id, address, firstName, lastName, marketingDailyLimit, marketingAssignDefault, marketingEnabled, followupEnabled, accountId, status, password, appPassword, twoFa, recoveryEmail, grantId, nylasKey, chromePath, chromeUserDataDir, chromeProfileDirectory, gmailUIndex, isSignatureAdded, createdAt, updatedAt, deletedAt) {
     this.id = id;
     this.address = address;
     this.firstName = firstName;
@@ -22,6 +22,7 @@ export class Email {
     this.chromeUserDataDir = chromeUserDataDir;
     this.chromeProfileDirectory = chromeProfileDirectory;
     this.gmailUIndex = gmailUIndex;
+    this.isSignatureAdded = isSignatureAdded;
     this.createdAt = createdAt;
     this.updatedAt = updatedAt;
     this.deletedAt = deletedAt;
@@ -139,6 +140,12 @@ export const EmailSchema = new EntitySchema({
       name: 'gmail_u_index',
       type: 'int',
       nullable: true,
+    },
+    isSignatureAdded: {
+      name: 'is_signature_added',
+      type: 'boolean',
+      nullable: false,
+      default: false,
     },
     createdAt: {
       type: 'timestamp',

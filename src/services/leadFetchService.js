@@ -104,6 +104,20 @@ export function buildUncontactedLeadsQuery(clientRepo, options = {}) {
     });
   }
 
+  const locations = Array.isArray(options.locations)
+    ? options.locations.map((s) => String(s || '').trim()).filter(Boolean)
+    : [];
+  if (locations.length > 0) {
+    const parts = [];
+    const params = {};
+    locations.forEach((loc, i) => {
+      const key = `locKw${i}`;
+      parts.push(`(client.location ILIKE :${key} OR client.companyLocation ILIKE :${key})`);
+      params[key] = `%${loc}%`;
+    });
+    qb.andWhere(`(${parts.join(' OR ')})`, params);
+  }
+
   if (industry) {
     qb.andWhere('client.industries LIKE :industry', { industry: `%${industry}%` });
   }

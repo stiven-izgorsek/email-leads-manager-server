@@ -268,6 +268,8 @@ export async function syncCalendarEventsFromNylas({ startSec, endSec, emailId, e
         where: { emailId: mailbox.id, nylasEventId: row.nylasEventId },
       });
       if (existing) {
+        // Platform soft-deleted: keep hidden; do not resurrect on sync
+        if (existing.deletedAt) continue;
         await eventRepo.update({ id: existing.id }, row);
       } else {
         await eventRepo.save(eventRepo.create(row));
@@ -279,7 +281,8 @@ export async function syncCalendarEventsFromNylas({ startSec, endSec, emailId, e
       .createQueryBuilder('ce')
       .where('ce.email_id = :emailId', { emailId: mailbox.id })
       .andWhere('ce.start_at < :rangeEnd', { rangeEnd })
-      .andWhere('ce.end_at > :rangeStart', { rangeStart });
+      .andWhere('ce.end_at > :rangeStart', { rangeStart })
+      .andWhere('ce.deleted_at IS NULL');
 
     if (keptNylasIds.size > 0) {
       staleQb.andWhere('ce.nylas_event_id NOT IN (:...ids)', { ids: Array.from(keptNylasIds) });
@@ -315,7 +318,8 @@ export async function listCalendarEventsFromDb({ startSec, endSec, emailId, emai
     .createQueryBuilder('ce')
     .where('ce.start_at < :rangeEnd', { rangeEnd })
     .andWhere('ce.end_at > :rangeStart', { rangeStart })
-    .andWhere('ce.all_day = false');
+    .andWhere('ce.all_day = false')
+    .andWhere('ce.deleted_at IS NULL');
 
   if (ids.length > 0) {
     qb.andWhere('ce.email_id IN (:...ids)', { ids });
@@ -356,6 +360,34 @@ export async function listCalendarEventsFromDb({ startSec, endSec, emailId, emai
     lastSyncedAt,
     fromCache: true,
   };
+}
+
+/**
+ * Soft-delete a synced Nylas event in this platform only (does not cancel in Google/Nylas).
+ * API id format: `${emailId}:${nylasEventId}`
+ */
+export async function softDeleteNylasCalendarEvent(apiId) {
+  const raw = String(apiId || '').trim();
+  const sep = raw.indexOf(':');
+  if (sep <= 0 || sep >= raw.length - 1) {
+    throw new Error('Invalid event id');
+  }
+  const emailId = raw.slice(0, sep);
+  const nylasEventId = raw.slice(sep + 1);
+  if (!emailId || !nylasEventId) {
+    throw new Error('Invalid event id');
+  }
+
+  const eventRepo = AppDataSource.getRepository(CalendarEvent);
+  const existing = await eventRepo.findOne({
+    where: { emailId, nylasEventId },
+  });
+  if (!existing || existing.deletedAt) {
+    throw new Error('Event not found');
+  }
+
+  await eventRepo.update({ id: existing.id }, { deletedAt: new Date() });
+  return { deleted: true, source: 'nylas' };
 }
 
 /** Hourly job: sync default window for all mailboxes. */

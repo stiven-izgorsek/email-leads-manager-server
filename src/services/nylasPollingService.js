@@ -15,6 +15,7 @@ import {
   MESSAGE_TYPE_HIDE_SENDER,
 } from './incomingSenderFilterService.js';
 import { NYLAS_LIST_PAGE_LIMIT, parseNylas429RetryDelayMs, sleep } from '../utils/nylasRateLimit.js';
+import { maybeCreateDomainBlockAlert } from './domainBlockAlertService.js';
 
 const POLL_MS = Math.min(
   30 * 60 * 1000,
@@ -371,6 +372,18 @@ async function fetchUnreadMessagesForMailbox(emailRow) {
       if (error?.code !== '23505') {
         console.error('[NYLAS] Failed storing incoming message:', error.message || error);
       }
+    }
+
+    try {
+      await maybeCreateDomainBlockAlert({
+        mailboxAddress: emailRow.address,
+        externalMessageId: messageId,
+        subject,
+        body,
+        fromEmail: fromAddresses.join(', '),
+      });
+    } catch (error) {
+      console.error('[NYLAS] Domain-block alert failed:', error.message || error);
     }
   }
 }

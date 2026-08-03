@@ -1,6 +1,9 @@
 import { AppDataSource } from '../config/database.js';
 import { Client } from '../entities/Client.js';
 import { LeadFilter } from '../entities/LeadFilter.js';
+import { CrmClient } from '../entities/CrmClient.js';
+import { MarketingAssignmentLead } from '../entities/MarketingAssignmentLead.js';
+import { FollowupAssignmentLead } from '../entities/FollowupAssignmentLead.js';
 import { In } from 'typeorm';
 import fs from 'fs/promises';
 import XLSX from 'xlsx';
@@ -19,6 +22,19 @@ import {
   sanitizeAiMarkerInName,
   serializeClientLeadForApi,
 } from '../utils/leadNameSanitize.js';
+import {
+  normalizeLinkedInUrl,
+  normalizeCompanyLinkedInUrl,
+  extractLinkedInSlug,
+  isApolloTool,
+} from '../utils/linkedinUrl.js';
+import {
+  getJobTitlePriority,
+  pickBestLeadPerCompany,
+} from '../utils/jobTitlePriority.js';
+import { ApolloAccount } from '../entities/ApolloAccount.js';
+import { bulkEnrichPeopleByLinkedIn } from '../services/apolloEnrichmentService.js';
+import { serializeCrmClient } from './crmClientController.js';
 
 function parseLocationFilter(query) {
   const raw = query.location;
@@ -326,12 +342,15 @@ export async function uploadLeads(req, res) {
     // Parse LeadFilter from request if provided
     let leadFilterId = null;
     let leadFilterMillionsStatus = null;
+    let uploadTool = null;
     if (req.body.leadFilter) {
       try {
         const leadFilterData = typeof req.body.leadFilter === 'string' 
           ? JSON.parse(req.body.leadFilter) 
           : req.body.leadFilter;
         
+        uploadTool = leadFilterData.tool || null;
+
         if (leadFilterData.industries?.length || leadFilterData.locations?.length || leadFilterData.tool || leadFilterData.rating) {
           const leadFilter = leadFilterRepository.create({
             industries: leadFilterData.industries || null,
@@ -354,6 +373,8 @@ export async function uploadLeads(req, res) {
         console.error('Error parsing LeadFilter:', err);
       }
     }
+
+    const allowMissingEmail = isApolloTool(uploadTool);
 
     const uploadTemplateIndustry = (() => {
       const raw = String(req.body.templateIndustry || req.body.template_industry || '').trim();
@@ -474,216 +495,354 @@ export async function uploadLeads(req, res) {
       return { firstName, lastName };
     }
 
-    // Process data rows
+    async function findExistingByLinkedin(linkedinUrl) {
+      const normalized = normalizeLinkedInUrl(linkedinUrl);
+      const slug = extractLinkedInSlug(linkedinUrl);
+      if (!normalized && !slug) return null;
+
+      if (slug) {
+        const bySlug = await clientRepository
+          .createQueryBuilder('client')
+          .where('client.deletedAt IS NULL')
+          .andWhere('client.linkedin IS NOT NULL')
+          .andWhere("LOWER(client.linkedin) LIKE :pat", { pat: `%/in/${slug}%` })
+          .getOne();
+        if (bySlug) return bySlug;
+      }
+
+      if (normalized) {
+        return clientRepository
+          .createQueryBuilder('client')
+          .where('client.deletedAt IS NULL')
+          .andWhere('LOWER(TRIM(client.linkedin)) = :linkedin', { linkedin: normalized })
+          .getOne();
+      }
+      return null;
+    }
+
+    // Pass 1: parse rows into candidates
+    const candidates = [];
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i];
 
-      // Email: primary column, then Email_2, Email_3, … (ContactOut export)
-      const email = getFirstEmailFromCsvRow(row);
-      if (email) {
-        try {
-          // Handle LinkedIn profile URL - check multiple variations
-          let linkedinUrl = getField(
-            row,
-            'linkedin',
-            'linkedinprofile',
-            'linkedin_profile',
-            'personlinkedinurl',
-            'person_linkedin_url',
-            'linkedinurl',
-            'linkedin_url',
-            'linkedinprofileurl',
-            'linkedin_profile_url'
-          );
-          if (linkedinUrl) {
-            linkedinUrl = linkedinUrl.trim();
-            if (linkedinUrl && !linkedinUrl.startsWith('http')) {
-              linkedinUrl = `https://${linkedinUrl}`;
-            }
+      try {
+        // Email: primary column, then Email_2, Email_3, … (ContactOut export)
+        const rawEmail = getFirstEmailFromCsvRow(row);
+        const email = rawEmail ? String(rawEmail).toLowerCase().trim() : '';
+
+        // Handle LinkedIn profile URL - check multiple variations
+        let linkedinUrl = getField(
+          row,
+          'linkedin',
+          'linkedinprofile',
+          'linkedin_profile',
+          'personlinkedinurl',
+          'person_linkedin_url',
+          'linkedinurl',
+          'linkedin_url',
+          'linkedinprofileurl',
+          'linkedin_profile_url'
+        );
+        if (linkedinUrl) {
+          linkedinUrl = normalizeLinkedInUrl(linkedinUrl);
+        }
+
+        if (!email) {
+          if (!allowMissingEmail) {
+            errors.push({ row: i + 2, error: 'Email is required' });
+            continue;
           }
-
-          // Handle company URL/domain - check multiple variations
-          let companyUrl = getField(
-            row,
-            'website',
-            'companyurl',
-            'company_url',
-            'companydomain',
-            'company_domain',
-            'companywebsite',
-            'company_website',
-            'domain'
-          );
-          if (companyUrl) {
-            companyUrl = companyUrl.trim();
-            if (companyUrl && !companyUrl.startsWith('http') && companyUrl.includes('.')) {
-              companyUrl = `https://${companyUrl}`;
-            }
+          if (!linkedinUrl) {
+            errors.push({
+              row: i + 2,
+              error: 'LinkedIn URL is required when uploading Apollo leads without email',
+            });
+            continue;
           }
+        }
 
-          // Handle Name field - if only Name exists, split it into firstName and lastName
-          const nameField = getField(row, 'name', 'fullname', 'full_name');
-          let firstName = getField(row, 'firstname', 'first_name', 'firstname', 'fname', 'f_name', 'givenname', 'given_name');
-          let lastName = getField(row, 'lastname', 'last_name', 'lastname', 'lname', 'l_name', 'surname', 'familyname', 'family_name');
-
-          // If Name field exists and firstName/lastName are not present, split the Name field
-          if (nameField && !firstName && !lastName) {
-            const split = splitName(nameField);
-            firstName = split.firstName;
-            lastName = split.lastName;
+        // Handle company URL/domain - check multiple variations
+        let companyUrl = getField(
+          row,
+          'website',
+          'companyurl',
+          'company_url',
+          'companydomain',
+          'company_domain',
+          'companywebsite',
+          'company_website',
+          'domain'
+        );
+        if (companyUrl) {
+          companyUrl = companyUrl.trim();
+          if (companyUrl && !companyUrl.startsWith('http') && companyUrl.includes('.')) {
+            companyUrl = `https://${companyUrl}`;
           }
+        }
 
-          // Handle company name - check multiple variations
-          const companyName = getField(
+        const companyLinkedin = normalizeCompanyLinkedInUrl(
+          getField(
             row,
-            'company',
-            'companyname',
-            'company_name',
-            'companynameforemails',
-            'company_name_for_emails',
-            'organization',
-            'org',
-            'companyname',
-            'company'
-          );
+            'companylinkedinurl',
+            'company_linkedin_url',
+            'companylinkedin',
+            'company_linkedin',
+            'organizationlinkedinurl',
+            'organization_linkedin_url',
+            'companylinkedinprofile'
+          )
+        );
 
-          // Handle job title - check multiple variations
-          const jobTitle = getField(row, 'title', 'jobtitle', 'job_title', 'position', 'role', 'job', 'jobtitle');
+        // Handle Name field - if only Name exists, split it into firstName and lastName
+        const nameField = getField(row, 'name', 'fullname', 'full_name');
+        let firstName = getField(row, 'firstname', 'first_name', 'firstname', 'fname', 'f_name', 'givenname', 'given_name');
+        let lastName = getField(row, 'lastname', 'last_name', 'lastname', 'lname', 'l_name', 'surname', 'familyname', 'family_name');
 
-          // Handle location - check multiple variations
-          let location = null;
-          const city = getField(row, 'city', 'locationcity', 'location_city');
-          const state = getField(row, 'state', 'locationstate', 'location_state', 'province', 'region');
-          const country = getField(row, 'country', 'locationcountry', 'location_country');
-          
-          if (city && state) {
-            location = `${city}, ${state}`;
-            if (country) location += `, ${country}`;
-          } else {
-            location = getField(row, 'location', 'address', 'fulladdress', 'full_address') || city || state || country;
+        // If Name field exists and firstName/lastName are not present, split the Name field
+        if (nameField && !firstName && !lastName) {
+          const split = splitName(nameField);
+          firstName = split.firstName;
+          lastName = split.lastName;
+        }
+
+        // Handle company name - check multiple variations
+        const companyName = getField(
+          row,
+          'company',
+          'companyname',
+          'company_name',
+          'companynameforemails',
+          'company_name_for_emails',
+          'organization',
+          'org',
+          'companyname',
+          'company'
+        );
+
+        // Handle job title - check multiple variations
+        const jobTitle = getField(row, 'title', 'jobtitle', 'job_title', 'position', 'role', 'job', 'jobtitle');
+
+        // Handle location - check multiple variations
+        let location = null;
+        const city = getField(row, 'city', 'locationcity', 'location_city');
+        const state = getField(row, 'state', 'locationstate', 'location_state', 'province', 'region');
+        const country = getField(row, 'country', 'locationcountry', 'location_country');
+        
+        if (city && state) {
+          location = `${city}, ${state}`;
+          if (country) location += `, ${country}`;
+        } else {
+          location = getField(row, 'location', 'address', 'fulladdress', 'full_address') || city || state || country;
+        }
+
+        // Handle company location
+        const companyLocation = getField(
+          row,
+          'companycountry',
+          'company_country',
+          'companylocation',
+          'company_location',
+          'companycity',
+          'company_city'
+        ) || country;
+
+        // Handle Millions verification status (manual CSV column)
+        const rawMillionsStatus = getField(
+          row,
+          'millionsstatus',
+          'millions_status',
+          'millionsverificationstatus',
+          'millions_verification_status',
+          'millions'
+        );
+
+        // If a Millions status was provided in the Lead Filter, use that for all rows.
+        // Otherwise, fall back to any per-row CSV value.
+        let millionsStatus = leadFilterMillionsStatus || null;
+        if (rawMillionsStatus) {
+          const normalized = String(rawMillionsStatus).trim().toLowerCase();
+          // Normalize common variants to the core statuses used in the app
+          if (['good', 'risky', 'bad', 'error'].includes(normalized)) {
+            millionsStatus = normalized;
+          } else if (['valid', 'deliverable'].includes(normalized)) {
+            millionsStatus = 'good';
+          } else if (['risky-valid', 'riskyvalid', 'risky_deliverable'].includes(normalized)) {
+            millionsStatus = 'risky';
+          } else if (['invalid', 'undeliverable', 'blocklisted', 'blocked'].includes(normalized)) {
+            millionsStatus = 'bad';
           }
+          // Any other values (including "unknown"/"unverified") are treated as null/unset
+        }
 
-          // Handle company location
-          const companyLocation = getField(
-            row,
-            'companycountry',
-            'company_country',
-            'companylocation',
-            'company_location',
-            'companycity',
-            'company_city'
-          ) || country;
+        const clientData = {
+          email: email || null,
+          firstName: sanitizeAiMarkerInName(firstName) || null,
+          lastName: sanitizeAiMarkerInName(lastName) || null,
+          companyName: sanitizeAiMarkerInName(companyName) || null,
+          companyUrl: companyUrl || null,
+          companyLinkedin: companyLinkedin || null,
+          linkedin: linkedinUrl || null,
+          jobTitle: jobTitle || null,
+          location: location || null,
+          companyLocation: companyLocation || null,
+          status: getField(row, 'status') || 'new',
+          contactedBy: (() => {
+            const value = getField(row, 'assignedto', 'assigned_to', 'contactedby', 'contacted_by');
+            return value ? [value] : null;
+          })(),
+          industries: (() => {
+            const value = getField(row, 'industries', 'industry');
+            if (!value) return null;
+            return Array.isArray(value) ? value : value.split(',').map(i => i.trim()).filter(i => i);
+          })(),
+          templateIndustry: (() => {
+            const fromRow = getField(row, 'templateindustry', 'template_industry', 'templateIndustry');
+            const raw = String(fromRow || uploadTemplateIndustry || '').trim();
+            return raw || null;
+          })(),
+          tech: (() => {
+            const value = getField(row, 'tech', 'technologies', 'technology');
+            if (!value) return null;
+            return Array.isArray(value) ? value : value.split(',').map(t => t.trim()).filter(t => t);
+          })(),
+          leadFilterId: leadFilterId,
+          millionsStatus,
+        };
 
-          // Handle Millions verification status (manual CSV column)
-          const rawMillionsStatus = getField(
-            row,
-            'millionsstatus',
-            'millions_status',
-            'millionsverificationstatus',
-            'millions_verification_status',
-            'millions'
-          );
+        candidates.push({
+          rowIndex: i,
+          companyKey: companyLinkedin || null,
+          titlePriority: getJobTitlePriority(jobTitle),
+          clientData,
+        });
+      } catch (error) {
+        errors.push({ row: i + 2, error: error.message });
+      }
+    }
 
-          // If a Millions status was provided in the Lead Filter, use that for all rows.
-          // Otherwise, fall back to any per-row CSV value.
-          let millionsStatus = leadFilterMillionsStatus || null;
-          if (rawMillionsStatus) {
-            const normalized = String(rawMillionsStatus).trim().toLowerCase();
-            // Normalize common variants to the core statuses used in the app
-            if (['good', 'risky', 'bad', 'error'].includes(normalized)) {
-              millionsStatus = normalized;
-            } else if (['valid', 'deliverable'].includes(normalized)) {
-              millionsStatus = 'good';
-            } else if (['risky-valid', 'riskyvalid', 'risky_deliverable'].includes(normalized)) {
-              millionsStatus = 'risky';
-            } else if (['invalid', 'undeliverable', 'blocklisted', 'blocked'].includes(normalized)) {
-              millionsStatus = 'bad';
-            }
-            // Any other values (including "unknown"/"unverified") are treated as null/unset
-          }
+    // Pass 2: keep only highest-priority title per company LinkedIn URL (CEO > CTO, etc.)
+    const { winners, skipped } = pickBestLeadPerCompany(candidates);
+    for (const { candidate, kept } of skipped) {
+      const keptTitle = kept.clientData.jobTitle || 'higher-priority title';
+      errors.push({
+        row: candidate.rowIndex + 2,
+        email: candidate.clientData.email || undefined,
+        linkedin: candidate.clientData.linkedin || undefined,
+        error: `Skipped: same company already has ${keptTitle} (prefer CEO over other roles)`,
+      });
+    }
 
-          const clientData = {
-            email: email.toLowerCase().trim(),
-            firstName: sanitizeAiMarkerInName(firstName) || null,
-            lastName: sanitizeAiMarkerInName(lastName) || null,
-            companyName: sanitizeAiMarkerInName(companyName) || null,
-            companyUrl: companyUrl || null,
-            linkedin: linkedinUrl || null,
-            jobTitle: jobTitle || null,
-            location: location || null,
-            companyLocation: companyLocation || null,
-            status: getField(row, 'status') || 'new',
-            contactedBy: (() => {
-              const value = getField(row, 'assignedto', 'assigned_to', 'contactedby', 'contacted_by');
-              return value ? [value] : null;
-            })(),
-            industries: (() => {
-              const value = getField(row, 'industries', 'industry');
-              if (!value) return null;
-              return Array.isArray(value) ? value : value.split(',').map(i => i.trim()).filter(i => i);
-            })(),
-            templateIndustry: (() => {
-              const fromRow = getField(row, 'templateindustry', 'template_industry', 'templateIndustry');
-              const raw = String(fromRow || uploadTemplateIndustry || '').trim();
-              return raw || null;
-            })(),
-            tech: (() => {
-              const value = getField(row, 'tech', 'technologies', 'technology');
-              if (!value) return null;
-              return Array.isArray(value) ? value : value.split(',').map(t => t.trim()).filter(t => t);
-            })(),
-            leadFilterId: leadFilterId,
-            millionsStatus,
-          };
+    async function findExistingAtCompany(companyLinkedin) {
+      if (!companyLinkedin) return [];
+      return clientRepository
+        .createQueryBuilder('client')
+        .where('client.deletedAt IS NULL')
+        .andWhere('client.companyLinkedin IS NOT NULL')
+        .andWhere('LOWER(TRIM(client.companyLinkedin)) = :companyLinkedin', {
+          companyLinkedin: companyLinkedin.toLowerCase(),
+        })
+        .getMany();
+    }
 
-          // Check if client already exists
-          const existing = await clientRepository.findOne({
+    // Pass 3: insert / update winners
+    for (const candidate of winners) {
+      const { rowIndex: i, clientData, titlePriority } = candidate;
+
+      try {
+        // Dedupe: email when present; otherwise LinkedIn (Apollo no-email uploads)
+        let existing = null;
+        if (clientData.email) {
+          existing = await clientRepository.findOne({
             where: { email: clientData.email, deletedAt: null },
           });
+        }
+        if (!existing && clientData.linkedin) {
+          existing = await findExistingByLinkedin(clientData.linkedin);
+        }
 
-          if (!existing) {
-            const client = clientRepository.create(clientData);
-            const savedClient = await clientRepository.save(client);
-            results.push(savedClient);
+        // If this person is new, skip when platform already has equal/higher title at same company
+        if (!existing && clientData.companyLinkedin) {
+          const sameCompany = await findExistingAtCompany(clientData.companyLinkedin);
+          const betterOrEqual = sameCompany.find(
+            (c) => getJobTitlePriority(c.jobTitle) >= titlePriority
+          );
+          if (betterOrEqual) {
+            errors.push({
+              row: i + 2,
+              email: clientData.email || undefined,
+              linkedin: clientData.linkedin || undefined,
+              error: `Skipped: company already has ${betterOrEqual.jobTitle || 'a lead'} on platform (prefer CEO over other roles)`,
+            });
+            continue;
+          }
+        }
+
+        if (!existing) {
+          const client = clientRepository.create(clientData);
+          const savedClient = await clientRepository.save(client);
+          results.push(savedClient);
+          processed++;
+        } else {
+          // Client exists - check if firstName or lastName need to be updated
+          const updateData = {};
+          let needsUpdate = false;
+
+          // Update firstName if it's missing in DB but present in upload
+          if (!existing.firstName && clientData.firstName) {
+            updateData.firstName = clientData.firstName;
+            needsUpdate = true;
+          }
+
+          // Update lastName if it's missing in DB but present in upload
+          if (!existing.lastName && clientData.lastName) {
+            updateData.lastName = clientData.lastName;
+            needsUpdate = true;
+          }
+
+          if (!existing.templateIndustry && clientData.templateIndustry) {
+            updateData.templateIndustry = clientData.templateIndustry;
+            needsUpdate = true;
+          }
+
+          if (!existing.linkedin && clientData.linkedin) {
+            updateData.linkedin = clientData.linkedin;
+            needsUpdate = true;
+          }
+
+          // Fill email on existing LinkedIn-matched Apollo lead if we now have one
+          if (!existing.email && clientData.email) {
+            updateData.email = clientData.email;
+            needsUpdate = true;
+          }
+
+          if (!existing.companyLinkedin && clientData.companyLinkedin) {
+            updateData.companyLinkedin = clientData.companyLinkedin;
+            needsUpdate = true;
+          }
+
+          if (!existing.leadFilterId && clientData.leadFilterId) {
+            updateData.leadFilterId = clientData.leadFilterId;
+            needsUpdate = true;
+          }
+
+          if (needsUpdate) {
+            await clientRepository.update({ id: existing.id }, updateData);
+            const updatedClient = await clientRepository.findOne({
+              where: { id: existing.id },
+            });
+            results.push(updatedClient);
             processed++;
           } else {
-            // Client exists - check if firstName or lastName need to be updated
-            const updateData = {};
-            let needsUpdate = false;
-
-            // Update firstName if it's missing in DB but present in upload
-            if (!existing.firstName && clientData.firstName) {
-              updateData.firstName = clientData.firstName;
-              needsUpdate = true;
-            }
-
-            // Update lastName if it's missing in DB but present in upload
-            if (!existing.lastName && clientData.lastName) {
-              updateData.lastName = clientData.lastName;
-              needsUpdate = true;
-            }
-
-            if (!existing.templateIndustry && clientData.templateIndustry) {
-              updateData.templateIndustry = clientData.templateIndustry;
-              needsUpdate = true;
-            }
-
-            if (needsUpdate) {
-              await clientRepository.update({ id: existing.id }, updateData);
-              const updatedClient = await clientRepository.findOne({
-                where: { id: existing.id },
-              });
-              results.push(updatedClient);
-              processed++;
-            } else {
-              errors.push({ row: i + 2, email: clientData.email, error: 'Lead already exists' });
-            }
+            errors.push({
+              row: i + 2,
+              email: clientData.email || undefined,
+              linkedin: clientData.linkedin || undefined,
+              error: 'Lead already exists',
+            });
           }
-        } catch (error) {
-          errors.push({ row: i + 2, error: error.message });
         }
-      } else {
-        errors.push({ row: i + 2, error: 'Email is required' });
+      } catch (error) {
+        errors.push({ row: i + 2, error: error.message });
       }
     }
 
@@ -702,6 +861,313 @@ export async function uploadLeads(req, res) {
     });
   } catch (error) {
     console.error('Upload leads error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
+export async function getLeadById(req, res) {
+  try {
+    const { id } = req.params;
+    const clientRepository = AppDataSource.getRepository(Client);
+    const lead = await clientRepository.findOne({
+      where: { id, deletedAt: null },
+    });
+    if (!lead) {
+      return res.status(404).json({ error: 'Lead not found' });
+    }
+    res.json(serializeClientLeadForApi(lead));
+  } catch (error) {
+    console.error('Get lead by id error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
+export async function updateLead(req, res) {
+  try {
+    const { id } = req.params;
+    const clientRepository = AppDataSource.getRepository(Client);
+    const existing = await clientRepository.findOne({
+      where: { id, deletedAt: null },
+    });
+    if (!existing) {
+      return res.status(404).json({ error: 'Lead not found' });
+    }
+
+    const body = req.body || {};
+    const stringOrNull = (v) => {
+      if (v === undefined) return undefined;
+      if (v === null) return null;
+      const s = String(v).trim();
+      return s || null;
+    };
+
+    const patch = {};
+    if (body.email !== undefined) {
+      const email = String(body.email || '').toLowerCase().trim();
+      if (!email) {
+        return res.status(400).json({ error: 'Email cannot be empty' });
+      }
+      if (email !== (existing.email || '').toLowerCase()) {
+        const dup = await clientRepository.findOne({
+          where: { email, deletedAt: null },
+        });
+        if (dup && dup.id !== existing.id) {
+          return res.status(400).json({ error: 'Lead with this email already exists' });
+        }
+      }
+      patch.email = email;
+    }
+
+    const nameFields = ['firstName', 'lastName', 'companyName'];
+    for (const field of nameFields) {
+      if (body[field] !== undefined || (field === 'companyName' && body.company !== undefined)) {
+        const raw = field === 'companyName' && body.companyName === undefined ? body.company : body[field];
+        patch[field] = sanitizeAiMarkerInName(stringOrNull(raw));
+      }
+    }
+
+    if (body.companyUrl !== undefined || body.website !== undefined) {
+      patch.companyUrl = stringOrNull(body.companyUrl ?? body.website);
+    }
+    if (body.companyLinkedin !== undefined) {
+      patch.companyLinkedin = normalizeCompanyLinkedInUrl(body.companyLinkedin) || stringOrNull(body.companyLinkedin);
+    }
+    if (body.linkedin !== undefined) {
+      patch.linkedin = normalizeLinkedInUrl(body.linkedin) || stringOrNull(body.linkedin);
+    }
+    if (body.jobTitle !== undefined || body.title !== undefined) {
+      patch.jobTitle = stringOrNull(body.jobTitle ?? body.title);
+    }
+    if (body.location !== undefined) patch.location = stringOrNull(body.location);
+    if (body.companyLocation !== undefined || body.country !== undefined) {
+      patch.companyLocation = stringOrNull(body.companyLocation ?? body.country);
+    }
+    if (body.status !== undefined) patch.status = stringOrNull(body.status) || 'new';
+    if (body.templateIndustry !== undefined || body.template_industry !== undefined) {
+      patch.templateIndustry = stringOrNull(body.templateIndustry ?? body.template_industry);
+    }
+    if (body.note !== undefined) patch.note = stringOrNull(body.note);
+    if (body.photoUrl !== undefined) patch.photoUrl = stringOrNull(body.photoUrl);
+    if (body.employees !== undefined) {
+      patch.employees = body.employees === null || body.employees === '' ? null : Number(body.employees);
+    }
+    if (body.isSent !== undefined) patch.isSent = Boolean(body.isSent);
+    if (body.isReplied !== undefined) patch.isReplied = Boolean(body.isReplied);
+    if (body.isFollowup !== undefined) patch.isFollowup = Boolean(body.isFollowup);
+    if (body.millionsStatus !== undefined) patch.millionsStatus = stringOrNull(body.millionsStatus);
+    if (body.lastSent !== undefined) {
+      patch.lastSent = body.lastSent ? new Date(body.lastSent) : null;
+    }
+    if (body.contactedBy !== undefined || body.assignedTo !== undefined) {
+      const raw = body.contactedBy !== undefined ? body.contactedBy : body.assignedTo;
+      if (raw === null || raw === '') patch.contactedBy = null;
+      else if (typeof raw === 'string') patch.contactedBy = [raw];
+      else if (Array.isArray(raw)) patch.contactedBy = raw;
+      else patch.contactedBy = null;
+    }
+    if (body.industries !== undefined) {
+      if (body.industries === null || body.industries === '') patch.industries = null;
+      else if (Array.isArray(body.industries)) patch.industries = body.industries;
+      else patch.industries = String(body.industries).split(',').map((s) => s.trim()).filter(Boolean);
+    }
+    if (body.tech !== undefined) {
+      if (body.tech === null || body.tech === '') patch.tech = null;
+      else if (Array.isArray(body.tech)) patch.tech = body.tech;
+      else patch.tech = String(body.tech).split(',').map((s) => s.trim()).filter(Boolean);
+    }
+
+    if (Object.keys(patch).length === 0) {
+      return res.status(400).json({ error: 'No valid fields to update' });
+    }
+
+    await clientRepository.update({ id }, patch);
+    const updated = await clientRepository.findOne({ where: { id } });
+    res.json(serializeClientLeadForApi(updated));
+  } catch (error) {
+    console.error('Update lead error:', error);
+    if (error.code === '23505') {
+      return res.status(400).json({ error: 'Lead with this email already exists' });
+    }
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
+export async function deleteLead(req, res) {
+  try {
+    const { id } = req.params;
+    const clientRepository = AppDataSource.getRepository(Client);
+    const existing = await clientRepository.findOne({
+      where: { id, deletedAt: null },
+    });
+    if (!existing) {
+      return res.status(404).json({ error: 'Lead not found' });
+    }
+
+    await clientRepository.update({ id }, { deletedAt: new Date() });
+    res.json({ success: true, deleted: 1 });
+  } catch (error) {
+    console.error('Delete lead error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
+/**
+ * Lead detail + per-mailbox send/CRM flow.
+ * Multiple accounts can have used the same lead; group history by account email.
+ */
+export async function getLeadHistory(req, res) {
+  try {
+    const { id } = req.params;
+    const clientRepository = AppDataSource.getRepository(Client);
+    const lead = await clientRepository.findOne({
+      where: { id, deletedAt: null },
+    });
+    if (!lead) {
+      return res.status(404).json({ error: 'Lead not found' });
+    }
+
+    const marketingRows = await AppDataSource.getRepository(MarketingAssignmentLead)
+      .createQueryBuilder('mal')
+      .leftJoinAndSelect('mal.assignment', 'assignment')
+      .leftJoinAndSelect('assignment.email', 'email')
+      .where('mal.clientId = :clientId', { clientId: id })
+      .orderBy('mal.createdAt', 'DESC')
+      .getMany();
+
+    const followupRows = await AppDataSource.getRepository(FollowupAssignmentLead)
+      .createQueryBuilder('fal')
+      .leftJoinAndSelect('fal.assignment', 'assignment')
+      .leftJoinAndSelect('assignment.email', 'email')
+      .where('fal.clientId = :clientId', { clientId: id })
+      .orderBy('fal.createdAt', 'DESC')
+      .getMany();
+
+    const crmRows = await AppDataSource.getRepository(CrmClient)
+      .createQueryBuilder('c')
+      .where('c.deletedAt IS NULL')
+      .andWhere('(c.leadId = :leadId OR LOWER(TRIM(c.email)) = :email)', {
+        leadId: id,
+        email: String(lead.email || '').toLowerCase().trim() || '__none__',
+      })
+      .getMany();
+
+    /** @type {Map<string, { accountEmail: string, coldSends: any[], followups: any[], crmClients: any[] }>} */
+    const byAccount = new Map();
+
+    function ensureAccount(rawEmail) {
+      const accountEmail = String(rawEmail || '').trim().toLowerCase();
+      if (!accountEmail) return null;
+      if (!byAccount.has(accountEmail)) {
+        byAccount.set(accountEmail, {
+          accountEmail,
+          coldSends: [],
+          followups: [],
+          crmClients: [],
+        });
+      }
+      return byAccount.get(accountEmail);
+    }
+
+    for (const addr of lead.sentBy || []) {
+      ensureAccount(addr);
+    }
+
+    for (const row of marketingRows) {
+      const accountEmail = row.assignment?.email?.address || null;
+      const bucket = ensureAccount(accountEmail);
+      const event = {
+        id: row.id,
+        type: 'cold',
+        sendStatus: row.sendStatus,
+        subject: row.subject,
+        sentAt: row.sentAt,
+        createdAt: row.createdAt,
+        errorMessage: row.errorMessage,
+        nylasMessageId: row.nylasMessageId,
+        assignmentDate: row.assignment?.assignmentDate || null,
+        accountEmail: accountEmail ? String(accountEmail).toLowerCase() : null,
+      };
+      if (bucket) bucket.coldSends.push(event);
+    }
+
+    for (const row of followupRows) {
+      const accountEmail = row.assignment?.email?.address || null;
+      const bucket = ensureAccount(accountEmail);
+      const event = {
+        id: row.id,
+        type: 'followup',
+        sendStatus: row.sendStatus,
+        subject: row.subject,
+        originalSubject: row.originalSubject,
+        sentAt: row.sentAt,
+        createdAt: row.createdAt,
+        errorMessage: row.errorMessage,
+        nylasMessageId: row.nylasMessageId,
+        assignmentDate: row.assignment?.assignmentDate || null,
+        accountEmail: accountEmail ? String(accountEmail).toLowerCase() : null,
+      };
+      if (bucket) bucket.followups.push(event);
+    }
+
+    for (const crm of crmRows) {
+      const bucket = ensureAccount(crm.sentByAccount);
+      const serialized = serializeCrmClient(crm);
+      if (bucket) bucket.crmClients.push(serialized);
+      else {
+        // CRM without mailbox — still surface under a placeholder bucket
+        const orphanKey = '__unassigned__';
+        if (!byAccount.has(orphanKey)) {
+          byAccount.set(orphanKey, {
+            accountEmail: null,
+            coldSends: [],
+            followups: [],
+            crmClients: [],
+          });
+        }
+        byAccount.get(orphanKey).crmClients.push(serialized);
+      }
+    }
+
+    const accounts = Array.from(byAccount.values()).map((bucket) => {
+      const latestCold = bucket.coldSends[0] || null;
+      const latestFollowup = bucket.followups[0] || null;
+      let flowStatus = 'not_contacted';
+      if (latestFollowup && (latestFollowup.sendStatus === 'sent' || latestFollowup.sentAt)) {
+        flowStatus = 'followed_up';
+      } else if (latestCold && (latestCold.sendStatus === 'sent' || latestCold.sentAt)) {
+        flowStatus = 'sent';
+      } else if (latestCold || latestFollowup) {
+        flowStatus = latestCold?.sendStatus || latestFollowup?.sendStatus || 'pending';
+      } else if (bucket.crmClients.length > 0) {
+        flowStatus = 'crm_only';
+      }
+
+      return {
+        accountEmail: bucket.accountEmail,
+        flowStatus,
+        leadStatus: lead.status || 'new',
+        isSentOnLead: Array.isArray(lead.sentBy)
+          ? lead.sentBy.some((a) => String(a).toLowerCase() === bucket.accountEmail)
+          : false,
+        coldSends: bucket.coldSends,
+        followups: bucket.followups,
+        crmClients: bucket.crmClients,
+      };
+    });
+
+    // Prefer real accounts first; unassigned CRM last
+    accounts.sort((a, b) => {
+      if (!a.accountEmail && b.accountEmail) return 1;
+      if (a.accountEmail && !b.accountEmail) return -1;
+      return String(a.accountEmail || '').localeCompare(String(b.accountEmail || ''));
+    });
+
+    res.json({
+      lead: serializeClientLeadForApi(lead),
+      accounts,
+    });
+  } catch (error) {
+    console.error('Get lead history error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 }
@@ -1193,6 +1659,8 @@ export async function resetLeadsStatus(req, res) {
 
 // In-memory storage for verification job status
 const verificationJobs = new Map();
+// In-memory storage for Apollo LinkedIn email-fetch jobs
+const apolloFetchJobs = new Map();
 
 function parseIncludeErrorFlag(value) {
   return value === true || value === 'true' || value === '1' || value === 1;
@@ -1549,3 +2017,283 @@ export async function getVerificationStatus(req, res) {
     res.status(500).json({ error: 'Internal server error' });
   }
 }
+
+/**
+ * Count Apollo-sourced leads that have LinkedIn but no email (ready for enrichment).
+ * Excludes leads already checked by Apollo (no_email / email_conflict / error / updated).
+ */
+export async function getApolloMissingEmailCount(req, res) {
+  try {
+    const rawIds = req.query?.ids ?? req.body?.ids;
+    const ids = Array.isArray(rawIds)
+      ? rawIds.map((id) => String(id).trim()).filter(Boolean)
+      : typeof rawIds === 'string' && rawIds.trim()
+        ? rawIds.split(',').map((s) => s.trim()).filter(Boolean)
+        : null;
+
+    const clientRepository = AppDataSource.getRepository(Client);
+
+    const baseQb = () => {
+      const qb = clientRepository
+        .createQueryBuilder('client')
+        .leftJoin(LeadFilter, 'lf', 'lf.id = client.leadFilterId')
+        .where('client.deletedAt IS NULL')
+        .andWhere("(client.email IS NULL OR TRIM(client.email) = '')")
+        .andWhere('client.linkedin IS NOT NULL')
+        .andWhere("TRIM(client.linkedin) <> ''");
+      if (ids?.length) {
+        qb.andWhere('client.id IN (:...ids)', { ids });
+      } else {
+        qb.andWhere("LOWER(TRIM(COALESCE(lf.tool, ''))) = 'apollo'");
+      }
+      return qb;
+    };
+
+    const [noEmailWithLinkedin, eligible, noEmailStatus, conflictStatus] = await Promise.all([
+      baseQb().getCount(),
+      baseQb()
+        .andWhere("(client.apollo_email_status IS NULL OR TRIM(client.apollo_email_status) = '')")
+        .getCount(),
+      baseQb().andWhere("client.apollo_email_status = 'no_email'").getCount(),
+      baseQb().andWhere("client.apollo_email_status = 'email_conflict'").getCount(),
+    ]);
+
+    const alreadyChecked = Math.max(0, noEmailWithLinkedin - eligible);
+
+    return res.json({
+      count: eligible,
+      eligible,
+      noEmailWithLinkedin,
+      alreadyChecked,
+      noEmail: noEmailStatus,
+      emailConflict: conflictStatus,
+    });
+  } catch (error) {
+    console.error('getApolloMissingEmailCount error:', error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
+/**
+ * Start async Apollo LinkedIn email enrichment job (progress via status endpoint).
+ */
+export async function fetchApolloEmails(req, res) {
+  try {
+    const apolloAccountId = String(req.body?.apolloAccountId || req.body?.apollo_account_id || '').trim();
+    const ids = Array.isArray(req.body?.ids)
+      ? req.body.ids.map((id) => String(id).trim()).filter(Boolean)
+      : null;
+
+    // limit: 'all' | omitted → process every eligible lead.
+    // Numeric limit kept for optional throttling (hard cap 50k).
+    const limitRaw = req.body?.limit;
+    const wantAll =
+      limitRaw == null ||
+      limitRaw === '' ||
+      String(limitRaw).toLowerCase() === 'all' ||
+      limitRaw === 0 ||
+      limitRaw === '0';
+    const limitNum = wantAll
+      ? null
+      : Math.min(50000, Math.max(1, parseInt(String(limitRaw), 10) || 0)) || null;
+
+    if (!apolloAccountId) {
+      return res.status(400).json({ error: 'apolloAccountId is required' });
+    }
+
+    const apolloRepo = AppDataSource.getRepository(ApolloAccount);
+    const account = await apolloRepo.findOne({ where: { id: apolloAccountId } });
+    if (!account || account.deletedAt) {
+      return res.status(404).json({ error: 'Apollo account not found' });
+    }
+    if (!String(account.apiKey || '').trim()) {
+      return res.status(400).json({ error: 'Apollo account is missing an API key' });
+    }
+
+    const clientRepository = AppDataSource.getRepository(Client);
+    const qb = clientRepository
+      .createQueryBuilder('client')
+      .leftJoin(LeadFilter, 'lf', 'lf.id = client.leadFilterId')
+      .where('client.deletedAt IS NULL')
+      .andWhere("(client.email IS NULL OR TRIM(client.email) = '')")
+      .andWhere('client.linkedin IS NOT NULL')
+      .andWhere("TRIM(client.linkedin) <> ''")
+      .andWhere("(client.apollo_email_status IS NULL OR TRIM(client.apollo_email_status) = '')");
+
+    if (ids?.length) {
+      qb.andWhere('client.id IN (:...ids)', { ids });
+    } else {
+      qb.andWhere("LOWER(TRIM(COALESCE(lf.tool, ''))) = 'apollo'");
+    }
+
+    qb.orderBy('client.createdAt', 'ASC');
+    if (limitNum != null) {
+      qb.take(limitNum);
+    }
+
+    const leads = await qb.getMany();
+
+    const jobId = `apollo-fetch-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    apolloFetchJobs.set(jobId, {
+      status: 'running',
+      total: leads.length,
+      completed: 0,
+      updated: 0,
+      skipped: 0,
+      failed: 0,
+      results: [],
+      error: null,
+      startedAt: new Date().toISOString(),
+    });
+
+    if (!leads.length) {
+      const job = apolloFetchJobs.get(jobId);
+      job.status = 'completed';
+      job.completedAt = new Date().toISOString();
+      return res.json({
+        success: true,
+        jobId,
+        total: 0,
+        message: 'No eligible leads to enrich',
+      });
+    }
+
+    // Run enrichment in background so FE can poll progress
+    setImmediate(() => {
+      void (async () => {
+        const job = apolloFetchJobs.get(jobId);
+        if (!job) return;
+
+        try {
+          const enrichInput = leads.map((lead) => ({
+            id: lead.id,
+            linkedin: lead.linkedin,
+            firstName: lead.firstName,
+            lastName: lead.lastName,
+            companyName: lead.companyName,
+            companyUrl: lead.companyUrl,
+          }));
+
+          await bulkEnrichPeopleByLinkedIn(account.apiKey, enrichInput, {
+            onBatch: async ({ processed, total, batchResults }) => {
+              const checkedAt = new Date();
+              for (const item of batchResults) {
+                const lead = leads.find((l) => l.id === item.id);
+                if (!lead) {
+                  job.failed += 1;
+                  job.results.push({
+                    id: item.id,
+                    status: 'failed',
+                    error: 'Lead not found after enrich',
+                  });
+                  continue;
+                }
+
+                if (!item.email) {
+                  await clientRepository.update(
+                    { id: lead.id },
+                    {
+                      apolloEmailStatus: 'no_email',
+                      apolloSuggestedEmail: null,
+                      apolloEmailCheckedAt: checkedAt,
+                      linkedin: normalizeLinkedInUrl(lead.linkedin) || lead.linkedin,
+                    }
+                  );
+                  job.skipped += 1;
+                  job.results.push({
+                    id: lead.id,
+                    linkedin: lead.linkedin,
+                    status: 'no_email',
+                  });
+                  continue;
+                }
+
+                const emailOwner = await clientRepository.findOne({
+                  where: { email: item.email, deletedAt: null },
+                });
+                if (emailOwner && emailOwner.id !== lead.id) {
+                  await clientRepository.update(
+                    { id: lead.id },
+                    {
+                      apolloEmailStatus: 'email_conflict',
+                      apolloSuggestedEmail: item.email,
+                      apolloEmailCheckedAt: checkedAt,
+                      linkedin: normalizeLinkedInUrl(lead.linkedin) || lead.linkedin,
+                    }
+                  );
+                  job.failed += 1;
+                  job.results.push({
+                    id: lead.id,
+                    linkedin: lead.linkedin,
+                    email: item.email,
+                    status: 'email_conflict',
+                    error: 'Email already belongs to another lead',
+                  });
+                  continue;
+                }
+
+                await clientRepository.update(
+                  { id: lead.id },
+                  {
+                    email: item.email,
+                    linkedin: normalizeLinkedInUrl(lead.linkedin) || lead.linkedin,
+                    apolloEmailStatus: 'updated',
+                    apolloSuggestedEmail: null,
+                    apolloEmailCheckedAt: checkedAt,
+                  }
+                );
+                job.updated += 1;
+                job.results.push({
+                  id: lead.id,
+                  linkedin: lead.linkedin,
+                  email: item.email,
+                  status: 'updated',
+                });
+              }
+
+              job.completed = processed;
+              job.total = total;
+            },
+          });
+
+          job.status = 'completed';
+          job.completed = job.total;
+          job.completedAt = new Date().toISOString();
+        } catch (error) {
+          console.error('Apollo fetch job error:', error);
+          job.status = 'error';
+          job.error = error.message || 'Apollo fetch failed';
+          job.completedAt = new Date().toISOString();
+        }
+      })();
+    });
+
+    return res.json({
+      success: true,
+      jobId,
+      total: leads.length,
+      message: `Started fetching emails for ${leads.length} lead(s)`,
+    });
+  } catch (error) {
+    console.error('fetchApolloEmails error:', error);
+    return res.status(500).json({ error: error.message || 'Internal server error' });
+  }
+}
+
+export async function getApolloFetchStatus(req, res) {
+  try {
+    const { jobId } = req.params;
+    if (!jobId) {
+      return res.status(400).json({ error: 'jobId is required' });
+    }
+    const job = apolloFetchJobs.get(jobId);
+    if (!job) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+    return res.json(job);
+  } catch (error) {
+    console.error('getApolloFetchStatus error:', error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+}
+

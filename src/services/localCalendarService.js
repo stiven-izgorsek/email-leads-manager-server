@@ -194,7 +194,7 @@ export async function listExpandedLocalEvents({ startSec, endSec, emailIds } = {
     });
 
   if (Array.isArray(emailIds) && emailIds.length > 0) {
-    qb.andWhere('le.email_id IN (:...ids)', { ids: emailIds });
+    qb.andWhere('(le.email_id IN (:...ids) OR le.email_id IS NULL)', { ids: emailIds });
   }
 
   const masters = await qb.getMany();
@@ -228,21 +228,31 @@ export async function listExpandedLocalEvents({ startSec, endSec, emailIds } = {
 }
 
 export async function createLocalCalendarEvent(body) {
-  const emailId = String(body?.emailId || '').trim();
-  if (!emailId) throw new Error('emailId is required');
+  const emailIdRaw = body?.emailId;
+  const emailId =
+    emailIdRaw === null || emailIdRaw === undefined || emailIdRaw === ''
+      ? null
+      : String(emailIdRaw).trim() || null;
 
   const startAt = parseDate(body?.start ?? body?.startAt, 'start');
   const endAt = parseDate(body?.end ?? body?.endAt, 'end');
   if (!startAt || !endAt) throw new Error('start and end are required');
   if (endAt <= startAt) throw new Error('end must be after start');
 
-  const mailbox = await getMailbox(emailId);
+  let mailboxId = null;
+  let mailboxEmail = null;
+  if (emailId) {
+    const mailbox = await getMailbox(emailId);
+    mailboxId = mailbox.id;
+    mailboxEmail = mailbox.address;
+  }
+
   const recurrence = normalizeRecurrence(body);
   const repo = AppDataSource.getRepository(CalendarEventLocal);
 
   const row = repo.create({
-    emailId: mailbox.id,
-    mailboxEmail: mailbox.address,
+    emailId: mailboxId,
+    mailboxEmail,
     title: String(body?.title || '').trim() || '(no title)',
     description: body?.description != null ? String(body.description) : null,
     location: body?.location != null ? String(body.location).trim() || null : null,
@@ -328,10 +338,16 @@ export async function updateLocalCalendarEvent(id, body) {
   if (body?.start) patch.startAt = parseDate(body.start, 'start');
   if (body?.end) patch.endAt = parseDate(body.end, 'end');
   if (body?.allDay !== undefined) patch.allDay = Boolean(body.allDay);
-  if (body?.emailId) {
-    const mailbox = await getMailbox(String(body.emailId).trim());
-    patch.emailId = mailbox.id;
-    patch.mailboxEmail = mailbox.address;
+  if (body?.emailId !== undefined) {
+    const raw = body.emailId;
+    if (raw === null || raw === '') {
+      patch.emailId = null;
+      patch.mailboxEmail = null;
+    } else {
+      const mailbox = await getMailbox(String(raw).trim());
+      patch.emailId = mailbox.id;
+      patch.mailboxEmail = mailbox.address;
+    }
   }
 
   if (body?.recurrence !== undefined || body?.recurrenceFrequency !== undefined) {

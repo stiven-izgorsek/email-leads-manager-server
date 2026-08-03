@@ -2,6 +2,7 @@ import {
   listCalendarEventsFromDb,
   parseUnixRange,
   syncCalendarEventsFromNylas,
+  softDeleteNylasCalendarEvent,
 } from '../services/calendarSyncService.js';
 import {
   createLocalCalendarEvent,
@@ -138,7 +139,7 @@ export async function updateLocalEventHandler(req, res) {
   }
 }
 
-/** DELETE — delete series or cancel one occurrence. */
+/** DELETE — soft-delete a local series or cancel one occurrence. */
 export async function deleteLocalEventHandler(req, res) {
   try {
     const { id } = req.params;
@@ -152,6 +153,36 @@ export async function deleteLocalEventHandler(req, res) {
     return res.json({ success: true, ...result });
   } catch (error) {
     console.error('deleteLocalEvent error:', error);
+    const msg = error.message || 'Failed to delete event';
+    const status = /Invalid|not found/i.test(msg) ? 400 : 500;
+    return res.status(status).json({ error: msg });
+  }
+}
+
+/**
+ * DELETE — platform soft-delete for any calendar event (local or synced/Nylas).
+ * Does not cancel the event in Google/Nylas.
+ */
+export async function deleteCalendarEventHandler(req, res) {
+  try {
+    const { id } = req.params;
+    const rawId = decodeURIComponent(String(id || ''));
+
+    if (String(rawId).startsWith('local:') || parseLocalEventId(rawId)) {
+      const parsed = parseLocalEventId(rawId) || { masterId: rawId, occurrenceStart: null };
+      const occurrenceStart =
+        req.query?.occurrenceStart ||
+        req.body?.occurrenceStart ||
+        parsed.occurrenceStart ||
+        null;
+      const result = await deleteLocalCalendarEvent(parsed.masterId, { occurrenceStart });
+      return res.json({ success: true, source: 'local', ...result });
+    }
+
+    const result = await softDeleteNylasCalendarEvent(rawId);
+    return res.json({ success: true, ...result });
+  } catch (error) {
+    console.error('deleteCalendarEvent error:', error);
     const msg = error.message || 'Failed to delete event';
     const status = /Invalid|not found/i.test(msg) ? 400 : 500;
     return res.status(status).json({ error: msg });

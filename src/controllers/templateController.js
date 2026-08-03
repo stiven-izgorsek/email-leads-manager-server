@@ -8,6 +8,10 @@ import {
   TEMPLATE_INDUSTRIES,
   resolveForcedTemplateIndustry,
 } from '../constants/templateIndustries.js';
+import {
+  parseIsSignatureAdded,
+  stripTrailingSignatureClosing,
+} from '../utils/stripSignatureClosing.js';
 
 const TEMPLATE_SIZES = ['long', 'short', 'normal'];
 
@@ -486,6 +490,7 @@ export async function composeLeadOutboundEmail({
   accountEmail = '',
   messageType = 'outreach',
   industry = '',
+  isSignatureAdded = false,
 }) {
   if (!lead || typeof lead !== 'object') {
     throw new Error('lead is required');
@@ -509,7 +514,8 @@ export async function composeLeadOutboundEmail({
     email: accountEmail ?? '',
   };
   const subject = sanitizeRandomPlaceholders(renderTemplateVariables(subjectTemplate.content, vars));
-  const body = sanitizeRandomPlaceholders(renderTemplateVariables(messageTemplate.content, vars));
+  let body = sanitizeRandomPlaceholders(renderTemplateVariables(messageTemplate.content, vars));
+  body = stripTrailingSignatureClosing(body, isSignatureAdded);
   await incrementTemplateUsedCount(subjectRepo, subjectTemplate.id);
   await incrementTemplateUsedCount(subjectRepo, messageTemplate.id);
   return {
@@ -523,23 +529,29 @@ export async function composeLeadOutboundEmail({
 }
 
 /** Render template placeholders for manual compose (subject/body snippets). */
-export function renderTemplateContent(content, { lead, accountName, accountEmail } = {}) {
+export function renderTemplateContent(content, { lead, accountName, accountEmail, isSignatureAdded = false } = {}) {
   const normalizedLead = normalizeLeadVariables(lead || {});
   const vars = {
     ...normalizedLead,
     senderName: accountName ?? '',
     email: accountEmail ?? '',
   };
-  return sanitizeRandomPlaceholders(renderTemplateVariables(String(content || ''), vars));
+  const rendered = sanitizeRandomPlaceholders(renderTemplateVariables(String(content || ''), vars));
+  return stripTrailingSignatureClosing(rendered, isSignatureAdded);
 }
 
 export async function renderTemplateContentHttp(req, res) {
   try {
-    const { content, lead, accountName, accountEmail } = req.body || {};
+    const { content, lead, accountName, accountEmail, isSignatureAdded } = req.body || {};
     if (!content || typeof content !== 'string') {
       return res.status(400).json({ error: 'content is required' });
     }
-    const rendered = renderTemplateContent(content, { lead, accountName, accountEmail });
+    const rendered = renderTemplateContent(content, {
+      lead,
+      accountName,
+      accountEmail,
+      isSignatureAdded: parseIsSignatureAdded(isSignatureAdded, false),
+    });
     return res.json({ content: rendered });
   } catch (error) {
     console.error('renderTemplateContentHttp error:', error);
@@ -549,7 +561,7 @@ export async function renderTemplateContentHttp(req, res) {
 
 export async function composeEmailFromTemplates(req, res) {
   try {
-    const { accountName, accountEmail, lead, messageType, industry } = req.body || {};
+    const { accountName, accountEmail, lead, messageType, industry, isSignatureAdded } = req.body || {};
 
     if (!lead || typeof lead !== 'object') {
       return res.status(400).json({ error: 'lead is required' });
@@ -561,6 +573,7 @@ export async function composeEmailFromTemplates(req, res) {
       accountEmail,
       messageType,
       industry,
+      isSignatureAdded: parseIsSignatureAdded(isSignatureAdded, false),
     });
 
     return res.json({
@@ -586,6 +599,7 @@ export async function composeLeadOutboundEmailWithAi({
   accountEmail = '',
   messageType,
   industry = '',
+  isSignatureAdded = false,
 }) {
   if (!lead || typeof lead !== 'object') {
     throw new Error('lead is required');
@@ -600,6 +614,7 @@ export async function composeLeadOutboundEmailWithAi({
       accountEmail,
       messageType: requestedMessageType,
       industry: forcedIndustry,
+      isSignatureAdded,
     });
     return {
       subject: composed.subject,
@@ -777,6 +792,7 @@ export async function composeLeadOutboundEmailWithAi({
     let template = renderTemplateVariables(messageTemplate.content, vars);
     subject = sanitizeRandomPlaceholders(subject);
     template = sanitizeRandomPlaceholders(template);
+    template = stripTrailingSignatureClosing(template, isSignatureAdded);
 
     await incrementTemplateUsedCount(templateRepository, subjectTemplate.id);
     await incrementTemplateUsedCount(templateRepository, messageTemplate.id);
@@ -797,10 +813,17 @@ export async function composeLeadOutboundEmailWithAi({
       openAiFailed,
     };
 }
-
+  
 export async function composeAiEmail(req, res) {
   try {
-    const { accountName, accountEmail, lead, messageType: bodyMessageType, industry } = req.body || {};
+    const {
+      accountName,
+      accountEmail,
+      lead,
+      messageType: bodyMessageType,
+      industry,
+      isSignatureAdded,
+    } = req.body || {};
     if (!lead || typeof lead !== 'object') {
       return res.status(400).json({ error: 'lead is required' });
     }
@@ -811,6 +834,7 @@ export async function composeAiEmail(req, res) {
       accountEmail,
       messageType: bodyMessageType,
       industry,
+      isSignatureAdded: parseIsSignatureAdded(isSignatureAdded, false),
     });
 
     return res.json({
