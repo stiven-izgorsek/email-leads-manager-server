@@ -2,7 +2,7 @@ import express from 'express';
 import multer from 'multer';
 import path from 'path';
 import os from 'os';
-import { getLeads, createLead, uploadLeads } from '../controllers/leadController.js';
+import { getLeads, createLead, uploadLeads, bulkDeleteLeads, bulkUpdateLeads, getUncontactedLeads, getLeadFilters, markClientAsSent, markClientAsFollowedUp, checkLeadsStatus, getDashboardKPIs, resetLeadsStatus, getEmailsSentInDateRange, bulkVerifyEmails, bulkVerifyAllNew, getNewLeadsVerificationCount, getVerificationStatus, downloadNewLeadsCsv, getFollowupCandidates, getApolloMissingEmailCount, fetchApolloEmails, getApolloFetchStatus, getLeadById, updateLead, deleteLead, getLeadHistory } from '../controllers/leadController.js';
 // import { authenticateToken } from '../middleware/auth.js';
 
 const router = express.Router();
@@ -22,8 +22,31 @@ const upload = multer({ storage });
 // router.use(authenticateToken); // Uncomment to enable authentication
 
 router.get('/', getLeads);
+router.get('/uncontacted', getUncontactedLeads);
+router.get('/filters', getLeadFilters);
+router.get('/dashboard-kpis', getDashboardKPIs);
+router.get('/emails-date-range', getEmailsSentInDateRange);
+router.get('/followup-candidates', getFollowupCandidates);
 router.post('/', createLead);
 router.post('/upload', upload.single('file'), uploadLeads);
+router.post('/bulk-delete', bulkDeleteLeads);
+router.post('/bulk-update', bulkUpdateLeads);
+router.post('/check-status', checkLeadsStatus);
+router.post('/reset-status', resetLeadsStatus);
+router.post('/bulk-verify-emails', bulkVerifyEmails);
+router.post('/bulk-verify-all-new', bulkVerifyAllNew);
+router.get('/new-leads-verification-count', getNewLeadsVerificationCount);
+router.get('/download-new-csv', downloadNewLeadsCsv);
+router.get('/verification-status/:jobId', getVerificationStatus);
+router.get('/apollo-missing-email-count', getApolloMissingEmailCount);
+router.post('/fetch-apollo-emails', fetchApolloEmails);
+router.get('/apollo-fetch-status/:jobId', getApolloFetchStatus);
+router.get('/:id/history', getLeadHistory);
+router.get('/:id', getLeadById);
+router.put('/:id', updateLead);
+router.delete('/:id', deleteLead);
+router.put('/:clientId/mark-sent', markClientAsSent);
+router.post('/mark-followed-up', markClientAsFollowedUp);
 
 export default router;
 

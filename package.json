@@ -7,24 +7,40 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
+    "migration:run": "node scripts/run-migrations.js",
+    "migration:revert": "node scripts/revert-migration.js",
+    "cleanup:client": "node scripts/cleanup-client.js",
+    "import:leads": "node scripts/import-leads-csv.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": ["email", "leads", "management", "api"],
+  "keywords": [
+    "email",
+    "leads",
+    "management",
+    "api"
+  ],
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "express": "^4.18.2",
-    "mongoose": "^8.0.3",
-    "jsonwebtoken": "^9.0.2",
     "bcryptjs": "^2.4.3",
+    "cookie-parser": "^1.4.6",
     "cors": "^2.8.5",
-    "dotenv": "^16.3.1",
-    "multer": "^1.4.5-lts.1",
     "csv-parser": "^3.0.0",
-    "cookie-parser": "^1.4.6"
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "imapflow": "^1.4.7",
+    "jsonwebtoken": "^9.0.2",
+    "mailparser": "^3.9.14",
+    "multer": "^1.4.5-lts.1",
+    "nodemailer": "^9.0.3",
+    "pg": "^8.16.3",
+    "reflect-metadata": "^0.2.2",
+    "typeorm": "^0.3.28",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
-    "@types/node": "^20.10.6"
+    "@types/mailparser": "^3.4.6",
+    "@types/node": "^20.10.6",
+    "@types/nodemailer": "^8.0.1"
   }
 }
-

@@ -1,13 +1,91 @@
-import mongoose from 'mongoose';
+import 'reflect-metadata';
+import { DataSource } from 'typeorm';
+import dotenv from 'dotenv';
+import {
+  UserSchema,
+  AccountSchema,
+  EmailSchema,
+  ClientSchema,
+  TemplateSchema,
+  InterviewSchema,
+  LeadFilterSchema,
+  PortfolioSchema,
+  PortfolioIndustrySchema,
+  PortfolioWorkExperienceSchema,
+  PortfolioTagSchema,
+  NylasSlackNotificationSchema,
+  IncomingMessageSchema,
+  IncomingMessageReplySchema,
+  HiddenSenderEntrySchema,
+  MessageTypeRuleSchema,
+  CompanySchema,
+  CompanySavedSearchSchema,
+  CrmClientSchema,
+  MarketingAssignmentSchema,
+  MarketingAssignmentLeadSchema,
+  FollowupAssignmentSchema,
+  FollowupAssignmentLeadSchema,
+  CalendarEventSchema,
+  CalendarEventLocalSchema,
+  CalendarEventLocalExceptionSchema,
+  ApolloAccountSchema,
+  MarketingDomainBlockAlertSchema,
+} from '../entities/index.js';
+
+dotenv.config();
+
+export const AppDataSource = new DataSource({
+  type: 'postgres',
+  host: process.env.DB_HOST || 'localhost',
+  port: parseInt(process.env.DB_PORT || '5432', 10),
+  username: process.env.DB_USERNAME || 'postgres',
+  password: process.env.DB_PASSWORD || 'postgres',
+  database: process.env.DB_NAME || 'email_leads_manager',
+  synchronize: process.env.NODE_ENV !== 'production', // Auto-sync schema in development
+  logging: false, // Disable query logging
+  entities: [
+    UserSchema,
+    AccountSchema,
+    EmailSchema,
+    ClientSchema,
+    TemplateSchema,
+    InterviewSchema,
+    LeadFilterSchema,
+    PortfolioSchema,
+    PortfolioIndustrySchema,
+    PortfolioWorkExperienceSchema,
+    PortfolioTagSchema,
+    NylasSlackNotificationSchema,
+    IncomingMessageSchema,
+    IncomingMessageReplySchema,
+    HiddenSenderEntrySchema,
+    MessageTypeRuleSchema,
+    CompanySchema,
+    CompanySavedSearchSchema,
+    CrmClientSchema,
+    MarketingAssignmentSchema,
+    MarketingAssignmentLeadSchema,
+    FollowupAssignmentSchema,
+    FollowupAssignmentLeadSchema,
+    CalendarEventSchema,
+    CalendarEventLocalSchema,
+    CalendarEventLocalExceptionSchema,
+    ApolloAccountSchema,
+    MarketingDomainBlockAlertSchema,
+  ],
+  migrations: ['src/migrations/**/*.js'],
+  subscribers: ['src/subscribers/**/*.js'],
+  extra: {
+    max: parseInt(process.env.DB_POOL_MAX || '20', 10),
+  },
+});
 
 export async function connectDatabase() {
   try {
-    const mongoUri = process.env.MONGODB_URI || 'mongodb://localhost:27017/email-leads-manager';
-    await mongoose.connect(mongoUri);
-    console.log('MongoDB connected successfully');
+    await AppDataSource.initialize();
+    console.log('PostgreSQL database connected successfully');
   } catch (error) {
-    console.error('MongoDB connection error:', error);
+    console.error('Database connection error:', error);
     process.exit(1);
   }
 }
-
