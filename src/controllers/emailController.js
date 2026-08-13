@@ -482,18 +482,26 @@ export async function bulkUpdateEmails(req, res) {
       return res.status(400).json({ error: 'Updates object is required' });
     }
 
-    // Only allow updating specific fields
-    const allowedFields = ['status', 'accountId'];
+    // Only allow updating specific fields (camelCase + snake_case aliases)
+    const fieldMap = {
+      status: 'status',
+      accountId: 'accountId',
+      account_id: 'accountId',
+      grantId: 'grantId',
+      grant_id: 'grantId',
+      nylasKey: 'nylasKey',
+      nylas_key: 'nylasKey',
+    };
     const updateData = {};
-    
-    for (const field of allowedFields) {
-      if (field in updates) {
-        // Handle accountId - allow null to unlink
-        if (field === 'accountId') {
-          updateData[field] = updates[field] || null;
-        } else {
-          updateData[field] = updates[field];
-        }
+
+    for (const [incoming, entityField] of Object.entries(fieldMap)) {
+      if (!(incoming in updates)) continue;
+      const value = updates[incoming];
+      // Nullable credential / relation fields — empty string clears to null
+      if (entityField === 'accountId' || entityField === 'grantId' || entityField === 'nylasKey') {
+        updateData[entityField] = value || null;
+      } else {
+        updateData[entityField] = value;
       }
     }
 

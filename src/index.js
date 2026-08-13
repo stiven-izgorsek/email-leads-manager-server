@@ -22,7 +22,7 @@ import marketingRoutes from './routes/marketingRoutes.js';
 import followupRoutes from './routes/followupRoutes.js';
 import apolloAccountRoutes from './routes/apolloAccountRoutes.js';
 import { startNylasUnreadPollingJob } from './services/nylasPollingService.js';
-import { startImapUnreadPollingJob } from './services/imapPollingService.js';
+// import { startImapUnreadPollingJob } from './services/imapPollingService.js';
 import { startCalendarSyncJob } from './services/calendarSyncJob.js';
 import { releaseAllOrphanedMarketingRuns } from './services/marketingService.js';
 import { releaseAllOrphanedFollowupRuns } from './services/followupService.js';
@@ -115,7 +115,9 @@ async function startServer() {
       );
     }
     startNylasUnreadPollingJob();
-    startImapUnreadPollingJob();
+    // Disabled: Gmail IMAP app-password auth is failing across mailboxes
+    // (AUTHENTICATIONFAILED / Invalid credentials). Re-enable after app passwords are refreshed.
+    // startImapUnreadPollingJob();
     startCalendarSyncJob();
     app.listen(PORT, () => {
       console.log(`Server is running on port ${PORT}`);

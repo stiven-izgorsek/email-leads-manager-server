@@ -1,30 +1,81 @@
+import { IsNull } from 'typeorm';
 import { AppDataSource } from '../config/database.js';
 import { Account } from '../entities/Account.js';
+import { Email } from '../entities/Email.js';
 
 export async function getAccounts(req, res) {
   try {
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 20;
     const skip = (page - 1) * limit;
+    const search = (req.query.search || '').trim();
 
     const accountRepository = AppDataSource.getRepository(Account);
 
+    const queryBuilder = accountRepository
+      .createQueryBuilder('account')
+      .where('account.deletedAt IS NULL');
+
+    if (search) {
+      queryBuilder.andWhere(
+        `(account.firstName ILIKE :search OR account.lastName ILIKE :search OR account.country ILIKE :search OR CONCAT(COALESCE(account.firstName, ''), ' ', COALESCE(account.lastName, '')) ILIKE :search)`,
+        { search: `%${search}%` }
+      );
+    }
+
     const [data, total] = await Promise.all([
-      accountRepository.find({
-        where: { deletedAt: null },
-        order: { createdAt: 'DESC' },
-        skip: skip,
-        take: limit,
-      }),
-      accountRepository.count({
-        where: { deletedAt: null },
-      }),
+      queryBuilder
+        .orderBy('account.createdAt', 'DESC')
+        .skip(skip)
+        .take(limit)
+        .getMany(),
+      queryBuilder.getCount(),
     ]);
+
+    const emailCounts = {};
+    const accountIds = data.map((account) => account.id).filter(Boolean);
+    if (accountIds.length) {
+      const emailRepository = AppDataSource.getRepository(Email);
+      const countRows = await emailRepository
+        .createQueryBuilder('email')
+        .select('email.accountId', 'accountId')
+        .addSelect(
+          `SUM(CASE WHEN email.status = 'good' THEN 1 ELSE 0 END)`,
+          'goodCount'
+        )
+        .addSelect(
+          `SUM(CASE WHEN email.status <> 'good' OR email.status IS NULL THEN 1 ELSE 0 END)`,
+          'otherCount'
+        )
+        .where('email.deletedAt IS NULL')
+        .andWhere('email.accountId IN (:...accountIds)', { accountIds })
+        .groupBy('email.accountId')
+        .getRawMany();
+
+      for (const row of countRows) {
+        const key = String(row.accountId || '');
+        if (!key) continue;
+        emailCounts[key] = {
+          good: Number(row.goodCount || 0),
+          other: Number(row.otherCount || 0),
+        };
+      }
+    }
+
+    const enriched = data.map((account) => {
+      const counts = emailCounts[account.id] || { good: 0, other: 0 };
+      return {
+        ...account,
+        goodEmailsCount: counts.good,
+        otherEmailsCount: counts.other,
+        emailsCount: counts.good + counts.other,
+      };
+    });
 
     const totalPages = Math.ceil(total / limit);
 
     res.json({
-      data,
+      data: enriched,
       page,
       limit,
       total,
@@ -40,7 +91,7 @@ export async function getAccount(req, res) {
   try {
     const accountRepository = AppDataSource.getRepository(Account);
     const account = await accountRepository.findOne({
-      where: { id: req.params.id, deletedAt: null },
+      where: { id: req.params.id, deletedAt: IsNull() },
     });
 
     if (!account) {
@@ -83,7 +134,7 @@ export async function updateAccount(req, res) {
     const accountRepository = AppDataSource.getRepository(Account);
     
     const account = await accountRepository.findOne({
-      where: { id: req.params.id, deletedAt: null },
+      where: { id: req.params.id, deletedAt: IsNull() },
     });
 
     if (!account) {
@@ -113,7 +164,7 @@ export async function deleteAccount(req, res) {
     const accountRepository = AppDataSource.getRepository(Account);
     
     const account = await accountRepository.findOne({
-      where: { id: req.params.id, deletedAt: null },
+      where: { id: req.params.id, deletedAt: IsNull() },
     });
 
     if (!account) {
@@ -130,4 +181,3 @@ export async function deleteAccount(req, res) {
     res.status(500).json({ error: 'Internal server error' });
   }
 }
-

@@ -185,7 +185,20 @@ async function fetchUnreadMessagesForMailbox(emailRow) {
   try {
     await client.connect();
   } catch (err) {
-    console.error(`[IMAP] Connect failed for ${user}:`, err?.message || err);
+    const details = [
+      err?.responseText,
+      err?.serverResponseCode,
+      err?.authenticationFailed ? 'auth_failed' : null,
+      err?.responseStatus,
+      err?.code,
+    ]
+      .filter(Boolean)
+      .join(' | ');
+    console.error(
+      `[IMAP] Connect failed for ${user}:`,
+      err?.message || err,
+      details ? `(${details})` : ''
+    );
     await safeCloseImapClient(client);
     return;
   }
