@@ -5,6 +5,7 @@ import { Client } from '../entities/Client.js';
 import { MarketingAssignment } from '../entities/MarketingAssignment.js';
 import { MarketingAssignmentLead } from '../entities/MarketingAssignmentLead.js';
 import {
+  fetchOooRepliedLeads,
   fetchUncontactedVerifiedLeads,
   resetLeadsFromReady,
 } from './leadFetchService.js';
@@ -13,7 +14,7 @@ import {
   composeLeadOutboundEmailWithAi,
 } from '../controllers/templateController.js';
 import { sendNylasEmail } from './nylasSendService.js';
-import { sendSmtpEmail, hasAppPasswordCredentials } from './smtpSendService.js';
+import { sendSmtpEmail, hasAppPasswordCredentials, isAppPasswordFeaturesEnabled } from './smtpSendService.js';
 import { sleep } from '../utils/nylasRateLimit.js';
 import { getMailboxTodayStatsByEmailId, getLocalTodayRange } from './mailboxTodayOutboundService.js';
 import {
@@ -35,6 +36,10 @@ const DEFAULT_MARKETING_SEND_DELAY_MIN_MS = 3 * 60 * 1000;
 const DEFAULT_MARKETING_SEND_DELAY_MAX_MS = 5 * 60 * 1000;
 const DEFAULT_MARKETING_MAX_PARALLEL_MAILBOXES = 5;
 const DEFAULT_STUCK_RUNNING_MS = 45 * 60 * 1000;
+/** Wait before auto-requeueing a network-failed lead back to pending. */
+const DEFAULT_NETWORK_RETRY_COOLDOWN_MS = 3 * 60 * 1000;
+/** Extra round-robin / single-mailbox passes for network retries. */
+const DEFAULT_NETWORK_RETRY_MAX_PASSES = 5;
 
 function marketingLog(mailbox, message, extra) {
   const ts = new Date().toISOString();
@@ -56,6 +61,126 @@ function getMarketingMaxParallelMailboxes() {
 
 function getStuckRunningMaxAgeMs() {
   return parsePositiveIntEnv('MARKETING_STUCK_RUNNING_MS', DEFAULT_STUCK_RUNNING_MS);
+}
+
+function getNetworkRetryCooldownMs() {
+  return parsePositiveIntEnv('MARKETING_NETWORK_RETRY_COOLDOWN_MS', DEFAULT_NETWORK_RETRY_COOLDOWN_MS);
+}
+
+function getNetworkRetryMaxPasses() {
+  return parsePositiveIntEnv('MARKETING_NETWORK_RETRY_MAX_PASSES', DEFAULT_NETWORK_RETRY_MAX_PASSES);
+}
+
+/**
+ * Transient / network errors that should be auto-retried (not permanent failures like
+ * unsupported country or missing credentials).
+ */
+export function isRetryableNetworkSendError(errorOrMessage) {
+  const raw =
+    typeof errorOrMessage === 'string'
+      ? errorOrMessage
+      : errorOrMessage?.message || errorOrMessage?.error || String(errorOrMessage || '');
+  const msg = String(raw || '').trim().toLowerCase();
+  if (!msg) return false;
+
+  // Permanent / non-retryable (even if wording overlaps)
+  if (
+    /country, region, or territory not supported|mailbox is missing|no email address|invalid.?grant|unauthorized|authentication|app password|daily.?limit/i.test(
+      msg
+    )
+  ) {
+    return false;
+  }
+
+  return (
+    msg === 'fetch failed' ||
+    /fetch failed|network|econnreset|econnrefused|etimedout|enotfound|eai_again|socket hang up|socket closed|und_err|timeout|timed out|temporarily unavailable|try again|502|503|504|429|rate.?limit|gateway|connection reset|connection refused|networkerror|failed to fetch/i.test(
+      msg
+    )
+  );
+}
+
+/**
+ * Requeue failed leads whose last error looks like a transient network issue,
+ * after MARKETING_NETWORK_RETRY_COOLDOWN_MS (so we don't hammer the same lead).
+ * @returns {Promise<number>} how many leads were moved back to pending
+ */
+async function requeueRetryableNetworkFailures(assignmentId, { ignoreCooldown = false } = {}) {
+  if (!assignmentId) return 0;
+  const leadRepo = AppDataSource.getRepository(MarketingAssignmentLead);
+  const failedRows = await leadRepo.find({
+    where: { assignmentId, sendStatus: 'failed' },
+  });
+  if (!failedRows.length) return 0;
+
+  const cooldownMs = getNetworkRetryCooldownMs();
+  const cutoff = Date.now() - cooldownMs;
+  const toRetry = [];
+
+  for (const row of failedRows) {
+    if (!isRetryableNetworkSendError(row.errorMessage)) continue;
+    if (!ignoreCooldown) {
+      const updatedMs = row.updatedAt ? new Date(row.updatedAt).getTime() : 0;
+      if (Number.isFinite(updatedMs) && updatedMs > cutoff) continue;
+    }
+    toRetry.push(row);
+  }
+
+  if (!toRetry.length) return 0;
+
+  for (const row of toRetry) {
+    row.sendStatus = 'pending';
+    // Keep last error for visibility until a successful send clears it.
+    row.sentAt = null;
+    row.nylasMessageId = null;
+  }
+  await leadRepo.save(toRetry);
+  marketingLog(null, 'requeued network-failed leads', {
+    assignmentId,
+    count: toRetry.length,
+    cooldownMs,
+  });
+  return toRetry.length;
+}
+
+/** Earliest wait (ms) until a network-failed lead is eligible; null if none remain. */
+async function msUntilNextNetworkRetry(assignmentId) {
+  const leadRepo = AppDataSource.getRepository(MarketingAssignmentLead);
+  const failedRows = await leadRepo.find({
+    where: { assignmentId, sendStatus: 'failed' },
+  });
+  const cooldownMs = getNetworkRetryCooldownMs();
+  let soonest = null;
+  let any = false;
+  for (const row of failedRows) {
+    if (!isRetryableNetworkSendError(row.errorMessage)) continue;
+    any = true;
+    const updatedMs = row.updatedAt ? new Date(row.updatedAt).getTime() : Date.now();
+    const readyAt = updatedMs + cooldownMs;
+    const wait = Math.max(0, readyAt - Date.now());
+    if (soonest == null || wait < soonest) soonest = wait;
+  }
+  return any ? soonest : null;
+}
+
+async function requeueRetryableNetworkFailuresForDate(assignmentDate) {
+  const date = getAssignmentDateString(assignmentDate);
+  const assignmentRepo = AppDataSource.getRepository(MarketingAssignment);
+  const assignments = await assignmentRepo.find({
+    where: { assignmentDate: date },
+    select: ['id'],
+  });
+  let total = 0;
+  for (const a of assignments) {
+    total += await requeueRetryableNetworkFailures(a.id);
+  }
+  if (total > 0) {
+    marketingLog(null, 'requeued network-failed leads for date', {
+      assignmentDate: date,
+      count: total,
+    });
+  }
+  return total;
 }
 
 /**
@@ -277,11 +402,20 @@ async function sendOneMarketingLead(email, assignment, leadRow, meta = {}) {
     }
 
     if (!result.ok) {
+      const errMsg =
+        result.error || (channel === 'smtp' ? 'SMTP send failed' : 'Nylas send failed');
       leadRow.sendStatus = 'failed';
-      leadRow.errorMessage = result.error || (channel === 'smtp' ? 'SMTP send failed' : 'Nylas send failed');
+      leadRow.errorMessage = errMsg;
       leadRow.subject = composed.subject;
       leadRow.body = composed.body;
       await leadRepo.save(leadRow);
+      if (isRetryableNetworkSendError(errMsg)) {
+        marketingLog(mb, 'lead deferred (network) — will retry after cooldown', {
+          ...meta,
+          error: errMsg,
+        });
+        return { sent: 0, failed: 0, deferred: 1 };
+      }
       return { sent: 0, failed: 1 };
     }
 
@@ -296,10 +430,18 @@ async function sendOneMarketingLead(email, assignment, leadRow, meta = {}) {
     marketingLog(mb, 'lead sent', { ...meta, channel, messageId: result.messageId });
     return { sent: 1, failed: 0 };
   } catch (err) {
+    const errMsg = err.message || String(err);
     leadRow.sendStatus = 'failed';
-    leadRow.errorMessage = err.message || String(err);
+    leadRow.errorMessage = errMsg;
     await leadRepo.save(leadRow);
-    marketingLog(mb, 'lead failed', { ...meta, error: err.message || String(err) });
+    if (isRetryableNetworkSendError(errMsg)) {
+      marketingLog(mb, 'lead deferred (network) — will retry after cooldown', {
+        ...meta,
+        error: errMsg,
+      });
+      return { sent: 0, failed: 0, deferred: 1 };
+    }
+    marketingLog(mb, 'lead failed', { ...meta, error: errMsg });
     return { sent: 0, failed: 1 };
   }
 }
@@ -322,14 +464,21 @@ async function loadMarketingWorkloads(date, eligibleRows) {
     if (!assignment) continue;
 
     const pending = await countPendingLeads(assignment.id);
-    if (pending === 0) continue;
+    if (pending === 0) {
+      // Include cooled-down network failures so start-all still picks this mailbox up.
+      const requeued = await requeueRetryableNetworkFailures(assignment.id);
+      if (requeued === 0) continue;
+    }
+
+    const pendingAfter = await countPendingLeads(assignment.id);
+    if (pendingAfter === 0) continue;
 
     workloads.push({
       emailId: row.emailId,
       address: row.address,
       email,
       assignment,
-      initialPending: pending,
+      initialPending: pendingAfter,
       channel: row.marketingChannel || 'nylas',
     });
   }
@@ -342,6 +491,10 @@ async function processMailboxOneRound(workload, roundIndex, totalRounds) {
     marketingLog(address, 'paused — stop requested');
     return { sent: 0, failed: 0, skipped: true, stopped: true };
   }
+
+  // Pull network failures back into the queue once cooldown has passed.
+  await requeueRetryableNetworkFailures(assignment.id);
+
   const pending = await countPendingLeads(assignment.id);
   if (pending === 0) return { sent: 0, failed: 0, skipped: true };
 
@@ -408,22 +561,48 @@ async function runMarketingRoundRobin(eligible, date, batchSize) {
       return { totalSent, totalFailed };
     }
 
-    const maxRounds = Math.max(...workloads.map((w) => w.initialPending));
+    const maxInitialRounds = Math.max(...workloads.map((w) => w.initialPending), 0);
+    const maxExtra = getNetworkRetryMaxPasses();
+    const hardCap = maxInitialRounds + maxExtra;
     marketingLog(null, 'round-robin started', {
       mailboxes: workloads.length,
       batchSize,
-      maxRounds,
+      maxInitialRounds,
+      networkRetryPasses: maxExtra,
+      hardCap,
     });
 
-    for (let round = 0; round < maxRounds; round += 1) {
+    let totalDeferred = 0;
+    for (let round = 0; round < hardCap; round += 1) {
       if (marketingStopAllRequested) {
         marketingLog(null, 'round-robin stopped by user');
         break;
       }
+
+      // Before each round, requeue cooled-down network failures so they join later rounds.
+      let requeued = 0;
+      for (const w of workloads) {
+        requeued += await requeueRetryableNetworkFailures(w.assignment.id);
+      }
+
+      let pendingAnywhere = 0;
+      for (const w of workloads) {
+        pendingAnywhere += await countPendingLeads(w.assignment.id);
+      }
+      if (pendingAnywhere === 0) {
+        if (round >= maxInitialRounds) break;
+        // Still in initial window but nothing pending — stop.
+        if (requeued === 0) break;
+      }
+
       const roundNum = round + 1;
       const batches = chunkArray(workloads, batchSize);
 
-      marketingLog(null, `message round ${roundNum}/${maxRounds}`, { batches: batches.length });
+      marketingLog(null, `message round ${roundNum}/${hardCap}`, {
+        batches: batches.length,
+        pendingAnywhere,
+        requeued,
+      });
 
       for (let b = 0; b < batches.length; b += 1) {
         if (marketingStopAllRequested) break;
@@ -440,11 +619,12 @@ async function runMarketingRoundRobin(eligible, date, batchSize) {
 
         try {
           const results = await Promise.all(
-            batch.map((w) => processMailboxOneRound(w, round, maxRounds))
+            batch.map((w) => processMailboxOneRound(w, round, hardCap))
           );
           for (const r of results) {
             totalSent += r.sent || 0;
             totalFailed += r.failed || 0;
+            totalDeferred += r.deferred || 0;
           }
         } finally {
           await setAssignmentsRunning(assignmentIds, false);
@@ -453,8 +633,13 @@ async function runMarketingRoundRobin(eligible, date, batchSize) {
     }
 
     await finalizeMarketingWorkloads(workloads);
-    marketingLog(null, 'round-robin finished', { totalSent, totalFailed, mailboxes: workloads.length });
-    return { totalSent, totalFailed };
+    marketingLog(null, 'round-robin finished', {
+      totalSent,
+      totalFailed,
+      totalDeferred,
+      mailboxes: workloads.length,
+    });
+    return { totalSent, totalFailed, totalDeferred };
   } finally {
     marketingOrchestratorActive = false;
     marketingStopAllRequested = false;
@@ -774,9 +959,13 @@ export async function getMarketingDashboard(assignmentDate, options = {}) {
     .leftJoinAndSelect('email.account', 'account')
     .where('email.deletedAt IS NULL');
   if (channel === 'smtp') {
-    emailQb = emailQb.andWhere(
-      `(email.app_password IS NOT NULL AND TRIM(email.app_password) <> '')`
-    );
+    if (!isAppPasswordFeaturesEnabled()) {
+      emailQb = emailQb.andWhere('1 = 0');
+    } else {
+      emailQb = emailQb.andWhere(
+        `(email.app_password IS NOT NULL AND TRIM(email.app_password) <> '')`
+      );
+    }
   } else if (nylasOnly || channel === 'nylas') {
     emailQb = emailQb.andWhere(
       `(email.grant_id IS NOT NULL AND TRIM(email.grant_id) <> '')
@@ -869,6 +1058,38 @@ export async function getMarketingDashboard(assignmentDate, options = {}) {
   };
 }
 
+function normalizeOooMix(raw) {
+  const s = String(raw || '')
+    .trim()
+    .toLowerCase();
+  if (s === 'only') return 'only';
+  if (s === 'first' || s === 'all' || s === '1' || s === '1/1' || !s) return 'first';
+  const match = s.match(/^(\d+)\s*\/\s*(\d+)$/);
+  if (!match) return 'first';
+  const numerator = parseInt(match[1], 10);
+  const denominator = parseInt(match[2], 10);
+  if (!Number.isFinite(numerator) || !Number.isFinite(denominator)) return 'first';
+  if (numerator < 1 || denominator < 1) return 'first';
+  if (numerator >= denominator) return 'first';
+  return `${numerator}/${denominator}`;
+}
+
+/** How many of `total` slots to request from the OOO pool. */
+function resolveOooWantedCount(total, mix) {
+  const n = Math.max(0, Math.floor(total) || 0);
+  if (!n) return 0;
+  if (mix === 'only' || mix === 'first') return n;
+  const match = String(mix).match(/^(\d+)\s*\/\s*(\d+)$/);
+  if (!match) return n;
+  const numerator = parseInt(match[1], 10);
+  const denominator = parseInt(match[2], 10);
+  if (!Number.isFinite(numerator) || !Number.isFinite(denominator) || numerator < 1 || denominator < 1) {
+    return n;
+  }
+  if (numerator >= denominator) return n;
+  return Math.max(0, Math.min(n, Math.floor((n * numerator) / denominator)));
+}
+
 export async function assignLeadsToEmail(emailId, count, assignmentDate, filters = {}) {
   const date = getAssignmentDateString(assignmentDate);
   const channel = filters.channel === 'smtp' ? 'smtp' : 'nylas';
@@ -907,9 +1128,11 @@ export async function assignLeadsToEmail(emailId, count, assignmentDate, filters
     );
   }
 
-  // Same pool as Gmail extension: status=new only, atomically claimed as ready in DB.
-  const leads = await fetchUncontactedVerifiedLeads({
-    count: n,
+  const includeOooReplied = Boolean(filters.includeOooReplied);
+  const oooMix = includeOooReplied ? normalizeOooMix(filters.oooMix) : null;
+  const oooWanted = includeOooReplied ? resolveOooWantedCount(n, oooMix) : 0;
+  const fillNew = !includeOooReplied || oooMix !== 'only';
+  const poolOptions = {
     verifiedOnly: true,
     assignmentDate: date,
     leadFilterId: filters.leadFilterId,
@@ -918,11 +1141,31 @@ export async function assignLeadsToEmail(emailId, count, assignmentDate, filters
     location: filters.location,
     locations: filters.locations,
     industry: filters.industry,
-  });
+  };
+
+  let leads = [];
+  if (oooWanted > 0) {
+    leads = await fetchOooRepliedLeads({
+      count: oooWanted,
+      ...poolOptions,
+    });
+  }
+  if (fillNew && leads.length < n) {
+    const rest = await fetchUncontactedVerifiedLeads({
+      count: n - leads.length,
+      ...poolOptions,
+      excludeClientIds: leads.map((c) => c.id),
+    });
+    leads = [...leads, ...rest];
+  }
   if (!leads.length) {
     return {
       assigned: 0,
-      message: 'No available new Millions-verified leads to assign (ready/sent leads are excluded)',
+      message: includeOooReplied
+        ? oooMix === 'only'
+          ? 'No available OOO-replied Millions-verified leads to assign'
+          : 'No available OOO-replied or new Millions-verified leads to assign'
+        : 'No available new Millions-verified leads to assign (ready/sent leads are excluded)',
     };
   }
 
@@ -984,7 +1227,9 @@ export async function getAssignmentLeadsForEmail(emailId, assignmentDate) {
       companyName: row.client?.companyName || '',
       millionsStatus: row.client?.millionsStatus || null,
       clientStatus: row.client?.status || null,
+      errorMessage: row.errorMessage || null,
       canUnassign: row.sendStatus === 'pending',
+      canRetry: row.sendStatus === 'failed',
     })),
   };
 }
@@ -1054,6 +1299,191 @@ export async function unassignAllPendingMarketingLeads({ assignmentDate, emailId
   }
 
   return { unassigned, assignmentDate: date, emailId: emailId || null };
+}
+
+async function refreshAssignmentStatusAfterRetry(assignmentId) {
+  const assignmentRepo = AppDataSource.getRepository(MarketingAssignment);
+  const leadRepo = AppDataSource.getRepository(MarketingAssignmentLead);
+  const assignment = await assignmentRepo.findOne({ where: { id: assignmentId } });
+  if (!assignment) return;
+
+  const pending = await leadRepo.count({
+    where: { assignmentId, sendStatus: 'pending' },
+  });
+  const failed = await leadRepo.count({
+    where: { assignmentId, sendStatus: 'failed' },
+  });
+  const sent = await leadRepo.count({
+    where: { assignmentId, sendStatus: 'sent' },
+  });
+
+  // Don't flip a live send loop; only clear terminal statuses.
+  if (assignment.running) {
+    await assignmentRepo.update({ id: assignmentId }, { lastError: null });
+    return;
+  }
+
+  let status = assignment.status;
+  if (pending > 0) status = 'assigned';
+  else if (failed > 0 && sent === 0) status = 'failed';
+  else if (sent > 0 && pending === 0) status = 'completed';
+  else status = 'assigned';
+
+  await assignmentRepo.update(
+    { id: assignmentId },
+    { status, lastError: null }
+  );
+}
+
+/**
+ * Reset one failed assignment lead back to pending so it can be sent again.
+ */
+export async function retryFailedMarketingLead(assignmentLeadId, { start = false, channel = 'nylas' } = {}) {
+  const leadRepo = AppDataSource.getRepository(MarketingAssignmentLead);
+  const row = await leadRepo.findOne({
+    where: { id: assignmentLeadId },
+    relations: ['assignment'],
+  });
+  if (!row) throw new Error('Assigned lead not found');
+  if (row.sendStatus !== 'failed') {
+    throw new Error('Only failed leads can be retried');
+  }
+
+  row.sendStatus = 'pending';
+  row.errorMessage = null;
+  row.sentAt = null;
+  row.nylasMessageId = null;
+  await leadRepo.save(row);
+
+  const assignmentId = row.assignmentId;
+  const emailId = row.assignment?.emailId || null;
+  const assignmentDate = row.assignment?.assignmentDate
+    ? getAssignmentDateString(row.assignment.assignmentDate)
+    : null;
+
+  await refreshAssignmentStatusAfterRetry(assignmentId);
+
+  let startResult = null;
+  if (start && emailId && assignmentDate) {
+    try {
+      startResult = await runMarketingForEmail(emailId, assignmentDate, { channel });
+    } catch (err) {
+      // Lead is already pending — surface start error without rolling back the retry.
+      startResult = { error: err.message || String(err) };
+    }
+  }
+
+  return {
+    retried: 1,
+    assignmentLeadId,
+    emailId,
+    assignmentDate,
+    started: Boolean(start && emailId),
+    startResult,
+  };
+}
+
+/**
+ * Reset failed marketing assignment leads to pending.
+ * When emailId is set, only that mailbox; otherwise all mailboxes for the date.
+ * When start=true, kicks off the send loop for affected mailboxes.
+ */
+export async function retryFailedMarketingLeads({
+  assignmentDate,
+  emailId,
+  start = false,
+  channel = 'nylas',
+} = {}) {
+  const date = getAssignmentDateString(assignmentDate);
+  const assignmentRepo = AppDataSource.getRepository(MarketingAssignment);
+  const leadRepo = AppDataSource.getRepository(MarketingAssignmentLead);
+
+  let assignments = [];
+  if (emailId) {
+    const one = await assignmentRepo.findOne({
+      where: { emailId, assignmentDate: date },
+    });
+    if (one) assignments = [one];
+  } else {
+    assignments = await assignmentRepo.find({
+      where: { assignmentDate: date },
+    });
+  }
+
+  if (!assignments.length) {
+    return {
+      retried: 0,
+      assignmentDate: date,
+      emailId: emailId || null,
+      started: 0,
+      mailboxes: [],
+    };
+  }
+
+  const assignmentIds = assignments.map((a) => a.id);
+  const failedRows = await leadRepo.find({
+    where: { assignmentId: In(assignmentIds), sendStatus: 'failed' },
+  });
+
+  if (!failedRows.length) {
+    return {
+      retried: 0,
+      assignmentDate: date,
+      emailId: emailId || null,
+      started: 0,
+      mailboxes: [],
+      message: 'No failed leads to retry',
+    };
+  }
+
+  for (const row of failedRows) {
+    row.sendStatus = 'pending';
+    row.errorMessage = null;
+    row.sentAt = null;
+    row.nylasMessageId = null;
+  }
+  await leadRepo.save(failedRows);
+
+  const touchedAssignmentIds = Array.from(new Set(failedRows.map((r) => r.assignmentId)));
+  for (const id of touchedAssignmentIds) {
+    await refreshAssignmentStatusAfterRetry(id);
+  }
+
+  const touchedEmailIds = assignments
+    .filter((a) => touchedAssignmentIds.includes(a.id))
+    .map((a) => a.emailId);
+
+  let started = 0;
+  let startResult = null;
+  const startErrors = [];
+  if (start) {
+    if (emailId) {
+      try {
+        startResult = await runMarketingForEmail(emailId, date, { channel });
+        started = 1;
+      } catch (err) {
+        startErrors.push({ emailId, error: err.message || String(err) });
+      }
+    } else {
+      try {
+        startResult = await runMarketingForAll(date, { channel });
+        started = startResult?.started || 0;
+      } catch (err) {
+        startErrors.push({ error: err.message || String(err) });
+      }
+    }
+  }
+
+  return {
+    retried: failedRows.length,
+    assignmentDate: date,
+    emailId: emailId || null,
+    started,
+    mailboxes: touchedEmailIds,
+    startResult: startResult || undefined,
+    startErrors: startErrors.length ? startErrors : undefined,
+    message: `Retried ${failedRows.length} failed lead(s)${start ? `; started ${started} mailbox(es)` : ''}`,
+  };
 }
 
 function resolveMarketingDailyLimit(row, defaultCount) {
@@ -1129,9 +1559,13 @@ export async function assignLeadsToAll(countPerAccount, assignmentDate, filters 
   const continent = normalizeMarketingContinent(filters.continent);
   const assignFraction = normalizeAssignFraction(filters.assignFraction);
   const continentLocations = getContinentLocationKeywords(continent);
+  const includeOooReplied = Boolean(filters.includeOooReplied);
+  const oooMix = includeOooReplied ? normalizeOooMix(filters.oooMix) : null;
   const assignFilters = {
     ...filters,
     channel,
+    includeOooReplied,
+    oooMix,
     ...(continentLocations.length ? { locations: continentLocations } : {}),
   };
 
@@ -1143,6 +1577,8 @@ export async function assignLeadsToAll(countPerAccount, assignmentDate, filters 
       accounts: [],
       continent,
       assignFraction: continent ? assignFraction || 'all' : null,
+      includeOooReplied,
+      oooMix,
     };
   }
 
@@ -1205,6 +1641,8 @@ export async function assignLeadsToAll(countPerAccount, assignmentDate, filters 
     channel,
     continent,
     assignFraction: continent ? assignFraction || 'all' : null,
+    includeOooReplied,
+    oooMix,
   };
 }
 
@@ -1265,12 +1703,39 @@ export async function runMarketingForEmail(emailId, assignmentDate, options = {}
   const assignment = await assignmentRepo.findOne({ where: { emailId, assignmentDate: date } });
   if (!assignment) throw new Error('No leads assigned for today. Assign leads first.');
 
+  // Pull cooled-down network failures back before counting pending.
+  await requeueRetryableNetworkFailures(assignment.id);
+
   const leadRepo = AppDataSource.getRepository(MarketingAssignmentLead);
-  const pendingRows = await leadRepo.find({
+  let pendingRows = await leadRepo.find({
     where: { assignmentId: assignment.id, sendStatus: 'pending' },
     relations: ['client'],
     order: { createdAt: 'ASC' },
   });
+
+  if (!pendingRows.length) {
+    // Maybe network failures are still in cooldown — wait once and try.
+    const waitMs = await msUntilNextNetworkRetry(assignment.id);
+    if (waitMs != null && waitMs > 0 && waitMs <= getNetworkRetryCooldownMs()) {
+      marketingLog(mb, 'waiting for network-failure cooldown before retry', {
+        waitMs,
+      });
+      const slice = Math.min(waitMs + 500, getNetworkRetryCooldownMs() + 1000);
+      const endAt = Date.now() + slice;
+      while (Date.now() < endAt) {
+        if (isMarketingStopRequestedForEmail(emailId)) break;
+        await sleep(Math.min(5000, endAt - Date.now()));
+      }
+      if (!isMarketingStopRequestedForEmail(emailId)) {
+        await requeueRetryableNetworkFailures(assignment.id);
+        pendingRows = await leadRepo.find({
+          where: { assignmentId: assignment.id, sendStatus: 'pending' },
+          relations: ['client'],
+          order: { createdAt: 'ASC' },
+        });
+      }
+    }
+  }
 
   if (!pendingRows.length) {
     marketingLog(mb, 'no pending leads');
@@ -1294,11 +1759,17 @@ export async function runMarketingForEmail(emailId, assignmentDate, options = {}
 
   let sent = 0;
   let failed = 0;
+  let deferred = 0;
   let stopped = false;
   clearMarketingStopForEmail(emailId);
 
-  try {
-    for (let i = 0; i < pendingRows.length; i += 1) {
+  async function drainPendingOnce(passLabel) {
+    let passSent = 0;
+    let passFailed = 0;
+    let passDeferred = 0;
+    // Bound iterations to current pending + a little slack (new requeues happen between passes).
+    const safety = (await countPendingLeads(assignment.id)) + 2;
+    for (let i = 0; i < safety; i += 1) {
       if (isMarketingStopRequestedForEmail(emailId)) {
         stopped = true;
         marketingLog(mb, 'paused by user — stopping send loop');
@@ -1320,33 +1791,96 @@ export async function runMarketingForEmail(emailId, assignmentDate, options = {}
 
       const result = await sendOneMarketingLead(email, assignment, row, {
         index: i + 1,
-        total: pendingRows.length,
+        pass: passLabel,
         mode: 'single-mailbox',
         channel,
       });
-      sent += result.sent;
-      failed += result.failed;
+      passSent += result.sent || 0;
+      passFailed += result.failed || 0;
+      passDeferred += result.deferred || 0;
+    }
+    return { passSent, passFailed, passDeferred };
+  }
+
+  try {
+    const first = await drainPendingOnce('initial');
+    sent += first.passSent;
+    failed += first.passFailed;
+    deferred += first.passDeferred;
+
+    // Extra passes: wait for network cooldown, requeue, send again.
+    const maxPasses = getNetworkRetryMaxPasses();
+    for (let pass = 1; pass <= maxPasses && !stopped; pass += 1) {
+      if (isMarketingStopRequestedForEmail(emailId)) {
+        stopped = true;
+        break;
+      }
+      if (!(await marketingCanSendAnother(email, date))) break;
+
+      const waitMs = await msUntilNextNetworkRetry(assignment.id);
+      if (waitMs == null) break; // no retryable network failures left
+
+      if (waitMs > 0) {
+        marketingLog(mb, 'network retry pass waiting', { pass, waitMs });
+        const endAt = Date.now() + Math.min(waitMs + 500, getNetworkRetryCooldownMs() + 1000);
+        while (Date.now() < endAt) {
+          if (isMarketingStopRequestedForEmail(emailId)) {
+            stopped = true;
+            break;
+          }
+          await sleep(Math.min(5000, endAt - Date.now()));
+        }
+        if (stopped) break;
+      }
+
+      const requeued = await requeueRetryableNetworkFailures(assignment.id);
+      const pendingLeft = await countPendingLeads(assignment.id);
+      if (!requeued && pendingLeft === 0) break;
+
+      marketingLog(mb, 'network retry pass starting', { pass, requeued, pendingLeft });
+      const next = await drainPendingOnce(`network-retry-${pass}`);
+      sent += next.passSent;
+      failed += next.passFailed;
+      deferred += next.passDeferred;
     }
   } finally {
     clearMarketingStopForEmail(emailId);
     const fresh = await assignmentRepo.findOne({ where: { id: assignment.id } });
     if (fresh) {
       fresh.running = false;
+      const pendingLeft = await countPendingLeads(assignment.id);
+      const failedLeft = await leadRepo.count({
+        where: { assignmentId: assignment.id, sendStatus: 'failed' },
+      });
+      const sentLeft = await leadRepo.count({
+        where: { assignmentId: assignment.id, sendStatus: 'sent' },
+      });
       if (stopped) {
         fresh.status = 'assigned';
         fresh.lastError = 'Stopped by user';
+      } else if (pendingLeft > 0) {
+        fresh.status = 'assigned';
+      } else if (failedLeft > 0 && sentLeft === 0) {
+        fresh.status = 'failed';
+        fresh.lastError = 'All sends failed for this batch';
+      } else if (sentLeft > 0) {
+        fresh.status = 'completed';
+        fresh.lastError = null;
       } else {
-        fresh.status = failed > 0 && sent === 0 ? 'failed' : sent > 0 ? 'completed' : 'assigned';
-        if (failed > 0 && sent === 0) {
-          fresh.lastError = 'All sends failed for this batch';
-        }
+        fresh.status = 'assigned';
       }
       await assignmentRepo.save(fresh);
     }
-    marketingLog(mb, 'run finished', { sent, failed, stopped, total: pendingRows.length, channel });
+    marketingLog(mb, 'run finished', {
+      sent,
+      failed,
+      deferred,
+      stopped,
+      channel,
+    });
   }
 
-  return { sent, failed, stopped, total: pendingRows.length };
+  return { sent, failed, deferred, stopped, total: pendingRows.length };
 }
 
 /**
@@ -1401,10 +1935,16 @@ export async function runMarketingForAll(assignmentDate, options = {}) {
     marketingLog(null, 'released stale running assignments before start-all', { count: released });
   }
 
+  // Bring cooled-down network failures back to pending so those mailboxes are eligible.
+  await requeueRetryableNetworkFailuresForDate(date);
+
   const dashboard = await getMarketingDashboard(date, { channel });
   const enabledRows = dashboard.rows.filter((r) => r.marketingEnabled);
   const eligible = enabledRows.filter(
-    (r) => r.canAssign && (r.pendingCount || 0) > 0 && !r.running
+    (r) =>
+      r.canAssign &&
+      !r.running &&
+      ((r.pendingCount || 0) > 0 || (r.failedCount || 0) > 0)
   );
   const skipped = [];
   const batchSize = getMarketingMaxParallelMailboxes();

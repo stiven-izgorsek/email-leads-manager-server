@@ -126,7 +126,12 @@ export async function createChatCompletion(messages) {
   if (!res.ok) {
     const msg = data?.error?.message || res.statusText || 'OpenAI request failed';
     const err = new Error(msg);
-    err.status = res.status >= 400 && res.status < 500 ? 400 : 502;
+    // Preserve 401/403/429 so compose can fall back instead of failing the send.
+    if (res.status === 401 || res.status === 403 || res.status === 429) {
+      err.status = res.status;
+    } else {
+      err.status = res.status >= 400 && res.status < 500 ? 400 : 502;
+    }
     throw err;
   }
 

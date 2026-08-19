@@ -3,6 +3,7 @@ import {
   parseUnixRange,
   syncCalendarEventsFromNylas,
   softDeleteNylasCalendarEvent,
+  getEnrichedCalendarEventById,
 } from '../services/calendarSyncService.js';
 import {
   createLocalCalendarEvent,
@@ -11,6 +12,7 @@ import {
   cancelLocalOccurrence,
   parseLocalEventId,
 } from '../services/localCalendarService.js';
+import { notifyMeetingToSlackNow } from '../services/meetingReminderService.js';
 
 function validateRange(rawStart, rawEnd, res) {
   if (!Number.isFinite(rawStart) || !Number.isFinite(rawEnd)) {
@@ -205,6 +207,29 @@ export async function cancelLocalOccurrenceHandler(req, res) {
     console.error('cancelLocalOccurrence error:', error);
     const msg = error.message || 'Failed to cancel occurrence';
     const status = /Invalid|not found|required/i.test(msg) ? 400 : 500;
+    return res.status(status).json({ error: msg });
+  }
+}
+
+/** POST — immediately send meeting details to Slack (no reminder wait). */
+export async function notifyCalendarEventSlackHandler(req, res) {
+  try {
+    const rawId = decodeURIComponent(String(req.params.id || ''));
+    if (!rawId || String(rawId).startsWith('local:')) {
+      return res.status(400).json({ error: 'Slack notify is only supported for synced calendar events' });
+    }
+    const event = await getEnrichedCalendarEventById(rawId);
+    const availableRaw = req.body?.available;
+    const available =
+      availableRaw === undefined || availableRaw === null
+        ? true
+        : availableRaw === true || availableRaw === 'true' || availableRaw === 1 || availableRaw === '1';
+    await notifyMeetingToSlackNow(event, { available });
+    return res.json({ success: true, notified: true, eventId: event.id, available });
+  } catch (error) {
+    console.error('notifyCalendarEventSlack error:', error);
+    const msg = error.message || 'Failed to notify Slack';
+    const status = /not found|Invalid|not configured/i.test(msg) ? 400 : 500;
     return res.status(status).json({ error: msg });
   }
 }

@@ -2,7 +2,7 @@ import express from 'express';
 import multer from 'multer';
 import path from 'path';
 import os from 'os';
-import { getLeads, createLead, uploadLeads, bulkDeleteLeads, bulkUpdateLeads, getUncontactedLeads, getLeadFilters, markClientAsSent, markClientAsFollowedUp, checkLeadsStatus, getDashboardKPIs, resetLeadsStatus, getEmailsSentInDateRange, bulkVerifyEmails, bulkVerifyAllNew, getNewLeadsVerificationCount, getVerificationStatus, downloadNewLeadsCsv, getFollowupCandidates, getApolloMissingEmailCount, fetchApolloEmails, getApolloFetchStatus, getLeadById, updateLead, deleteLead, getLeadHistory } from '../controllers/leadController.js';
+import { getLeads, createLead, uploadLeads, getLeadUploadStatus, bulkDeleteLeads, bulkUpdateLeads, getUncontactedLeads, getLeadFilters, markClientAsSent, markClientAsFollowedUp, checkLeadsStatus, getDashboardKPIs, resetLeadsStatus, getEmailsSentInDateRange, bulkVerifyEmails, bulkVerifyAllNew, getNewLeadsVerificationCount, getVerificationStatus, downloadNewLeadsCsv, getFollowupCandidates, getApolloMissingEmailCount, fetchApolloEmails, getApolloFetchStatus, getLeadById, updateLead, deleteLead, getLeadHistory } from '../controllers/leadController.js';
 // import { authenticateToken } from '../middleware/auth.js';
 
 const router = express.Router();
@@ -29,6 +29,7 @@ router.get('/emails-date-range', getEmailsSentInDateRange);
 router.get('/followup-candidates', getFollowupCandidates);
 router.post('/', createLead);
 router.post('/upload', upload.single('file'), uploadLeads);
+router.get('/upload-status/:jobId', getLeadUploadStatus);
 router.post('/bulk-delete', bulkDeleteLeads);
 router.post('/bulk-update', bulkUpdateLeads);
 router.post('/check-status', checkLeadsStatus);

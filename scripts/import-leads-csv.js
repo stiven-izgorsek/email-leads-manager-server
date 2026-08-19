@@ -12,9 +12,11 @@ import 'reflect-metadata';
 import dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
+import { Readable } from 'stream';
 import csv from 'csv-parser';
 import { AppDataSource } from '../src/config/database.js';
 import { getFirstEmailFromCsvRow } from '../src/utils/csvLeadImport.js';
+import { decodeCsvBuffer, preferRepairedName } from '../src/utils/csvEncoding.js';
 
 dotenv.config();
 
@@ -96,9 +98,14 @@ function normalizeMillionsStatus(raw) {
 }
 
 async function readCsvRows(filePath) {
+  const fileBuffer = fs.readFileSync(filePath);
+  const { text, encoding } = decodeCsvBuffer(fileBuffer);
+  if (encoding !== 'utf-8') {
+    console.log(`Decoded CSV as ${encoding}`);
+  }
   return new Promise((resolve, reject) => {
     const rows = [];
-    fs.createReadStream(filePath)
+    Readable.from([text])
       .pipe(csv())
       .on('data', (row) => rows.push(normalizeRow(row)))
       .on('end', () => resolve(rows))

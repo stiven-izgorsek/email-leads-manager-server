@@ -205,6 +205,7 @@ async function syncAssignmentTargetCount(assignmentId) {
 
 /**
  * Clients sent from this mailbox at least `daysBefore` ago with no reply / follow-up yet.
+ * Trusts CRM `isReplied` (human reply, bounce, unsub, block) as the do-not-follow-up flag.
  * @param {object} email
  * @param {number} daysBefore
  * @param {string} assignmentDate
@@ -261,48 +262,7 @@ export async function fetchFollowupCandidateClients(email, daysBefore, assignmen
           AND fal.send_status IN ('pending', 'sent')
       )`,
       { assignmentDate }
-    )
-    .andWhere(
-      `NOT EXISTS (
-        SELECT 1 FROM incoming_message im
-        WHERE im."emailAddress" = :mailboxExact
-          AND im."deletedAt" IS NULL
-          AND im."messageType" <> 'ignored_sender'
-          AND im."messageType" <> 'hide_sender'
-          AND COALESCE(im."receivedAt", im."createdAt") > "client"."lastSent"
-          AND (
-            LOWER(COALESCE(im."fromEmail", '')) LIKE ('%' || LOWER(TRIM("client"."email")) || '%')
-            OR (
-              im."messageType" IN ('blocked', 'ooo', 'bad', 'interest', 'no_job')
-              AND (
-                LOWER(COALESCE(im."fromEmail", '')) LIKE ('%' || LOWER(TRIM("client"."email")) || '%')
-                OR LOWER(COALESCE(im."subject", '')) LIKE ('%' || LOWER(TRIM("client"."email")) || '%')
-              )
-            )
-            OR (
-              LOWER(COALESCE(im."fromEmail", '')) LIKE '%mailer-daemon%'
-              AND LOWER(COALESCE(im."subject", '')) LIKE ('%' || LOWER(TRIM("client"."email")) || '%')
-            )
-            OR (
-              LOWER(COALESCE(im."fromEmail", '')) LIKE '%postmaster%'
-              AND LOWER(COALESCE(im."subject", '')) LIKE ('%' || LOWER(TRIM("client"."email")) || '%')
-            )
-            OR (
-              im."messageType" = 'other'
-              AND LOWER(COALESCE(im."fromEmail", '')) LIKE ('%' || LOWER(TRIM("client"."email")) || '%')
-            )
-            OR (
-              im."messageType" = 'blocked'
-              AND (
-                LOWER(COALESCE(im."fromEmail", '')) LIKE '%mailer-daemon%'
-                OR LOWER(COALESCE(im."fromEmail", '')) LIKE '%postmaster%'
-                OR LOWER(COALESCE(im."fromEmail", '')) LIKE '%mail delivery%'
-              )
-            )
-          )
-      )`
-    )
-    .setParameter('mailboxExact', email.address);
+    );
 
   if (excludeClientIds.length) {
     qb.andWhere('client.id NOT IN (:...excludeClientIds)', { excludeClientIds });

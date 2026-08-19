@@ -1,4 +1,4 @@
-import { NYLAS_LIST_PAGE_LIMIT, sleep } from '../utils/nylasRateLimit.js';
+import { NYLAS_LIST_PAGE_LIMIT, sleep, nylasFetchWithRetry } from '../utils/nylasRateLimit.js';
 
 const configuredNylasRegion = (process.env.NYLAS_REGION || '').toLowerCase();
 
@@ -48,19 +48,22 @@ export async function fetchPrimaryCalendarEvents(grantId, nylasKey, startSec, en
     for (const baseUrl of baseUrls) {
       const url = `${baseUrl}${path}`;
       try {
-        const response = await fetch(url, {
-          method: 'GET',
-          headers: {
-            Authorization: `Bearer ${nylasKey}`,
-            Accept: 'application/json',
+        const { response, text } = await nylasFetchWithRetry(
+          url,
+          {
+            method: 'GET',
+            headers: {
+              Authorization: `Bearer ${nylasKey}`,
+              Accept: 'application/json',
+            },
           },
-        });
+          { label: 'nylas-cal' }
+        );
         if (response.ok) {
-          payload = await response.json();
+          payload = text ? JSON.parse(text) : null;
           lastError = null;
           break;
         }
-        const text = await response.text().catch(() => '');
         lastError = new Error(
           `Nylas events failed (${response.status}) on ${baseUrl}: ${text || response.statusText}`
         );

@@ -1,5 +1,5 @@
 import { getNylasBaseUrls } from './nylasCalendarService.js';
-import { NYLAS_LIST_PAGE_LIMIT } from '../utils/nylasRateLimit.js';
+import { NYLAS_LIST_PAGE_LIMIT, nylasFetchWithRetry } from '../utils/nylasRateLimit.js';
 
 const configuredNylasRegion = (process.env.NYLAS_REGION || '').toLowerCase();
 
@@ -24,14 +24,17 @@ export async function probeNylasGrantMessagesList(grantId, nylasKey) {
   for (const baseUrl of getNylasBaseUrls()) {
     const url = `${baseUrl}/v3/grants/${encodeURIComponent(gid)}/messages?limit=${NYLAS_LIST_PAGE_LIMIT}`;
     try {
-      const response = await fetch(url, {
-        method: 'GET',
-        headers: {
-          Authorization: `Bearer ${key}`,
-          Accept: 'application/json',
+      const { response, text } = await nylasFetchWithRetry(
+        url,
+        {
+          method: 'GET',
+          headers: {
+            Authorization: `Bearer ${key}`,
+            Accept: 'application/json',
+          },
         },
-      });
-      const text = await response.text().catch(() => '');
+        { label: 'nylas-probe' }
+      );
       if (response.ok) {
         return { ok: true, code: 'ok', httpStatus: 200, detail: '', region: baseUrl };
       }

@@ -1,7 +1,7 @@
 import { AppDataSource } from '../config/database.js';
 import { MarketingAssignmentLead } from '../entities/MarketingAssignmentLead.js';
 import { getNylasBaseUrls } from './nylasCalendarService.js';
-import { NYLAS_LIST_PAGE_LIMIT, sleep } from '../utils/nylasRateLimit.js';
+import { NYLAS_LIST_PAGE_LIMIT, sleep, nylasFetchWithRetry } from '../utils/nylasRateLimit.js';
 
 const configuredNylasRegion = (process.env.NYLAS_REGION || '').toLowerCase();
 
@@ -132,7 +132,7 @@ export async function fetchNylasMessageById(grantId, nylasKey, messageId) {
 
   for (const baseUrl of getNylasBaseUrls()) {
     try {
-      const response = await fetch(
+      const { response, text } = await nylasFetchWithRetry(
         `${baseUrl}/v3/grants/${encodeURIComponent(gid)}/messages/${encodeURIComponent(mid)}`,
         {
           method: 'GET',
@@ -140,11 +140,16 @@ export async function fetchNylasMessageById(grantId, nylasKey, messageId) {
             Authorization: `Bearer ${key}`,
             Accept: 'application/json',
           },
-        }
+        },
+        { label: 'nylas-msg' }
       );
       if (response.ok) {
-        const payload = await response.json();
-        return payload?.data || payload;
+        try {
+          const payload = text ? JSON.parse(text) : null;
+          return payload?.data || payload;
+        } catch {
+          return null;
+        }
       }
       if (response.status === 401 && configuredNylasRegion) break;
     } catch {
@@ -183,18 +188,22 @@ async function findNylasOutboundToLead({ grantId, nylasKey, mailboxAddress, lead
       const url = `${baseUrl}/v3/grants/${encodeURIComponent(grantId)}/messages?${params.toString()}`;
       let payload = null;
       try {
-        const response = await fetch(url, {
-          method: 'GET',
-          headers: {
-            Authorization: `Bearer ${nylasKey}`,
-            Accept: 'application/json',
+        const { response, text } = await nylasFetchWithRetry(
+          url,
+          {
+            method: 'GET',
+            headers: {
+              Authorization: `Bearer ${nylasKey}`,
+              Accept: 'application/json',
+            },
           },
-        });
+          { label: 'nylas-search' }
+        );
         if (!response.ok) {
           if (response.status === 401 && configuredNylasRegion) break;
           continue;
         }
-        payload = await response.json();
+        payload = text ? JSON.parse(text) : null;
       } catch {
         continue;
       }

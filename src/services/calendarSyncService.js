@@ -1,8 +1,11 @@
 import { AppDataSource } from '../config/database.js';
 import { Email } from '../entities/Email.js';
+import { Account } from '../entities/Account.js';
+import { Client } from '../entities/Client.js';
 import { CalendarEvent } from '../entities/CalendarEvent.js';
 import { CrmClient } from '../entities/CrmClient.js';
 import { serializeCrmClient } from '../controllers/crmClientController.js';
+import { sanitizeAiMarkerInName, serializeClientLeadForApi } from '../utils/leadNameSanitize.js';
 import {
   fetchPrimaryCalendarEvents,
   parseEventWhen,
@@ -82,17 +85,228 @@ function collectEmailsFromStoredRow(row) {
   return Array.from(set).filter(Boolean);
 }
 
-async function loadCrmClientMap(emails) {
-  if (!emails.size) return new Map();
-  const crmRepo = AppDataSource.getRepository(CrmClient);
+function serializeLeadSnapshot(lead) {
+  if (!lead) return null;
+  const row = serializeClientLeadForApi({
+    id: lead.id,
+    email: lead.email,
+    firstName: lead.firstName,
+    lastName: lead.lastName,
+    companyName: lead.companyName,
+    companyUrl: lead.companyUrl,
+    companyLocation: lead.companyLocation,
+    location: lead.location,
+    jobTitle: lead.jobTitle,
+    linkedin: lead.linkedin,
+    industries: lead.industries,
+    tech: lead.tech,
+    photoUrl: lead.photoUrl,
+    status: lead.status,
+    note: lead.note || null,
+  });
+  return row;
+}
+
+function serializeAccountSnapshot(account, mailboxEmail = null) {
+  if (!account) return null;
+  const firstName = sanitizeAiMarkerInName(account.firstName);
+  const lastName = sanitizeAiMarkerInName(account.lastName);
+  const name = [firstName, lastName].filter(Boolean).join(' ').trim() || null;
+  return {
+    id: account.id,
+    firstName,
+    lastName,
+    name,
+    cv: account.cv || null,
+    linkedin: account.linkedin || null,
+    country: account.country || null,
+    mailboxEmail: mailboxEmail || null,
+  };
+}
+
+/**
+ * Map contact email → { crmClient, lead, account } for calendar enrichment.
+ * Looks up CRM clients and leads by email; resolves Account via sentByAccount mailbox.
+ */
+async function loadContactEnrichmentMap(emails) {
+  const map = new Map();
+  if (!emails.size) return map;
   const list = Array.from(emails);
+
+  const crmRepo = AppDataSource.getRepository(CrmClient);
+  const leadRepo = AppDataSource.getRepository(Client);
+  const emailRepo = AppDataSource.getRepository(Email);
+  const accountRepo = AppDataSource.getRepository(Account);
+
   const clients = await crmRepo
     .createQueryBuilder('c')
-    .where('LOWER(c.email) IN (:...emails)', { emails: list })
+    .where('c.deletedAt IS NULL')
+    .andWhere('LOWER(TRIM(c.email)) IN (:...emails)', { emails: list })
     .getMany();
-  return new Map(
-    clients.map((c) => [String(c.email).trim().toLowerCase(), serializeCrmClient(c)])
+
+  for (const c of clients) {
+    const em = String(c.email || '')
+      .trim()
+      .toLowerCase();
+    if (!em) continue;
+    map.set(em, {
+      crmClient: serializeCrmClient(c),
+      lead: null,
+      account: null,
+      _leadId: c.leadId || null,
+      _sentBy: c.sentByAccount || null,
+    });
+  }
+
+  const leadsByEmail = await leadRepo
+    .createQueryBuilder('l')
+    .where('l.deletedAt IS NULL')
+    .andWhere('LOWER(TRIM(l.email)) IN (:...emails)', { emails: list })
+    .getMany();
+
+  for (const lead of leadsByEmail) {
+    const em = String(lead.email || '')
+      .trim()
+      .toLowerCase();
+    if (!em) continue;
+    const existing = map.get(em) || {
+      crmClient: null,
+      lead: null,
+      account: null,
+      _leadId: null,
+      _sentBy: null,
+    };
+    if (!existing.lead) existing.lead = serializeLeadSnapshot(lead);
+    if (!existing._leadId) existing._leadId = lead.id;
+    map.set(em, existing);
+  }
+
+  const leadIds = Array.from(
+    new Set(
+      Array.from(map.values())
+        .map((v) => v._leadId)
+        .filter(Boolean)
+    )
   );
+  if (leadIds.length) {
+    const leadsById = await leadRepo
+      .createQueryBuilder('l')
+      .where('l.deletedAt IS NULL')
+      .andWhere('l.id IN (:...ids)', { ids: leadIds })
+      .getMany();
+    const byId = new Map(leadsById.map((l) => [l.id, l]));
+    for (const entry of map.values()) {
+      if (entry.lead || !entry._leadId) continue;
+      const lead = byId.get(entry._leadId);
+      if (lead) entry.lead = serializeLeadSnapshot(lead);
+    }
+  }
+
+  const sentByKeys = Array.from(
+    new Set(
+      [
+        ...Array.from(map.values()).map((v) =>
+          v._sentBy ? String(v._sentBy).trim().toLowerCase() : ''
+        ),
+      ].filter(Boolean)
+    )
+  );
+
+  /** mailbox email → account snapshot */
+  const accountByMailbox = new Map();
+  if (sentByKeys.length) {
+    const mailboxes = await emailRepo
+      .createQueryBuilder('e')
+      .where('e.deletedAt IS NULL')
+      .andWhere('LOWER(TRIM(e.address)) IN (:...addrs)', { addrs: sentByKeys })
+      .getMany();
+
+    const accountIds = Array.from(
+      new Set(mailboxes.map((m) => m.accountId).filter(Boolean))
+    );
+    const accounts = accountIds.length
+      ? await accountRepo
+          .createQueryBuilder('a')
+          .where('a.deletedAt IS NULL')
+          .andWhere('a.id IN (:...ids)', { ids: accountIds })
+          .getMany()
+      : [];
+    const accountById = new Map(accounts.map((a) => [a.id, a]));
+
+    for (const mb of mailboxes) {
+      const key = String(mb.address || '')
+        .trim()
+        .toLowerCase();
+      if (!key) continue;
+      const acc = mb.accountId ? accountById.get(mb.accountId) : null;
+      accountByMailbox.set(key, serializeAccountSnapshot(acc, mb.address));
+    }
+  }
+
+  for (const entry of map.values()) {
+    const sentKey = entry._sentBy ? String(entry._sentBy).trim().toLowerCase() : '';
+    if (sentKey && accountByMailbox.has(sentKey)) {
+      entry.account = accountByMailbox.get(sentKey);
+    }
+    delete entry._leadId;
+    delete entry._sentBy;
+  }
+
+  return map;
+}
+
+/** Resolve Account for a mailbox address (event mailbox fallback). */
+async function loadAccountByMailboxEmails(mailboxEmails) {
+  const result = new Map();
+  const list = Array.from(mailboxEmails).filter(Boolean);
+  if (!list.length) return result;
+
+  const emailRepo = AppDataSource.getRepository(Email);
+  const accountRepo = AppDataSource.getRepository(Account);
+  const mailboxes = await emailRepo
+    .createQueryBuilder('e')
+    .where('e.deletedAt IS NULL')
+    .andWhere('LOWER(TRIM(e.address)) IN (:...addrs)', { addrs: list })
+    .getMany();
+
+  const accountIds = Array.from(new Set(mailboxes.map((m) => m.accountId).filter(Boolean)));
+  const accounts = accountIds.length
+    ? await accountRepo
+        .createQueryBuilder('a')
+        .where('a.deletedAt IS NULL')
+        .andWhere('a.id IN (:...ids)', { ids: accountIds })
+        .getMany()
+    : [];
+  const accountById = new Map(accounts.map((a) => [a.id, a]));
+
+  for (const mb of mailboxes) {
+    const key = String(mb.address || '')
+      .trim()
+      .toLowerCase();
+    if (!key) continue;
+    const acc = mb.accountId ? accountById.get(mb.accountId) : null;
+    result.set(key, serializeAccountSnapshot(acc, mb.address));
+  }
+  return result;
+}
+
+function enrichContactFromMap(email, contactByEmail, mailboxAccount = null) {
+  const em = email ? String(email).trim().toLowerCase() : '';
+  if (!em) return null;
+  const hit = contactByEmail.get(em);
+  if (!hit && !mailboxAccount) return null;
+  return {
+    email: em,
+    crmClient: hit?.crmClient
+      ? {
+          ...hit.crmClient,
+          lead: hit.lead || hit.crmClient.lead || null,
+          account: hit.account || mailboxAccount || null,
+        }
+      : null,
+    lead: hit?.lead || null,
+    account: hit?.account || mailboxAccount || null,
+  };
 }
 
 function normalizeEmailIds(emailId, emailIds) {
@@ -161,33 +375,69 @@ function mapNylasEventToRow(ev, mailbox, whenParsed, syncedAt) {
   };
 }
 
-function enrichParticipant(p, clientByEmail) {
+function enrichParticipant(p, contactByEmail, mailboxAccount = null) {
   const em = p?.email ? String(p.email).trim().toLowerCase() : '';
+  const contact = enrichContactFromMap(em, contactByEmail, mailboxAccount);
   return {
     email: p?.email || '',
     name: p?.name || null,
     status: p?.status || null,
-    crmClient: em ? clientByEmail.get(em) || null : null,
+    crmClient: contact?.crmClient || null,
+    lead: contact?.lead || null,
+    account: contact?.account || null,
   };
 }
 
-function rowToApiEvent(row, clientByEmail) {
+function rowToApiEvent(row, contactByEmail, mailboxAccountByEmail = new Map()) {
+  const mailboxKey = row.mailboxEmail
+    ? String(row.mailboxEmail).trim().toLowerCase()
+    : '';
+  const mailboxAccount = mailboxKey ? mailboxAccountByEmail.get(mailboxKey) || null : null;
+
   const participants = Array.isArray(row.participantsJson) ? row.participantsJson : [];
-  const enrichedParticipants = participants.map((p) => enrichParticipant(p, clientByEmail));
+  const enrichedParticipants = participants.map((p) =>
+    enrichParticipant(p, contactByEmail, mailboxAccount)
+  );
 
   const orgEmail = row.organizerEmail ? String(row.organizerEmail).trim().toLowerCase() : '';
-  const organizerClient = orgEmail ? clientByEmail.get(orgEmail) || null : null;
+  const organizerContact = enrichContactFromMap(orgEmail, contactByEmail, mailboxAccount);
 
   const linkedClients = [];
+  const linkedContacts = [];
   const seenId = new Set();
-  for (const p of enrichedParticipants) {
-    if (p.crmClient?.id && !seenId.has(p.crmClient.id)) {
-      seenId.add(p.crmClient.id);
-      linkedClients.push(p.crmClient);
+  const seenEmail = new Set();
+
+  const pushContact = (contact, displayName = null) => {
+    if (!contact?.email || seenEmail.has(contact.email)) return;
+    // Prefer contacts that have CRM or lead data (skip empty enrichments that only have mailbox account)
+    if (!contact.crmClient && !contact.lead) return;
+    seenEmail.add(contact.email);
+    linkedContacts.push({
+      email: contact.email,
+      name: displayName || null,
+      crmClient: contact.crmClient,
+      lead: contact.lead,
+      account: contact.account,
+    });
+    if (contact.crmClient?.id && !seenId.has(contact.crmClient.id)) {
+      seenId.add(contact.crmClient.id);
+      linkedClients.push(contact.crmClient);
     }
+  };
+
+  if (organizerContact) {
+    pushContact(organizerContact, row.organizerName || null);
   }
-  if (organizerClient?.id && !seenId.has(organizerClient.id)) {
-    linkedClients.push(organizerClient);
+  for (const p of enrichedParticipants) {
+    pushContact(
+      {
+        email: p.email ? String(p.email).trim().toLowerCase() : '',
+        crmClient: p.crmClient,
+        lead: p.lead,
+        account: p.account,
+      },
+      p.name || null
+    );
   }
 
   return {
@@ -211,11 +461,15 @@ function rowToApiEvent(row, clientByEmail) {
       ? {
           name: row.organizerName,
           email: row.organizerEmail,
-          crmClient: organizerClient,
+          crmClient: organizerContact?.crmClient || null,
+          lead: organizerContact?.lead || null,
+          account: organizerContact?.account || null,
         }
       : null,
     participants: enrichedParticipants,
     linkedClients,
+    linkedContacts,
+    mailboxAccount: mailboxAccount || null,
   };
 }
 
@@ -328,14 +582,19 @@ export async function listCalendarEventsFromDb({ startSec, endSec, emailId, emai
   const rows = await qb.orderBy('ce.start_at', 'ASC').getMany();
 
   const allEmails = new Set();
+  const mailboxEmails = new Set();
   for (const row of rows) {
     for (const em of collectEmailsFromStoredRow(row)) {
       allEmails.add(em);
     }
+    if (row.mailboxEmail) {
+      mailboxEmails.add(String(row.mailboxEmail).trim().toLowerCase());
+    }
   }
-  const clientByEmail = await loadCrmClientMap(allEmails);
+  const contactByEmail = await loadContactEnrichmentMap(allEmails);
+  const mailboxAccountByEmail = await loadAccountByMailboxEmails(mailboxEmails);
 
-  const events = rows.map((row) => rowToApiEvent(row, clientByEmail));
+  const events = rows.map((row) => rowToApiEvent(row, contactByEmail, mailboxAccountByEmail));
 
   const localEvents = await listExpandedLocalEvents({
     startSec,
@@ -388,6 +647,39 @@ export async function softDeleteNylasCalendarEvent(apiId) {
 
   await eventRepo.update({ id: existing.id }, { deletedAt: new Date() });
   return { deleted: true, source: 'nylas' };
+}
+
+/**
+ * Load a single enriched calendar event by API id (`emailId:nylasEventId`).
+ */
+export async function getEnrichedCalendarEventById(apiId) {
+  const raw = String(apiId || '').trim();
+  const sep = raw.indexOf(':');
+  if (sep <= 0 || sep >= raw.length - 1) {
+    throw new Error('Invalid event id');
+  }
+  const emailId = raw.slice(0, sep);
+  const nylasEventId = raw.slice(sep + 1);
+  if (!emailId || !nylasEventId) {
+    throw new Error('Invalid event id');
+  }
+
+  const eventRepo = AppDataSource.getRepository(CalendarEvent);
+  const row = await eventRepo.findOne({
+    where: { emailId, nylasEventId },
+  });
+  if (!row || row.deletedAt) {
+    throw new Error('Event not found');
+  }
+
+  const allEmails = new Set(collectEmailsFromStoredRow(row));
+  const mailboxEmails = new Set();
+  if (row.mailboxEmail) {
+    mailboxEmails.add(String(row.mailboxEmail).trim().toLowerCase());
+  }
+  const contactByEmail = await loadContactEnrichmentMap(allEmails);
+  const mailboxAccountByEmail = await loadAccountByMailboxEmails(mailboxEmails);
+  return rowToApiEvent(row, contactByEmail, mailboxAccountByEmail);
 }
 
 /** Hourly job: sync default window for all mailboxes. */

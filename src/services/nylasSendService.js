@@ -1,5 +1,6 @@
 import { getNylasBaseUrls } from './nylasCalendarService.js';
 import { formatEmailBodyForHtmlSend } from '../utils/emailBodyHtml.js';
+import { nylasFetchWithRetry } from '../utils/nylasRateLimit.js';
 
 const configuredNylasRegion = (process.env.NYLAS_REGION || '').toLowerCase();
 
@@ -99,16 +100,19 @@ export async function sendNylasEmail({
   for (const baseUrl of getNylasBaseUrls()) {
     const url = `${baseUrl}/v3/grants/${encodeURIComponent(gid)}/messages/send`;
     try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${key}`,
-          Accept: 'application/json',
-          'Content-Type': 'application/json',
+      const { response, text, attempt } = await nylasFetchWithRetry(
+        url,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${key}`,
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(payload),
         },
-        body: JSON.stringify(payload),
-      });
-      const text = await response.text().catch(() => '');
+        { label: 'nylas-send' }
+      );
       if (response.ok) {
         let messageId = null;
         try {
@@ -117,7 +121,13 @@ export async function sendNylasEmail({
         } catch {
           // ignore parse
         }
-        nylasSendLog('success', { to: toSummary, httpStatus: response.status, messageId, baseUrl });
+        nylasSendLog('success', {
+          to: toSummary,
+          httpStatus: response.status,
+          messageId,
+          baseUrl,
+          attempt,
+        });
         return { ok: true, messageId, httpStatus: response.status };
       }
       last = { status: response.status, text };
@@ -125,6 +135,7 @@ export async function sendNylasEmail({
         to: toSummary,
         baseUrl,
         httpStatus: response.status,
+        attempt,
         bodyPreview: text.slice(0, 300),
       });
       if (response.status === 401 && configuredNylasRegion) break;

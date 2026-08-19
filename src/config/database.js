@@ -28,6 +28,7 @@ import {
   CalendarEventSchema,
   CalendarEventLocalSchema,
   CalendarEventLocalExceptionSchema,
+  CalendarSlackNotificationSchema,
   ApolloAccountSchema,
   MarketingDomainBlockAlertSchema,
 } from '../entities/index.js';
@@ -70,6 +71,7 @@ export const AppDataSource = new DataSource({
     CalendarEventSchema,
     CalendarEventLocalSchema,
     CalendarEventLocalExceptionSchema,
+    CalendarSlackNotificationSchema,
     ApolloAccountSchema,
     MarketingDomainBlockAlertSchema,
   ],

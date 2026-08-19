@@ -9,6 +9,17 @@ function smtpSendLog(message, extra) {
   console.log(`[smtp-send] ${new Date().toISOString()} ${message}${suffix}`);
 }
 
+/**
+ * Master switch for Google App Password features (SMTP marketing, IMAP polling).
+ * Default OFF — set APP_PASSWORD_FEATURES_ENABLED=true to re-enable.
+ */
+export function isAppPasswordFeaturesEnabled() {
+  const v = String(process.env.APP_PASSWORD_FEATURES_ENABLED ?? 'false')
+    .trim()
+    .toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes' || v === 'on';
+}
+
 const SMTP_ENDPOINTS = [
   // Prefer submission port — less often blocked than SMTPS 465.
   { host: 'smtp.gmail.com', port: 587, secure: false, requireTLS: true },
@@ -46,6 +57,14 @@ export async function sendSmtpEmail({
   inReplyTo,
   references,
 }) {
+  if (!isAppPasswordFeaturesEnabled()) {
+    return {
+      ok: false,
+      error:
+        'App Password / SMTP features are temporarily disabled (APP_PASSWORD_FEATURES_ENABLED=false)',
+    };
+  }
+
   const user = String(fromEmail || '').trim();
   const pass = String(appPassword || '').trim();
   const to = String(toEmail || '').trim();
@@ -99,5 +118,6 @@ export async function sendSmtpEmail({
 }
 
 export function hasAppPasswordCredentials(emailRow) {
+  if (!isAppPasswordFeaturesEnabled()) return false;
   return Boolean(String(emailRow?.appPassword || '').trim() && String(emailRow?.address || '').trim());
 }

@@ -17,6 +17,7 @@ import {
 import { countOutboundEmailsInRange } from '../services/outboundEmailStatsService.js';
 import { leadsToCsv } from '../utils/csvExport.js';
 import { getFirstEmailFromCsvRow } from '../utils/csvLeadImport.js';
+import { decodeCsvBuffer, preferRepairedName, repairImportedText } from '../utils/csvEncoding.js';
 import {
   formatUncontactedLeadForExtension,
   sanitizeAiMarkerInName,
@@ -35,6 +36,9 @@ import {
 import { ApolloAccount } from '../entities/ApolloAccount.js';
 import { bulkEnrichPeopleByLinkedIn } from '../services/apolloEnrichmentService.js';
 import { serializeCrmClient } from './crmClientController.js';
+
+/** In-memory progress for async lead CSV uploads (polled by the upload UI). */
+const leadUploadJobs = new Map();
 
 function parseLocationFilter(query) {
   const raw = query.location;
@@ -333,11 +337,64 @@ export async function uploadLeads(req, res) {
       return res.status(400).json({ error: 'No file uploaded' });
     }
 
+    const jobId = `upload_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+    const job = {
+      jobId,
+      status: 'processing',
+      phase: 'queued',
+      message: 'Upload received — starting import…',
+      percent: 1,
+      processed: 0,
+      total: 0,
+      created: 0,
+      updated: 0,
+      errorCount: 0,
+      errors: undefined,
+      startTime: new Date(),
+      endTime: null,
+    };
+    leadUploadJobs.set(jobId, job);
+
+    // Return immediately so the UI can poll progress (avoids gateway timeouts on large CSVs).
+    res.status(202).json({
+      success: true,
+      jobId,
+      status: 'processing',
+      message: job.message,
+    });
+
+    const failJob = (message) => {
+      const j = leadUploadJobs.get(jobId);
+      if (!j) return;
+      j.status = 'error';
+      j.phase = 'error';
+      j.message = message;
+      j.percent = 100;
+      j.endTime = new Date();
+    };
+
+    const patchJob = (patch) => {
+      const j = leadUploadJobs.get(jobId);
+      if (!j || j.status === 'error') return;
+      Object.assign(j, patch);
+    };
+
+    try {
     const clientRepository = AppDataSource.getRepository(Client);
     const leadFilterRepository = AppDataSource.getRepository(LeadFilter);
     const results = [];
     const errors = [];
     let processed = 0;
+
+    // Counters for each skip/error reason category shown in the UI
+    const skipCounts = {
+      duplicate: 0,      // lead already exists (no update needed)
+      noEmail: 0,        // email missing / LinkedIn required
+      lowerTitle: 0,     // same company has higher-priority title
+      parseError: 0,     // row-level parse / save exception
+    };
+
+    patchJob({ phase: 'preparing', message: 'Preparing lead filter…', percent: 3 });
 
     // Parse LeadFilter from request if provided
     let leadFilterId = null;
@@ -386,14 +443,20 @@ export async function uploadLeads(req, res) {
     const fileExtension = path.extname(req.file.originalname).toLowerCase().slice(1);
     const rows = [];
 
+    patchJob({ phase: 'parsing', message: 'Reading and parsing file…', percent: 8 });
+
     if (fileExtension === 'csv') {
-      // Parse CSV
-      const fileContent = await fs.readFile(filePath, 'utf-8');
-      const lines = fileContent.split('\n').filter(line => line.trim());
+      // Parse CSV — detect encoding (Excel often exports Windows-1250/1252, not UTF-8)
+      const fileBuffer = await fs.readFile(filePath);
+      const { text: fileContent, encoding: csvEncoding } = decodeCsvBuffer(fileBuffer);
+      if (csvEncoding !== 'utf-8') {
+        console.log(`[uploadLeads] Decoded CSV as ${csvEncoding}`);
+      }
+      const lines = fileContent.split(/\r?\n/).filter(line => line.trim());
 
       if (lines.length < 2) {
         await fs.unlink(filePath).catch(() => {});
-        return res.status(400).json({ error: 'CSV file must have at least a header and one data row' });
+        return failJob('CSV file must have at least a header and one data row');
       }
 
       // Parse CSV (handle quoted values)
@@ -431,6 +494,15 @@ export async function uploadLeads(req, res) {
           }
         });
         rows.push(row);
+        if (i % 500 === 0 || i === lines.length - 1) {
+          const parsePct = 8 + Math.round((i / Math.max(1, lines.length - 1)) * 12);
+          patchJob({
+            phase: 'parsing',
+            message: `Parsing CSV rows… ${i}/${lines.length - 1}`,
+            percent: Math.min(20, parsePct),
+            total: lines.length - 1,
+          });
+        }
       }
     } else if (fileExtension === 'xlsx' || fileExtension === 'xls') {
       // Parse XLSX/XLS
@@ -442,7 +514,7 @@ export async function uploadLeads(req, res) {
 
         if (data.length < 2) {
           await fs.unlink(filePath).catch(() => {});
-          return res.status(400).json({ error: 'Excel file must have at least a header and one data row' });
+          return failJob('Excel file must have at least a header and one data row');
         }
 
         const headers = data[0].map(h => String(h).toLowerCase().replace(/\s+/g, ''));
@@ -457,13 +529,19 @@ export async function uploadLeads(req, res) {
           });
           rows.push(row);
         }
+        patchJob({
+          phase: 'parsing',
+          message: `Parsed ${rows.length} Excel rows`,
+          percent: 20,
+          total: rows.length,
+        });
       } catch (error) {
         await fs.unlink(filePath).catch(() => {});
-        return res.status(400).json({ error: `Error parsing Excel file: ${error.message}` });
+        return failJob(`Error parsing Excel file: ${error.message}`);
       }
     } else {
       await fs.unlink(filePath).catch(() => {});
-      return res.status(400).json({ error: 'Unsupported file format. Please use CSV, XLSX, or XLS.' });
+      return failJob('Unsupported file format. Please use CSV, XLSX, or XLS.');
     }
 
     // Helper function to get field value from multiple possible column names
@@ -521,6 +599,12 @@ export async function uploadLeads(req, res) {
     }
 
     // Pass 1: parse rows into candidates
+    patchJob({
+      phase: 'mapping',
+      message: `Mapping ${rows.length} rows…`,
+      percent: 22,
+      total: rows.length,
+    });
     const candidates = [];
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i];
@@ -549,14 +633,17 @@ export async function uploadLeads(req, res) {
 
         if (!email) {
           if (!allowMissingEmail) {
-            errors.push({ row: i + 2, error: 'Email is required' });
+            errors.push({ row: i + 2, error: 'Email is required', reason: 'noEmail' });
+            skipCounts.noEmail++;
             continue;
           }
           if (!linkedinUrl) {
             errors.push({
               row: i + 2,
               error: 'LinkedIn URL is required when uploading Apollo leads without email',
+              reason: 'noEmail',
             });
+            skipCounts.noEmail++;
             continue;
           }
         }
@@ -676,15 +763,15 @@ export async function uploadLeads(req, res) {
 
         const clientData = {
           email: email || null,
-          firstName: sanitizeAiMarkerInName(firstName) || null,
-          lastName: sanitizeAiMarkerInName(lastName) || null,
-          companyName: sanitizeAiMarkerInName(companyName) || null,
+          firstName: sanitizeAiMarkerInName(repairImportedText(firstName)) || null,
+          lastName: sanitizeAiMarkerInName(repairImportedText(lastName)) || null,
+          companyName: sanitizeAiMarkerInName(repairImportedText(companyName)) || null,
           companyUrl: companyUrl || null,
           companyLinkedin: companyLinkedin || null,
           linkedin: linkedinUrl || null,
-          jobTitle: jobTitle || null,
-          location: location || null,
-          companyLocation: companyLocation || null,
+          jobTitle: repairImportedText(jobTitle) || null,
+          location: repairImportedText(location) || null,
+          companyLocation: repairImportedText(companyLocation) || null,
           status: getField(row, 'status') || 'new',
           contactedBy: (() => {
             const value = getField(row, 'assignedto', 'assigned_to', 'contactedby', 'contacted_by');
@@ -716,11 +803,29 @@ export async function uploadLeads(req, res) {
           clientData,
         });
       } catch (error) {
-        errors.push({ row: i + 2, error: error.message });
+        errors.push({ row: i + 2, error: error.message, reason: 'parseError' });
+        skipCounts.parseError++;
+      }
+
+      if (i % 200 === 0 || i === rows.length - 1) {
+        const mapPct = 22 + Math.round(((i + 1) / Math.max(1, rows.length)) * 18);
+        patchJob({
+          phase: 'mapping',
+          message: `Mapping rows… ${i + 1}/${rows.length}`,
+          percent: Math.min(40, mapPct),
+          processed: i + 1,
+          total: rows.length,
+          errorCount: errors.length,
+        });
       }
     }
 
     // Pass 2: keep only highest-priority title per company LinkedIn URL (CEO > CTO, etc.)
+    patchJob({
+      phase: 'deduping',
+      message: 'Deduplicating by company…',
+      percent: 42,
+    });
     const { winners, skipped } = pickBestLeadPerCompany(candidates);
     for (const { candidate, kept } of skipped) {
       const keptTitle = kept.clientData.jobTitle || 'higher-priority title';
@@ -729,7 +834,9 @@ export async function uploadLeads(req, res) {
         email: candidate.clientData.email || undefined,
         linkedin: candidate.clientData.linkedin || undefined,
         error: `Skipped: same company already has ${keptTitle} (prefer CEO over other roles)`,
+        reason: 'lowerTitle',
       });
+      skipCounts.lowerTitle++;
     }
 
     async function findExistingAtCompany(companyLinkedin) {
@@ -745,7 +852,16 @@ export async function uploadLeads(req, res) {
     }
 
     // Pass 3: insert / update winners
-    for (const candidate of winners) {
+    patchJob({
+      phase: 'importing',
+      message: `Importing ${winners.length} leads…`,
+      percent: 45,
+      processed: 0,
+      total: winners.length,
+      errorCount: errors.length,
+    });
+    for (let wi = 0; wi < winners.length; wi++) {
+      const candidate = winners[wi];
       const { rowIndex: i, clientData, titlePriority } = candidate;
 
       try {
@@ -772,7 +888,9 @@ export async function uploadLeads(req, res) {
               email: clientData.email || undefined,
               linkedin: clientData.linkedin || undefined,
               error: `Skipped: company already has ${betterOrEqual.jobTitle || 'a lead'} on platform (prefer CEO over other roles)`,
+              reason: 'lowerTitle',
             });
+            skipCounts.lowerTitle++;
             continue;
           }
         }
@@ -791,12 +909,71 @@ export async function uploadLeads(req, res) {
           if (!existing.firstName && clientData.firstName) {
             updateData.firstName = clientData.firstName;
             needsUpdate = true;
+          } else {
+            const repairedFirst = preferRepairedName(existing.firstName, clientData.firstName);
+            if (repairedFirst) {
+              updateData.firstName = repairedFirst;
+              needsUpdate = true;
+            }
           }
 
           // Update lastName if it's missing in DB but present in upload
           if (!existing.lastName && clientData.lastName) {
             updateData.lastName = clientData.lastName;
             needsUpdate = true;
+          } else {
+            const repairedLast = preferRepairedName(existing.lastName, clientData.lastName);
+            if (repairedLast) {
+              updateData.lastName = repairedLast;
+              needsUpdate = true;
+            }
+          }
+
+          if (!existing.companyName && clientData.companyName) {
+            updateData.companyName = clientData.companyName;
+            needsUpdate = true;
+          } else {
+            const repairedCompany = preferRepairedName(existing.companyName, clientData.companyName);
+            if (repairedCompany) {
+              updateData.companyName = repairedCompany;
+              needsUpdate = true;
+            }
+          }
+
+          if (!existing.jobTitle && clientData.jobTitle) {
+            updateData.jobTitle = clientData.jobTitle;
+            needsUpdate = true;
+          } else {
+            const repairedTitle = preferRepairedName(existing.jobTitle, clientData.jobTitle);
+            if (repairedTitle) {
+              updateData.jobTitle = repairedTitle;
+              needsUpdate = true;
+            }
+          }
+
+          if (!existing.location && clientData.location) {
+            updateData.location = clientData.location;
+            needsUpdate = true;
+          } else {
+            const repairedLocation = preferRepairedName(existing.location, clientData.location);
+            if (repairedLocation) {
+              updateData.location = repairedLocation;
+              needsUpdate = true;
+            }
+          }
+
+          if (!existing.companyLocation && clientData.companyLocation) {
+            updateData.companyLocation = clientData.companyLocation;
+            needsUpdate = true;
+          } else {
+            const repairedCompanyLocation = preferRepairedName(
+              existing.companyLocation,
+              clientData.companyLocation
+            );
+            if (repairedCompanyLocation) {
+              updateData.companyLocation = repairedCompanyLocation;
+              needsUpdate = true;
+            }
           }
 
           if (!existing.templateIndustry && clientData.templateIndustry) {
@@ -838,11 +1015,28 @@ export async function uploadLeads(req, res) {
               email: clientData.email || undefined,
               linkedin: clientData.linkedin || undefined,
               error: 'Lead already exists',
+              reason: 'duplicate',
             });
+            skipCounts.duplicate++;
           }
         }
       } catch (error) {
-        errors.push({ row: i + 2, error: error.message });
+        errors.push({ row: i + 2, error: error.message, reason: 'parseError' });
+        skipCounts.parseError++;
+      }
+
+      if (wi % 25 === 0 || wi === winners.length - 1) {
+        const importPct = 45 + Math.round(((wi + 1) / Math.max(1, winners.length)) * 50);
+        patchJob({
+          phase: 'importing',
+          message: `Importing leads… ${wi + 1}/${winners.length}`,
+          percent: Math.min(95, importPct),
+          processed: wi + 1,
+          total: winners.length,
+          created: results.length,
+          errorCount: errors.length,
+          skipCounts: { ...skipCounts },
+        });
       }
     }
 
@@ -853,14 +1047,58 @@ export async function uploadLeads(req, res) {
       console.error('Error deleting temp file:', err);
     }
 
-    res.json({
-      success: true,
-      processed,
+    // Build human-readable breakdown for the done message
+    const skipParts = [];
+    if (skipCounts.duplicate)  skipParts.push(`${skipCounts.duplicate} duplicate`);
+    if (skipCounts.lowerTitle) skipParts.push(`${skipCounts.lowerTitle} lower-title`);
+    if (skipCounts.noEmail)    skipParts.push(`${skipCounts.noEmail} no-email`);
+    if (skipCounts.parseError) skipParts.push(`${skipCounts.parseError} error`);
+    const skipSummary = skipParts.length ? ` · ${skipParts.join(' · ')}` : '';
+
+    patchJob({
+      status: 'completed',
+      phase: 'completed',
+      message: `Done — ${results.length} saved${skipSummary}`,
+      percent: 100,
+      processed: winners.length,
+      total: winners.length,
       created: results.length,
-      errors: errors.length > 0 ? errors : undefined,
+      errorCount: errors.length,
+      skipCounts: { ...skipCounts },
+      errors: errors.length > 0 ? errors.slice(0, 100) : undefined,
+      endTime: new Date(),
     });
+    } catch (innerError) {
+      console.error('Upload leads job error:', innerError);
+      failJob(innerError?.message || 'Internal server error');
+      try {
+        if (req.file?.path) await fs.unlink(req.file.path);
+      } catch {
+        // ignore cleanup errors
+      }
+    }
   } catch (error) {
     console.error('Upload leads error:', error);
+    // Only reached if we failed before sending 202
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  }
+}
+
+export async function getLeadUploadStatus(req, res) {
+  try {
+    const { jobId } = req.params;
+    if (!jobId) {
+      return res.status(400).json({ error: 'jobId is required' });
+    }
+    const job = leadUploadJobs.get(jobId);
+    if (!job) {
+      return res.status(404).json({ error: 'Upload job not found' });
+    }
+    res.json(job);
+  } catch (error) {
+    console.error('Get lead upload status error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 }
@@ -1162,8 +1400,16 @@ export async function getLeadHistory(req, res) {
       return String(a.accountEmail || '').localeCompare(String(b.accountEmail || ''));
     });
 
+    let leadFilter = null;
+    if (lead.leadFilterId) {
+      leadFilter = await AppDataSource.getRepository(LeadFilter).findOne({
+        where: { id: lead.leadFilterId },
+      });
+    }
+
     res.json({
       lead: serializeClientLeadForApi(lead),
+      leadFilter,
       accounts,
     });
   } catch (error) {
@@ -1666,6 +1912,20 @@ function parseIncludeErrorFlag(value) {
   return value === true || value === 'true' || value === '1' || value === 1;
 }
 
+function parseLeadFilterOptions(source) {
+  if (!source) return { leadFilterIds: [], leadFilterMode: 'include' };
+  let ids = source.leadFilterIds;
+  if (typeof ids === 'string') {
+    ids = ids.split(',').map((id) => id.trim()).filter(Boolean);
+  } else if (Array.isArray(ids)) {
+    ids = ids.map((id) => String(id).trim()).filter(Boolean);
+  } else {
+    ids = [];
+  }
+  const leadFilterMode = source.leadFilterMode === 'exclude' ? 'exclude' : 'include';
+  return { leadFilterIds: ids, leadFilterMode };
+}
+
 function isNewLeadEligibleForMillionsVerify(client, includeError = false) {
   if (!client.email || String(client.email).trim() === '') return false;
   const millionsStatus = client.millionsStatus
@@ -1675,12 +1935,27 @@ function isNewLeadEligibleForMillionsVerify(client, includeError = false) {
   return includeError && millionsStatus === 'error';
 }
 
-async function fetchNewLeadsForVerification(clientRepository) {
-  return clientRepository
+async function fetchNewLeadsForVerification(
+  clientRepository,
+  { leadFilterIds = [], leadFilterMode = 'include' } = {}
+) {
+  const qb = clientRepository
     .createQueryBuilder('client')
     .where('client.deletedAt IS NULL')
-    .andWhere('(client.status = :status OR client.status IS NULL)', { status: 'new' })
-    .getMany();
+    .andWhere('(client.status = :status OR client.status IS NULL)', { status: 'new' });
+
+  if (leadFilterIds.length > 0) {
+    if (leadFilterMode === 'exclude') {
+      qb.andWhere(
+        '(client.leadFilterId IS NULL OR client.leadFilterId NOT IN (:...leadFilterIds))',
+        { leadFilterIds }
+      );
+    } else {
+      qb.andWhere('client.leadFilterId IN (:...leadFilterIds)', { leadFilterIds });
+    }
+  }
+
+  return qb.orderBy('client.createdAt', 'ASC').getMany();
 }
 
 function summarizeNewLeadsVerification(clients, includeError = false) {
@@ -1876,9 +2151,25 @@ export async function bulkVerifyAllNew(req, res) {
     }
 
     const includeError = parseIncludeErrorFlag(req.body?.includeError);
+    const { leadFilterIds, leadFilterMode } = parseLeadFilterOptions(req.body);
+    const limitRaw = req.body?.limit ?? req.body?.amount;
+    let limit = null;
+    if (limitRaw != null && String(limitRaw).trim() !== '' && String(limitRaw).toLowerCase() !== 'all') {
+      const n = parseInt(String(limitRaw), 10);
+      if (!Number.isFinite(n) || n < 1) {
+        return res.status(400).json({ error: 'limit must be a positive integer' });
+      }
+      limit = Math.min(100000, n);
+    }
+
     const clientRepository = AppDataSource.getRepository(Client);
-    const clients = await fetchNewLeadsForVerification(clientRepository);
-    const { clientsToVerify } = summarizeNewLeadsVerification(clients, includeError);
+    const clients = await fetchNewLeadsForVerification(clientRepository, {
+      leadFilterIds,
+      leadFilterMode,
+    });
+    const { clientsToVerify: allEligible } = summarizeNewLeadsVerification(clients, includeError);
+    const clientsToVerify =
+      limit != null ? allEligible.slice(0, limit) : allEligible;
 
     if (clientsToVerify.length === 0) {
       const errorMessage = includeError
@@ -1954,10 +2245,14 @@ export async function bulkVerifyAllNew(req, res) {
       success: true,
       jobId,
       total: emails.length,
+      available: allEligible.length,
+      limit: limit,
       includeError,
+      leadFilterIds,
+      leadFilterMode,
       message: includeError
-        ? 'Verification started for all "new" status leads (including error status retries)'
-        : 'Verification started for all "new" status leads',
+        ? `Verification started for ${emails.length} "new" lead(s) (including error status retries)`
+        : `Verification started for ${emails.length} "new" lead(s)`,
     });
   } catch (error) {
     console.error('Bulk verify all new error:', error);
@@ -1976,8 +2271,12 @@ export async function bulkVerifyAllNew(req, res) {
 export async function getNewLeadsVerificationCount(req, res) {
   try {
     const includeError = parseIncludeErrorFlag(req.query.includeError);
+    const { leadFilterIds, leadFilterMode } = parseLeadFilterOptions(req.query);
     const clientRepository = AppDataSource.getRepository(Client);
-    const clients = await fetchNewLeadsForVerification(clientRepository);
+    const clients = await fetchNewLeadsForVerification(clientRepository, {
+      leadFilterIds,
+      leadFilterMode,
+    });
     const summary = summarizeNewLeadsVerification(clients, includeError);
 
     res.json({
@@ -1987,6 +2286,8 @@ export async function getNewLeadsVerificationCount(req, res) {
       unverifiedCount: summary.unverifiedCount,
       errorCount: summary.errorCount,
       includeError,
+      leadFilterIds,
+      leadFilterMode,
     });
   } catch (error) {
     console.error('Get new leads verification count error:', error);
@@ -2063,6 +2364,7 @@ export async function getApolloMissingEmailCount(req, res) {
     return res.json({
       count: eligible,
       eligible,
+      forceCount: noEmailWithLinkedin,
       noEmailWithLinkedin,
       alreadyChecked,
       noEmail: noEmailStatus,
@@ -2083,6 +2385,10 @@ export async function fetchApolloEmails(req, res) {
     const ids = Array.isArray(req.body?.ids)
       ? req.body.ids.map((id) => String(id).trim()).filter(Boolean)
       : null;
+    const force =
+      req.body?.force === true ||
+      req.body?.force === 1 ||
+      String(req.body?.force || '').trim().toLowerCase() === 'true';
 
     // limit: 'all' | omitted → process every eligible lead.
     // Numeric limit kept for optional throttling (hard cap 50k).
@@ -2117,8 +2423,16 @@ export async function fetchApolloEmails(req, res) {
       .where('client.deletedAt IS NULL')
       .andWhere("(client.email IS NULL OR TRIM(client.email) = '')")
       .andWhere('client.linkedin IS NOT NULL')
-      .andWhere("TRIM(client.linkedin) <> ''")
-      .andWhere("(client.apollo_email_status IS NULL OR TRIM(client.apollo_email_status) = '')");
+      .andWhere("TRIM(client.linkedin) <> ''");
+
+    if (force) {
+      qb.andWhere(
+        `(client.apollo_email_status IS NULL OR TRIM(client.apollo_email_status) = ''
+          OR client.apollo_email_status IN ('no_email', 'email_conflict', 'error'))`
+      );
+    } else {
+      qb.andWhere("(client.apollo_email_status IS NULL OR TRIM(client.apollo_email_status) = '')");
+    }
 
     if (ids?.length) {
       qb.andWhere('client.id IN (:...ids)', { ids });
@@ -2126,7 +2440,12 @@ export async function fetchApolloEmails(req, res) {
       qb.andWhere("LOWER(TRIM(COALESCE(lf.tool, ''))) = 'apollo'");
     }
 
-    qb.orderBy('client.createdAt', 'ASC');
+    if (force) {
+      qb.orderBy('client.apolloEmailCheckedAt', 'ASC', 'NULLS FIRST');
+      qb.addOrderBy('client.createdAt', 'ASC');
+    } else {
+      qb.orderBy('client.createdAt', 'ASC');
+    }
     if (limitNum != null) {
       qb.take(limitNum);
     }
@@ -2272,7 +2591,7 @@ export async function fetchApolloEmails(req, res) {
       success: true,
       jobId,
       total: leads.length,
-      message: `Started fetching emails for ${leads.length} lead(s)`,
+      message: `Started fetching emails for ${leads.length} lead(s)${force ? ' (force re-check)' : ''}`,
     });
   } catch (error) {
     console.error('fetchApolloEmails error:', error);

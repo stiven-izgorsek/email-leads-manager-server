@@ -14,8 +14,9 @@ import {
   MESSAGE_TYPE_IGNORED_SENDER,
   MESSAGE_TYPE_HIDE_SENDER,
 } from './incomingSenderFilterService.js';
-import { NYLAS_LIST_PAGE_LIMIT, parseNylas429RetryDelayMs, sleep } from '../utils/nylasRateLimit.js';
+import { NYLAS_LIST_PAGE_LIMIT, parseNylas429RetryDelayMs, nylasFetchWithRetry, sleep } from '../utils/nylasRateLimit.js';
 import { maybeCreateDomainBlockAlert } from './domainBlockAlertService.js';
+import { markLeadsRepliedFromIncomingMessage } from './leadReplyStatusService.js';
 
 const POLL_MS = Math.min(
   30 * 60 * 1000,
@@ -170,15 +171,17 @@ async function fetchUnreadMessagesForMailbox(emailRow) {
   for (const baseUrl of baseUrls) {
     const url = listUrl(baseUrl);
     try {
-      const response = await fetch(url, {
-        method: 'GET',
-        headers: {
-          Authorization: `Bearer ${nylasKey}`,
-          Accept: 'application/json',
+      const { response, text } = await nylasFetchWithRetry(
+        url,
+        {
+          method: 'GET',
+          headers: {
+            Authorization: `Bearer ${nylasKey}`,
+            Accept: 'application/json',
+          },
         },
-      });
-
-      const text = await response.text().catch(() => '');
+        { label: 'nylas-poll' }
+      );
 
       if (response.ok) {
         try {
@@ -366,8 +369,27 @@ async function fetchUnreadMessagesForMailbox(emailRow) {
           receivedAt,
             isRead: false,
           source: 'nylas',
+          // Keep text for bounce/DSN matching (lead address is often only in the body).
+          bodyText:
+            messageType === 'blocked' ||
+            messageType === 'delivery_failed' ||
+            messageType === 'no_address' ||
+            messageType === 'bad'
+              ? String(body || '').slice(0, 8000) || null
+              : null,
         })
       );
+      try {
+        await markLeadsRepliedFromIncomingMessage({
+          mailboxAddress: emailRow.address,
+          fromEmail: fromAddresses[0] || null,
+          messageType,
+          subject,
+          body,
+        });
+      } catch (error) {
+        console.error('[NYLAS] Failed marking lead replied:', error.message || error);
+      }
     } catch (error) {
       if (error?.code !== '23505') {
         console.error('[NYLAS] Failed storing incoming message:', error.message || error);

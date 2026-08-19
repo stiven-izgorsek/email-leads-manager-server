@@ -11,12 +11,14 @@ import {
   loadMessageTypeRules,
 } from './messageTypeService.js';
 import { maybeCreateDomainBlockAlert } from './domainBlockAlertService.js';
+import { markLeadsRepliedFromIncomingMessage } from './leadReplyStatusService.js';
 import {
   isIgnoredMarketingSender,
   isHiddenSender,
   MESSAGE_TYPE_IGNORED_SENDER,
   MESSAGE_TYPE_HIDE_SENDER,
 } from './incomingSenderFilterService.js';
+import { isAppPasswordFeaturesEnabled } from './smtpSendService.js';
 
 const POLL_MS = Math.min(
   30 * 60 * 1000,
@@ -331,6 +333,17 @@ async function fetchUnreadMessagesForMailbox(emailRow) {
               bodyText: bodyText || null,
             })
           );
+          try {
+            await markLeadsRepliedFromIncomingMessage({
+              mailboxAddress: user,
+              fromEmail: fromAddresses[0] || null,
+              messageType,
+              subject,
+              body: bodyForClassify,
+            });
+          } catch (error) {
+            console.error('[IMAP] Failed marking lead replied:', error.message || error);
+          }
         } catch (error) {
           if (error?.code !== '23505') {
             console.error('[IMAP] Failed storing incoming message:', error.message || error);
@@ -362,6 +375,7 @@ async function fetchUnreadMessagesForMailbox(emailRow) {
 }
 
 async function pollImapUnreadEmails() {
+  if (!isAppPasswordFeaturesEnabled()) return;
   if (isRunning) return;
   isRunning = true;
 
@@ -394,6 +408,12 @@ async function pollImapUnreadEmails() {
 }
 
 export function startImapUnreadPollingJob() {
+  if (!isAppPasswordFeaturesEnabled()) {
+    console.log(
+      '[IMAP] App-password unread polling DISABLED (APP_PASSWORD_FEATURES_ENABLED=false)'
+    );
+    return;
+  }
   if (timer) return;
   pollImapUnreadEmails().catch(() => undefined);
   timer = setInterval(() => {

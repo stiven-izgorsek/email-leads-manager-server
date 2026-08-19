@@ -24,5 +24,6 @@ export { FollowupAssignmentLead, FollowupAssignmentLeadSchema } from './Followup
 export { CalendarEvent, CalendarEventSchema } from './CalendarEvent.js';
 export { CalendarEventLocal, CalendarEventLocalSchema } from './CalendarEventLocal.js';
 export { CalendarEventLocalException, CalendarEventLocalExceptionSchema } from './CalendarEventLocalException.js';
+export { CalendarSlackNotification, CalendarSlackNotificationSchema } from './CalendarSlackNotification.js';
 export { MarketingDomainBlockAlert, MarketingDomainBlockAlertSchema } from './MarketingDomainBlockAlert.js';
 export { ApolloAccount, ApolloAccountSchema } from './ApolloAccount.js';

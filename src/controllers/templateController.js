@@ -12,6 +12,7 @@ import {
   parseIsSignatureAdded,
   stripTrailingSignatureClosing,
 } from '../utils/stripSignatureClosing.js';
+import { sanitizeAiMarkerInName } from '../utils/leadNameSanitize.js';
 
 const TEMPLATE_SIZES = ['long', 'short', 'normal'];
 
@@ -108,8 +109,8 @@ function normalizeStringListField(value) {
 
 function normalizeLeadVariables(lead) {
   return {
-    firstName: lead.firstName ?? lead.first_name ?? '',
-    companyName: lead.companyName ?? lead.company_name ?? '',
+    firstName: sanitizeAiMarkerInName(lead.firstName ?? lead.first_name) || '',
+    companyName: sanitizeAiMarkerInName(lead.companyName ?? lead.company_name) || '',
     companyUrl: lead.companyUrl ?? lead.websiteUrl ?? lead.website_url ?? lead.domain ?? '',
     email: lead.email ?? '',
     jobTitle: lead.jobTitle ?? lead.job_title ?? '',
@@ -317,11 +318,12 @@ function isOpenAiComposeFallbackError(err) {
   const status = err?.status;
   if (status === 503) return true;
   if (status === 401) return true;
+  if (status === 403) return true;
   if (status === 429) return true;
-  if (status === 400 && /quota|billing|invalid|incorrect|authentication|api key|unauthorized|permission/i.test(msg))
+  if (status === 400 && /quota|billing|invalid|incorrect|authentication|api key|unauthorized|permission|country|region|territory|not supported/i.test(msg))
     return true;
   if (
-    /not configured|OPEN_AI_API_KEY|OPENAI_API_KEY|incorrect api key|invalid api key|invalid_api_key|quota|billing|insufficient_quota|rate limit|429|timed out|AbortError|fetch failed|ECONNREFUSED/i.test(
+    /not configured|OPEN_AI_API_KEY|OPENAI_API_KEY|incorrect api key|invalid api key|invalid_api_key|quota|billing|insufficient_quota|rate limit|429|timed out|AbortError|fetch failed|ECONNREFUSED|country, region, or territory not supported|unsupported_country_region_territory|request_forbidden/i.test(
       msg
     )
   )

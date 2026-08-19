@@ -85,31 +85,20 @@ export async function hasStoredInboundReplySince({
        AND (
          LOWER(COALESCE(im."fromEmail", '')) LIKE $3
          OR (
-           im."messageType" IN ('blocked', 'ooo', 'bad', 'interest', 'no_job')
+           im."messageType" IN ('blocked', 'delivery_failed', 'no_address', 'ooo', 'bad', 'interest', 'no_job', 'other')
            AND (
              LOWER(COALESCE(im."fromEmail", '')) LIKE $3
              OR LOWER(COALESCE(im."subject", '')) LIKE $3
            )
          )
          OR (
-           LOWER(COALESCE(im."fromEmail", '')) LIKE '%mailer-daemon%'
-           AND LOWER(COALESCE(im."subject", '')) LIKE $3
-         )
-         OR (
-           LOWER(COALESCE(im."fromEmail", '')) LIKE '%postmaster%'
-           AND LOWER(COALESCE(im."subject", '')) LIKE $3
-         )
-         OR (
-           im."messageType" = 'other'
-           AND LOWER(COALESCE(im."fromEmail", '')) LIKE $3
-         )
-         OR (
-           im."messageType" = 'blocked'
-           AND (
+           (
              LOWER(COALESCE(im."fromEmail", '')) LIKE '%mailer-daemon%'
              OR LOWER(COALESCE(im."fromEmail", '')) LIKE '%postmaster%'
              OR LOWER(COALESCE(im."fromEmail", '')) LIKE '%mail delivery%'
+             OR im."messageType" IN ('blocked', 'delivery_failed', 'no_address')
            )
+           AND LOWER(COALESCE(im."subject", '')) LIKE $3
          )
        )
      LIMIT 1`,
@@ -136,22 +125,18 @@ function isInboundReplyNylasMessage(message, mailboxAddress, leadEmail) {
 
   if (fromIsLead) return true;
 
-  if (textLooksLikeBounceOrBlock(subject, body) && (leadInSubject || fromMatchesLead(fromStr, leadEmail))) {
+  if (textLooksLikeBounceOrBlock(subject, body) && leadInSubject) {
     return true;
   }
 
   if (
-    (fromStr.includes('mailer-daemon') || fromStr.includes('postmaster')) &&
+    (fromStr.includes('mailer-daemon') || fromStr.includes('postmaster') || fromLooksLikeBounceOrSystem(fromStr)) &&
     leadInSubject
   ) {
     return true;
   }
 
-  if (toIsMailbox && !fromIsMailbox) {
-    if (fromLooksLikeBounceOrSystem(fromStr)) return true;
-    if (textLooksLikeBounceOrBlock(subject, body)) return true;
-  }
-
+  // Do not treat unrelated mailbox bounces as a reply for this lead.
   if (toIsMailbox && fromIsMailbox) return false;
 
   return false;

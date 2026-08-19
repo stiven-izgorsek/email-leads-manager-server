@@ -16,6 +16,7 @@ import {
   deleteIncomingMessage,
   replyToIncomingMessage,
   listIncomingMessageReplies,
+  notifyIncomingMessageSlackHandler,
 } from '../controllers/incomingMessageController.js';
 import {
   listHiddenSenderEntries,
@@ -36,6 +37,7 @@ router.post('/incoming-messages/analyze-period', analyzeIncomingMessagesPeriod);
 router.get('/incoming-messages/:id/content', getIncomingMessageContent);
 router.get('/incoming-messages/:id/replies', listIncomingMessageReplies);
 router.post('/incoming-messages/:id/reply', replyToIncomingMessage);
+router.post('/incoming-messages/:id/notify-slack', notifyIncomingMessageSlackHandler);
 
 router.get('/hidden-senders', listHiddenSenderEntries);
 router.get('/hidden-senders/values', listHiddenSenderValues);

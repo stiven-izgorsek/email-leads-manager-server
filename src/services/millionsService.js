@@ -1,9 +1,31 @@
 /**
  * Millions Email Verification Service
  * API Documentation: https://api.millionverifier.com/api/v3/
+ *
+ * Concurrency knobs (env):
+ * - MILLIONS_VERIFY_CONCURRENCY — parallel single-email calls (default 10, max 50)
+ * - MILLIONS_VERIFY_DELAY_MS — optional pause after each call per worker (default 0)
  */
 
 const MILLIONS_API_BASE_URL = 'https://api.millionverifier.com/api/v3/';
+
+function getVerifyConcurrency(override) {
+  if (Number.isFinite(override) && override >= 1) {
+    return Math.min(50, Math.floor(override));
+  }
+  const n = parseInt(process.env.MILLIONS_VERIFY_CONCURRENCY || '', 10);
+  return Number.isFinite(n) && n >= 1 ? Math.min(50, n) : 10;
+}
+
+function getVerifyDelayMs() {
+  const n = parseInt(process.env.MILLIONS_VERIFY_DELAY_MS || '', 10);
+  return Number.isFinite(n) && n >= 0 ? n : 0;
+}
+
+function sleep(ms) {
+  if (!ms || ms <= 0) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 /**
  * Verify a single email address using Millions API
@@ -100,29 +122,49 @@ export async function verifyEmail(email, apiKey, timeout = 10) {
 }
 
 /**
- * Verify multiple emails sequentially
+ * Verify multiple emails with a bounded worker pool (parallel single-email API calls).
  * @param {Array<string>} emails - Array of email addresses
  * @param {string} apiKey - Millions API key
- * @param {Function} onProgress - Callback function called after each verification (email, result, index, total)
- * @returns {Promise<Array>} Array of verification results
+ * @param {Function} onProgress - Called after each verification (email, result, completedCount, total)
+ * @param {{ concurrency?: number }} [options]
+ * @returns {Promise<Array>} Array of verification results (same order as input emails)
  */
-export async function verifyEmailsBulk(emails, apiKey, onProgress = null) {
-  const results = [];
-  
-  for (let i = 0; i < emails.length; i++) {
-    const email = emails[i];
-    const result = await verifyEmail(email, apiKey);
-    results.push(result);
-    
-    if (onProgress) {
-      onProgress(email, result, i + 1, emails.length);
-    }
-    
-    // Add a small delay to avoid rate limiting (adjust as needed)
-    if (i < emails.length - 1) {
-      await new Promise(resolve => setTimeout(resolve, 100));
+export async function verifyEmailsBulk(emails, apiKey, onProgress = null, options = {}) {
+  const list = Array.isArray(emails) ? emails : [];
+  if (!list.length) return [];
+
+  const concurrency = getVerifyConcurrency(options?.concurrency);
+  const delayMs = getVerifyDelayMs();
+  const results = new Array(list.length);
+  let cursor = 0;
+  let completed = 0;
+
+  console.log(
+    `[millions] Verifying ${list.length} email(s) with concurrency=${concurrency}` +
+      (delayMs ? ` delayMs=${delayMs}` : '')
+  );
+
+  async function worker() {
+    while (true) {
+      const i = cursor++;
+      if (i >= list.length) return;
+
+      const email = list[i];
+      const result = await verifyEmail(email, apiKey);
+      results[i] = result;
+      completed += 1;
+
+      if (onProgress) {
+        await onProgress(email, result, completed, list.length);
+      }
+
+      if (delayMs > 0) {
+        await sleep(delayMs);
+      }
     }
   }
-  
+
+  const workerCount = Math.min(concurrency, list.length);
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
   return results;
 }

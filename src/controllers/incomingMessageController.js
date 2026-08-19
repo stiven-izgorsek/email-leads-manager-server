@@ -3,6 +3,7 @@ import { AppDataSource } from '../config/database.js';
 import { IncomingMessage } from '../entities/IncomingMessage.js';
 import { MessageTypeRule } from '../entities/MessageTypeRule.js';
 import { Email } from '../entities/Email.js';
+import { CrmClient } from '../entities/CrmClient.js';
 import {
   classifyIncomingMessage,
   ensureDefaultMessageTypeRules,
@@ -17,6 +18,7 @@ import {
   replyToIncomingMessageById,
   listManualRepliesForIncomingMessage,
 } from '../services/incomingMessageReplyService.js';
+import { notifyIncomingMessageToSlack } from '../services/incomingMessageSlackService.js';
 
 const configuredNylasRegion = (process.env.NYLAS_REGION || '').toLowerCase();
 
@@ -96,6 +98,46 @@ function applyExcludeSmtpForUpdate(qb) {
 
 function isQueryFlagTrue(value) {
   return String(value ?? '').toLowerCase() === 'true';
+}
+
+function applyStarredOnlyFilter(qb, alias = 'm') {
+  qb.andWhere(
+    `EXISTS (
+      SELECT 1 FROM crm_client crm
+      WHERE crm."deletedAt" IS NULL
+        AND crm.email IS NOT NULL
+        AND TRIM(crm.email) <> ''
+        AND LOWER(TRIM(crm.email)) = LOWER(TRIM(${alias}.fromEmail))
+    )`
+  );
+  return qb;
+}
+
+async function annotateStarredSenders(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return messages;
+  const emails = [
+    ...new Set(
+      messages
+        .map((m) => String(m.fromEmail || '').trim().toLowerCase())
+        .filter(Boolean)
+    ),
+  ];
+  const starred = new Set();
+  if (emails.length) {
+    const rows = await AppDataSource.getRepository(CrmClient)
+      .createQueryBuilder('c')
+      .select('LOWER(TRIM(c.email))', 'email')
+      .where('c.deletedAt IS NULL')
+      .andWhere('LOWER(TRIM(c.email)) IN (:...emails)', { emails })
+      .getRawMany();
+    for (const row of rows) {
+      if (row?.email) starred.add(String(row.email).toLowerCase());
+    }
+  }
+  return messages.map((m) => ({
+    ...m,
+    starred: starred.has(String(m.fromEmail || '').trim().toLowerCase()),
+  }));
 }
 
 function getYesterdayBoundsFromDayStart(dayStart) {
@@ -222,16 +264,20 @@ export async function listIncomingMessages(req, res) {
     if (isQueryFlagTrue(req.query.unreadOnly)) {
       qb.andWhere('m.isRead = :isRead', { isRead: false });
     }
+    if (isQueryFlagTrue(req.query.starredOnly)) {
+      applyStarredOnlyFilter(qb, 'm');
+    }
     const dayBounds = getIncomingListDayBounds(req.query);
     applyIncomingReceivedDateFilter(qb, {
       dayBounds,
       includeYesterdayUnread: isQueryFlagTrue(req.query.includeYesterdayUnread),
     });
 
-    const [data, total] = await Promise.all([
+    const [rows, total] = await Promise.all([
       qb.orderBy('COALESCE(m.receivedAt, m.createdAt)', 'DESC').skip(skip).take(limit).getMany(),
       qb.clone().getCount(),
     ]);
+    const data = await annotateStarredSenders(rows);
 
     res.json({
       data,
@@ -613,6 +659,20 @@ export async function replyToIncomingMessage(req, res) {
     console.error('replyToIncomingMessage error:', error);
     const status = error?.status || 500;
     return res.status(status).json({ error: error?.message || 'Failed to send reply' });
+  }
+}
+
+export async function notifyIncomingMessageSlackHandler(req, res) {
+  try {
+    const result = await notifyIncomingMessageToSlack(req.params.id);
+    res.json(result);
+  } catch (error) {
+    console.error('notifyIncomingMessageSlack error:', error);
+    const msg = error?.message || 'Failed to notify Slack';
+    const status =
+      error?.status ||
+      (/not found/i.test(msg) ? 404 : /not configured|missing Nylas|required/i.test(msg) ? 400 : 500);
+    return res.status(status).json({ error: msg });
   }
 }
 

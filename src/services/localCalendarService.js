@@ -153,6 +153,8 @@ export function localOccurrenceToApiEvent(occurrence) {
     organizer: null,
     participants: [],
     linkedClients: [],
+    linkedContacts: [],
+    mailboxAccount: null,
   };
 }
 

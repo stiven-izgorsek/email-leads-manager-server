@@ -1,14 +1,21 @@
 /**
- * Apollo / AI-sourced leads sometimes use "?" in names so recipients can spot automation.
- * Strip those markers on API responses (and optional writes) by replacing with spaces.
+ * Clean lead/person/company names for display and outbound email.
+ * - Apollo sometimes inserts ASCII "?" as an automation marker.
+ * - Bad CSV/source encoding often leaves U+FFFD () in place of letters (e.g. OÜ → O).
+ * Strip those so subjects and cold messages stay professional.
  */
 
 export function sanitizeAiMarkerInName(value) {
   if (value == null) return null;
   const s = String(value);
   if (!s) return null;
-  if (!s.includes('?')) return s;
-  const cleaned = s.replace(/\?+/g, ' ').replace(/\s+/g, ' ').trim();
+  const cleaned = s
+    // Unicode replacement char + ASCII "?" automation markers
+    .replace(/[\uFFFD?]+/g, ' ')
+    // Strip other C0 controls (keep tab/newline out of names too)
+    .replace(/[\u0000-\u001F\u007F]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
   return cleaned.length ? cleaned : null;
 }
 

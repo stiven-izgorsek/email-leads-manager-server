@@ -24,6 +24,7 @@ import apolloAccountRoutes from './routes/apolloAccountRoutes.js';
 import { startNylasUnreadPollingJob } from './services/nylasPollingService.js';
 import { startImapUnreadPollingJob } from './services/imapPollingService.js';
 import { startCalendarSyncJob } from './services/calendarSyncJob.js';
+import { startMeetingReminderJob } from './services/meetingReminderService.js';
 import { releaseAllOrphanedMarketingRuns } from './services/marketingService.js';
 import { releaseAllOrphanedFollowupRuns } from './services/followupService.js';
 import { ensureDefaultHiddenSenderEntries } from './services/incomingSenderFilterService.js';
@@ -117,6 +118,7 @@ async function startServer() {
     startNylasUnreadPollingJob();
     startImapUnreadPollingJob();
     startCalendarSyncJob();
+    startMeetingReminderJob();
     app.listen(PORT, () => {
       console.log(`Server is running on port ${PORT}`);
       console.log(`Health check: http://localhost:${PORT}/health`);

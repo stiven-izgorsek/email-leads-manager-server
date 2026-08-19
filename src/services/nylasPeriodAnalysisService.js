@@ -5,11 +5,10 @@ import {
   ensureDefaultMessageTypeRules,
   loadMessageTypeRules,
 } from './messageTypeService.js';
-import { NYLAS_LIST_PAGE_LIMIT, parseNylas429RetryDelayMs, sleep } from '../utils/nylasRateLimit.js';
+import { NYLAS_LIST_PAGE_LIMIT, sleep, nylasFetchWithRetry, getNylasHttpRetryAttempts } from '../utils/nylasRateLimit.js';
 
 const configuredNylasRegion = (process.env.NYLAS_REGION || '').toLowerCase();
 const NYLAS_PAGE_GAP_MS = Math.min(5000, Math.max(50, parseInt(process.env.NYLAS_PAGE_GAP_MS || '150', 10) || 150));
-const NYLAS_429_MAX_RETRIES = Math.min(5, Math.max(0, parseInt(process.env.NYLAS_429_MAX_RETRIES || '2', 10) || 2));
 
 function getNylasBaseUrls() {
   if (configuredNylasRegion === 'us') return ['https://api.us.nylas.com'];
@@ -108,35 +107,27 @@ async function fetchMessagesPage(baseUrl, grantId, nylasKey, { receivedAfter, re
 
   const url = `${baseUrl}/v3/grants/${grantId}/messages?${params.toString()}`;
 
-  for (let attempt = 0; attempt <= NYLAS_429_MAX_RETRIES; attempt += 1) {
-    const response = await fetch(url, {
+  const { response, text } = await nylasFetchWithRetry(
+    url,
+    {
       method: 'GET',
       headers: {
         Authorization: `Bearer ${nylasKey}`,
         Accept: 'application/json',
       },
-    });
+    },
+    { label: 'nylas-period', attempts: getNylasHttpRetryAttempts() }
+  );
 
-    const text = await response.text().catch(() => '');
-
-    if (response.ok) {
-      try {
-        return text ? JSON.parse(text) : {};
-      } catch {
-        throw new Error('Nylas returned invalid JSON for messages page');
-      }
+  if (response.ok) {
+    try {
+      return text ? JSON.parse(text) : {};
+    } catch {
+      throw new Error('Nylas returned invalid JSON for messages page');
     }
-
-    if (response.status === 429 && attempt < NYLAS_429_MAX_RETRIES) {
-      const waitMs = parseNylas429RetryDelayMs(response, text);
-      await sleep(waitMs);
-      continue;
-    }
-
-    throw new Error(`Nylas request failed (${response.status}): ${text || response.statusText}`);
   }
 
-  throw new Error('Nylas messages page: exceeded 429 retries');
+  throw new Error(`Nylas request failed (${response.status}): ${text || response.statusText}`);
 }
 
 async function fetchAllMessagesInRange(grantId, nylasKey, receivedAfter, receivedBefore) {

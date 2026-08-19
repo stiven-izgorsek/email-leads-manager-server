@@ -290,12 +290,21 @@ See `src/utils/csvLeadImport.js` for normalization logic.
 
 | Variable | Description |
 |----------|-------------|
-| `OPEN_AI_API_KEY` / `OPENAI_API_KEY` | OpenAI for compose, application, AI templates |
+| `OPEN_AI_API_KEY` / `OPENAI_API_KEY` | OpenAI for compose, application, AI templates (optional for reply classify) |
 | `OPEN_AI_MODEL` | Model name (default `gpt-4o-mini`) |
 | `OPEN_AI_TIMEOUT_MS` | OpenAI request timeout |
+| `REPLY_CLASSIFIER_PROVIDER` | Inbound reply typing: `auto` (Ollama→OpenAI→rules), `ollama`, `openai`, or `rules` |
+| `OLLAMA_HOST` | Local Ollama URL (default `http://127.0.0.1:11434`) |
+| `OLLAMA_MODEL` | Ollama model for reply classify (default `qwen2.5:3b`) |
+| `OLLAMA_TIMEOUT_MS` | Ollama request timeout |
+| `OLLAMA_KEEP_ALIVE` | How long Ollama keeps the model loaded (e.g. `5m`, `0` = unload) |
 | `APOLLO_API_KEY` | Apollo company search |
 | `MILLIONS_API_KEY` | Millions Verify email validation |
 | `SLACK_INCOMING_MESSAGES_WEBHOOK` | Slack alerts for new incoming mail |
+| `SLACK_MEETINGS_WEBHOOK` | Slack webhook for meeting reminders (falls back to incoming webhook if unset) |
+| `SLACK_MEETINGS_CHANNEL` | Slack channel for meeting reminders (default `#meeting-notification`) |
+| `MEETING_REMINDER_MINUTES` | Slack meeting reminder lead time (default `10`) |
+| `MEETING_REMINDER_POLL_MS` | How often to check for upcoming meetings (default `60000`) |
 | `NYLAS_REGION` | Optional Nylas region hint (`us` / `eu`) |
 
 Nylas credentials are stored **per mailbox** in the database (`grantId`, `nylasKey` on `Email` rows), not in `.env`.

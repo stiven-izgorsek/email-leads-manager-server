@@ -56,6 +56,34 @@ function applyStatusesToRow(row, statusesArray) {
   row.status = arr[0];
 }
 
+function parseYyyyMmDd(raw) {
+  const s = String(raw || '').trim();
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  if (!m) return null;
+  const y = parseInt(m[1], 10);
+  const mo = parseInt(m[2], 10);
+  const d = parseInt(m[3], 10);
+  const date = new Date(y, mo - 1, d, 0, 0, 0, 0);
+  if (
+    Number.isNaN(date.getTime()) ||
+    date.getFullYear() !== y ||
+    date.getMonth() !== mo - 1 ||
+    date.getDate() !== d
+  ) {
+    return null;
+  }
+  return date;
+}
+
+function toLocalYmd(value) {
+  const d = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(d.getTime())) return null;
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
 function parseDate(raw) {
   if (raw == null || raw === '') return null;
   const d = new Date(raw);
@@ -587,6 +615,58 @@ export async function deleteCrmClient(req, res) {
   } catch (error) {
     console.error('deleteCrmClient error:', error);
     res.status(500).json({ error: 'Failed to delete client' });
+  }
+}
+
+export async function getFollowUpCountsByDay(req, res) {
+  try {
+    const from = parseYyyyMmDd(req.query.from);
+    const to = parseYyyyMmDd(req.query.to);
+    if (!from || !to) {
+      return res.status(400).json({ error: 'from and to are required as YYYY-MM-DD' });
+    }
+    if (to < from) {
+      return res.status(400).json({ error: 'to must be on or after from' });
+    }
+
+    const fromStart = new Date(from);
+    fromStart.setDate(fromStart.getDate() - 1);
+    fromStart.setHours(0, 0, 0, 0);
+    const toEnd = new Date(to);
+    toEnd.setDate(toEnd.getDate() + 1);
+    toEnd.setHours(23, 59, 59, 999);
+
+    const repo = AppDataSource.getRepository(CrmClient);
+    const qb = repo
+      .createQueryBuilder('c')
+      .where('c.deletedAt IS NULL')
+      .andWhere('c.followUpAt IS NOT NULL')
+      .andWhere('c.followUpAt >= :fromStart AND c.followUpAt <= :toEnd', { fromStart, toEnd });
+
+    const excludeId = String(req.query.excludeId || '').trim();
+    if (excludeId) {
+      qb.andWhere('c.id <> :excludeId', { excludeId });
+    }
+
+    const rows = await qb.getMany();
+    const wanted = new Set();
+    for (let cursor = new Date(from); cursor <= to; cursor.setDate(cursor.getDate() + 1)) {
+      wanted.add(toLocalYmd(cursor));
+    }
+
+    const counts = {};
+    for (const day of wanted) counts[day] = 0;
+    for (const row of rows) {
+      const day = toLocalYmd(row.followUpAt);
+      if (day && Object.prototype.hasOwnProperty.call(counts, day)) {
+        counts[day] += 1;
+      }
+    }
+
+    res.json({ data: counts, from: toLocalYmd(from), to: toLocalYmd(to) });
+  } catch (error) {
+    console.error('getFollowUpCountsByDay error:', error);
+    res.status(500).json({ error: 'Failed to load follow-up counts' });
   }
 }
 

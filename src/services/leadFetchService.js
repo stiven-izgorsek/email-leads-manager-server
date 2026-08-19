@@ -13,6 +13,30 @@ const NOT_PENDING_MARKETING_ASSIGNMENT_WHERE = `NOT EXISTS (
   WHERE mal.client_id = client.id AND mal.send_status = 'pending'
 )`;
 
+const NOT_DUPLICATE_READY_EMAIL_WHERE = `NOT EXISTS (
+  SELECT 1 FROM client claimed
+  WHERE claimed."deletedAt" IS NULL
+    AND LOWER(TRIM(claimed.email)) = LOWER(TRIM(client.email))
+    AND LOWER(TRIM(claimed.status)) = 'ready'
+    AND claimed.id <> client.id
+)`;
+
+const OOO_RECLAIM_STATUS_WHERE = `LOWER(TRIM(COALESCE(client.status, ''))) IN ('replied', 'sent', 'followedup')`;
+
+/** Latest non-hidden inbound for this lead address is an out-of-office / auto-reply. */
+const LATEST_INBOUND_IS_OOO_WHERE = `(
+  SELECT LOWER(TRIM(im."messageType"))
+  FROM incoming_message im
+  WHERE im."deletedAt" IS NULL
+    AND im."fromEmail" IS NOT NULL
+    AND TRIM(im."fromEmail") <> ''
+    AND LOWER(TRIM(COALESCE(im."messageType", ''))) NOT IN ('ignored_sender', 'hide_sender')
+    AND LOWER(TRIM(BOTH FROM regexp_replace(LOWER(TRIM(im."fromEmail")), '^.*<([^>]+)>.*$', '\\1')))
+        = LOWER(TRIM(client.email))
+  ORDER BY COALESCE(im."receivedAt", im."createdAt") DESC NULLS LAST, im."createdAt" DESC
+  LIMIT 1
+) = 'ooo'`;
+
 async function claimClientsAsReady(clientRepo, clientIds, emails = []) {
   if (!clientIds?.length) return 0;
 
@@ -44,10 +68,7 @@ async function claimClientsAsReady(clientRepo, clientIds, emails = []) {
   return affected;
 }
 
-/**
- * Same pool as gmail-extension GET /leads/uncontacted (Millions-verified good/risky by default).
- */
-export function buildUncontactedLeadsQuery(clientRepo, options = {}) {
+function applyLeadPoolFilters(qb, options = {}) {
   const {
     verifiedOnly = true,
     leadFilterId,
@@ -58,23 +79,6 @@ export function buildUncontactedLeadsQuery(clientRepo, options = {}) {
     assignmentDate,
     excludeClientIds = [],
   } = options;
-
-  const qb = clientRepo
-    .createQueryBuilder('client')
-    .where('client.deletedAt IS NULL')
-    .andWhere('(client.isSent = false OR client.isSent IS NULL)')
-    .andWhere(NEW_STATUS_WHERE)
-    .andWhere(NOT_ALREADY_READY_WHERE)
-    .andWhere(NOT_PENDING_MARKETING_ASSIGNMENT_WHERE)
-    .andWhere(
-      `NOT EXISTS (
-        SELECT 1 FROM client claimed
-        WHERE claimed."deletedAt" IS NULL
-          AND LOWER(TRIM(claimed.email)) = LOWER(TRIM(client.email))
-          AND LOWER(TRIM(claimed.status)) = 'ready'
-          AND claimed.id <> client.id
-      )`
-    );
 
   if (verifiedOnly) {
     qb.andWhere('client.millionsStatus IN (:...millionsStatuses)', {
@@ -137,8 +141,55 @@ export function buildUncontactedLeadsQuery(clientRepo, options = {}) {
     qb.andWhere('client.id NOT IN (:...excludeClientIds)', { excludeClientIds });
   }
 
+  return qb;
+}
+
+/**
+ * Same pool as gmail-extension GET /leads/uncontacted (Millions-verified good/risky by default).
+ */
+export function buildUncontactedLeadsQuery(clientRepo, options = {}) {
+  const qb = clientRepo
+    .createQueryBuilder('client')
+    .where('client.deletedAt IS NULL')
+    .andWhere('(client.isSent = false OR client.isSent IS NULL)')
+    .andWhere(NEW_STATUS_WHERE)
+    .andWhere(NOT_ALREADY_READY_WHERE)
+    .andWhere(NOT_PENDING_MARKETING_ASSIGNMENT_WHERE)
+    .andWhere(NOT_DUPLICATE_READY_EMAIL_WHERE);
+
+  applyLeadPoolFilters(qb, options);
+
   return qb
     .orderBy('client.createdAt', 'DESC')
+    .addOrderBy(
+      `CASE 
+        WHEN client.millionsStatus = 'good' THEN 1 
+        WHEN client.millionsStatus = 'risky' THEN 2 
+        ELSE 3 
+      END`,
+      'ASC'
+    );
+}
+
+/**
+ * Previously contacted leads whose latest inbound is only an OOO / automatic reply.
+ */
+export function buildOooRepliedLeadsQuery(clientRepo, options = {}) {
+  const qb = clientRepo
+    .createQueryBuilder('client')
+    .where('client.deletedAt IS NULL')
+    .andWhere('client.email IS NOT NULL')
+    .andWhere("TRIM(client.email) <> ''")
+    .andWhere(OOO_RECLAIM_STATUS_WHERE)
+    .andWhere(LATEST_INBOUND_IS_OOO_WHERE)
+    .andWhere(NOT_PENDING_MARKETING_ASSIGNMENT_WHERE)
+    .andWhere(NOT_DUPLICATE_READY_EMAIL_WHERE);
+
+  applyLeadPoolFilters(qb, options);
+
+  return qb
+    .orderBy('client.lastSent', 'ASC')
+    .addOrderBy('client.createdAt', 'DESC')
     .addOrderBy(
       `CASE 
         WHEN client.millionsStatus = 'good' THEN 1 
@@ -223,6 +274,59 @@ export async function fetchUncontactedVerifiedLeads(options = {}) {
   });
 }
 
+async function claimOooClientsAsReady(clientRepo, clientIds) {
+  if (!clientIds?.length) return 0;
+  const result = await clientRepo
+    .createQueryBuilder()
+    .update(Client)
+    .set({ status: 'ready', isReplied: false, updatedAt: new Date() })
+    .where('id IN (:...clientIds)', { clientIds })
+    .andWhere('deletedAt IS NULL')
+    .andWhere("LOWER(TRIM(status)) IN ('replied', 'sent', 'followedup')")
+    .execute();
+  return result.affected || 0;
+}
+
+/**
+ * Claim previously sent leads whose latest inbound is only OOO, so they can be outreached again.
+ */
+export async function fetchOooRepliedLeads(options = {}) {
+  const count = Math.max(1, parseInt(String(options.count), 10) || 1);
+
+  return AppDataSource.transaction(async (manager) => {
+    const clientRepo = manager.getRepository(Client);
+    const qb = buildOooRepliedLeadsQuery(clientRepo, options);
+
+    const candidates = await qb
+      .setLock('pessimistic_partial_write')
+      .take(count)
+      .getMany();
+
+    if (!candidates.length) return [];
+
+    const ids = candidates.map((c) => c.id);
+    const affected = await claimOooClientsAsReady(clientRepo, ids);
+
+    if (affected < ids.length) {
+      console.warn(
+        `[fetchOooRepliedLeads] Claimed ${affected} row(s) for ${ids.length} selected lead(s)`
+      );
+    }
+
+    const verified = await clientRepo.find({
+      where: { id: In(ids), status: 'ready', deletedAt: IsNull() },
+      select: ['id', 'email', 'firstName', 'lastName', 'companyName', 'millionsStatus', 'status'],
+    });
+    const verifiedIds = new Set(verified.map((c) => c.id));
+    return candidates
+      .filter((c) => verifiedIds.has(c.id))
+      .map((c) => {
+        const row = verified.find((v) => v.id === c.id);
+        return serializeClientLeadForApi({ ...c, ...row, status: 'ready' });
+      });
+  });
+}
+
 export async function markLeadsReady(clientIds) {
   if (!clientIds?.length) return 0;
   const clientRepo = AppDataSource.getRepository(Client);
@@ -240,13 +344,26 @@ export async function markLeadsReady(clientIds) {
 export async function resetLeadsFromReady(clientIds) {
   if (!clientIds?.length) return 0;
   const clientRepo = AppDataSource.getRepository(Client);
-  const result = await clientRepo
+
+  const restoredOoo = await clientRepo
+    .createQueryBuilder()
+    .update(Client)
+    .set({ status: 'replied', isReplied: true, updatedAt: new Date() })
+    .where('id IN (:...clientIds)', { clientIds })
+    .andWhere("LOWER(TRIM(status)) = 'ready'")
+    .andWhere('isSent = true')
+    .andWhere('deletedAt IS NULL')
+    .execute();
+
+  const restoredNew = await clientRepo
     .createQueryBuilder()
     .update(Client)
     .set({ status: 'new' })
     .where('id IN (:...clientIds)', { clientIds })
-      .andWhere("LOWER(TRIM(status)) = 'ready'")
-      .andWhere('deletedAt IS NULL')
+    .andWhere("LOWER(TRIM(status)) = 'ready'")
+    .andWhere('(isSent = false OR isSent IS NULL)')
+    .andWhere('deletedAt IS NULL')
     .execute();
-  return result.affected || 0;
+
+  return (restoredOoo.affected || 0) + (restoredNew.affected || 0);
 }

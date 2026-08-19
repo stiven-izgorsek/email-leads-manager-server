@@ -64,6 +64,13 @@ const CONTINENT_LOCATION_KEYWORDS = {
     'vietnam',
     'yemen',
     'asia',
+    // Oceania — treated as Asia for outreach targeting
+    'australia',
+    'new zealand',
+    'nz',
+    'oceania',
+    'papua new guinea',
+    'fiji',
   ],
   europe: [
     'albania',
@@ -195,18 +202,27 @@ export function normalizeMarketingContinent(raw) {
 }
 
 /**
+ * Normalize assign rate to `all` or `n/m` (positive integers, n < m).
  * @param {unknown} raw
- * @returns {'1/2'|'1/3'|'all'|null}
+ * @returns {string|null} e.g. `'1/2'`, `'2/3'`, `'all'`
  */
 export function normalizeAssignFraction(raw) {
   const s = String(raw || '')
     .trim()
     .toLowerCase();
   if (!s) return null;
-  if (s === '1/2' || s === 'half' || s === '2') return '1/2';
-  if (s === '1/3' || s === 'third' || s === '3') return '1/3';
+  if (s === 'half' || s === '2') return '1/2';
+  if (s === 'third' || s === '3') return '1/3';
   if (s === 'all' || s === '1' || s === '1/1') return 'all';
-  return null;
+
+  const match = s.match(/^(\d+)\s*\/\s*(\d+)$/);
+  if (!match) return null;
+  const numerator = parseInt(match[1], 10);
+  const denominator = parseInt(match[2], 10);
+  if (!Number.isFinite(numerator) || !Number.isFinite(denominator)) return null;
+  if (numerator < 1 || denominator < 1) return null;
+  if (numerator >= denominator) return 'all';
+  return `${numerator}/${denominator}`;
 }
 
 /**
@@ -220,12 +236,12 @@ export function getContinentLocationKeywords(continent) {
 
 /**
  * How many leads to assign this round from daily capacity.
- * With continent + 1/n: floor(dailyLimit / n), clamped by remaining.
+ * With continent + n/m: floor(dailyLimit * n / m), clamped by remaining.
  * Without continent (or "all"): remaining capacity (fill toward daily limit).
  *
  * @param {number} remaining
  * @param {number} dailyLimit
- * @param {'1/2'|'1/3'|'all'|null} fraction
+ * @param {string|null} fraction e.g. `'1/2'`, `'2/3'`, `'all'`
  * @param {boolean} continentSelected
  */
 export function resolveFractionalAssignCount(remaining, dailyLimit, fraction, continentSelected) {
@@ -234,7 +250,12 @@ export function resolveFractionalAssignCount(remaining, dailyLimit, fraction, co
   if (!continentSelected || !fraction || fraction === 'all') return rem;
 
   const limit = Math.max(1, Math.floor(dailyLimit) || rem);
-  const divisor = fraction === '1/2' ? 2 : fraction === '1/3' ? 3 : 1;
-  if (divisor <= 1) return rem;
-  return Math.max(0, Math.min(rem, Math.floor(limit / divisor)));
+  const match = String(fraction).match(/^(\d+)\s*\/\s*(\d+)$/);
+  if (!match) return rem;
+  const numerator = parseInt(match[1], 10);
+  const denominator = parseInt(match[2], 10);
+  if (!Number.isFinite(numerator) || !Number.isFinite(denominator)) return rem;
+  if (numerator < 1 || denominator < 1) return rem;
+  if (numerator >= denominator) return rem;
+  return Math.max(0, Math.min(rem, Math.floor((limit * numerator) / denominator)));
 }

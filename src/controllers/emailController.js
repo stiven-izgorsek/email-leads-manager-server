@@ -9,9 +9,97 @@ import { sleep } from '../utils/nylasRateLimit.js';
 import { probeNylasGrantMessagesList } from '../services/nylasGrantProbeService.js';
 import { lookupRecipientsByEmails, sendEmailFromMailbox } from '../services/emailComposeService.js';
 import { parseIsSignatureAdded } from '../utils/stripSignatureClosing.js';
+import { decodeCsvBuffer } from '../utils/csvEncoding.js';
 
 function normalizeEmailAddress(value) {
   return String(value || '').trim().toLowerCase();
+}
+
+function parseDayStart(value) {
+  const raw = String(value || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) return null;
+  const d = new Date(`${raw}T00:00:00`);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function parseDayEnd(value) {
+  const raw = String(value || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) return null;
+  const d = new Date(`${raw}T23:59:59.999`);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function parseSentLeadFlags(query) {
+  const raw = query?.flags ?? query?.flag;
+  if (!raw) return [];
+  const list = Array.isArray(raw) ? raw : String(raw).split(',');
+  const allowed = new Set(['sent', 'replied', 'followup', 'follow-up']);
+  return [
+    ...new Set(
+      list
+        .map((f) => String(f || '').trim().toLowerCase())
+        .filter((f) => allowed.has(f))
+        .map((f) => (f === 'follow-up' ? 'followup' : f))
+    ),
+  ];
+}
+
+/**
+ * Base + optional filters for mailbox "Sent leads" list.
+ * @param {import('typeorm').SelectQueryBuilder} qb
+ * @param {string} mailbox
+ * @param {object} query
+ */
+function applySentLeadFilters(qb, mailbox, query = {}) {
+  qb.where('client.deletedAt IS NULL')
+    .andWhere('client.lastSent IS NOT NULL')
+    .andWhere("TRIM(COALESCE(client.email, '')) <> ''")
+    .andWhere("LOWER(COALESCE(client.sentBy, '')) LIKE :sentBy", {
+      sentBy: `%${mailbox}%`,
+    });
+
+  const search = String(query.search || query.q || '').trim().toLowerCase();
+  if (search) {
+    qb.andWhere(
+      `(
+        LOWER(COALESCE(client.email, '')) LIKE :search
+        OR LOWER(COALESCE(client.firstName, '')) LIKE :search
+        OR LOWER(COALESCE(client.lastName, '')) LIKE :search
+        OR LOWER(COALESCE(client.companyName, '')) LIKE :search
+      )`,
+      { search: `%${search}%` }
+    );
+  }
+
+  const sentFrom = parseDayStart(query.sentFrom || query.dateFrom);
+  if (sentFrom) {
+    qb.andWhere('client.lastSent >= :sentFrom', { sentFrom });
+  }
+  const sentTo = parseDayEnd(query.sentTo || query.dateTo);
+  if (sentTo) {
+    qb.andWhere('client.lastSent <= :sentTo', { sentTo });
+  }
+
+  const flags = parseSentLeadFlags(query);
+  if (flags.length > 0) {
+    const parts = [];
+    if (flags.includes('replied')) {
+      parts.push('client.isReplied = true');
+    }
+    if (flags.includes('followup')) {
+      parts.push('client.isFollowup = true');
+    }
+    if (flags.includes('sent')) {
+      parts.push(
+        '(client.isSent = true AND (client.isFollowup = false OR client.isFollowup IS NULL))'
+      );
+    }
+    if (parts.length) {
+      qb.andWhere(`(${parts.join(' OR ')})`);
+    }
+  }
+
+  return flags;
 }
 
 async function findActiveEmailByAddress(emailRepository, address) {
@@ -37,6 +125,26 @@ async function findSoftDeletedEmailByAddress(emailRepository, address) {
 
 const VALID_EMAIL_STATUSES = ['new', 'good', 'bad', 'blocked', 'warmingup'];
 
+const NYLAS_CONFIGURED_SQL = `(
+  email.grant_id IS NOT NULL AND TRIM(email.grant_id) <> ''
+  AND email.nylas_key IS NOT NULL AND TRIM(email.nylas_key) <> ''
+)`;
+
+const SMTP_CONFIGURED_SQL = `(
+  email.app_password IS NOT NULL AND TRIM(email.app_password) <> ''
+)`;
+
+const VALID_INTEGRATION_FILTERS = new Set([
+  'nylas',
+  'smtp',
+  'nylas_only',
+  'smtp_only',
+  'exclude_nylas',
+  'exclude_smtp',
+  'neither',
+  'any',
+]);
+
 function applyEmailListFilters(queryBuilder, query) {
   const includeDeleted =
     query.includeDeleted === 'true' || query.includeDeleted === '1';
@@ -57,6 +165,41 @@ function applyEmailListFilters(queryBuilder, query) {
   const status = String(query.status || '').trim().toLowerCase();
   if (status && VALID_EMAIL_STATUSES.includes(status)) {
     queryBuilder.andWhere('email.status = :status', { status });
+  }
+
+  const integration = String(query.integration || query.channel || '')
+    .trim()
+    .toLowerCase()
+    .replace(/-/g, '_');
+  if (integration && VALID_INTEGRATION_FILTERS.has(integration)) {
+    switch (integration) {
+      case 'nylas':
+        queryBuilder.andWhere(NYLAS_CONFIGURED_SQL);
+        break;
+      case 'smtp':
+        queryBuilder.andWhere(SMTP_CONFIGURED_SQL);
+        break;
+      case 'nylas_only':
+        queryBuilder.andWhere(`${NYLAS_CONFIGURED_SQL} AND NOT ${SMTP_CONFIGURED_SQL}`);
+        break;
+      case 'smtp_only':
+        queryBuilder.andWhere(`${SMTP_CONFIGURED_SQL} AND NOT ${NYLAS_CONFIGURED_SQL}`);
+        break;
+      case 'exclude_nylas':
+        queryBuilder.andWhere(`NOT ${NYLAS_CONFIGURED_SQL}`);
+        break;
+      case 'exclude_smtp':
+        queryBuilder.andWhere(`NOT ${SMTP_CONFIGURED_SQL}`);
+        break;
+      case 'neither':
+        queryBuilder.andWhere(`NOT ${NYLAS_CONFIGURED_SQL} AND NOT ${SMTP_CONFIGURED_SQL}`);
+        break;
+      case 'any':
+        queryBuilder.andWhere(`(${NYLAS_CONFIGURED_SQL} OR ${SMTP_CONFIGURED_SQL})`);
+        break;
+      default:
+        break;
+    }
   }
 }
 
@@ -138,15 +281,23 @@ export async function getEmailDetail(req, res) {
     const crmLimit = Math.min(500, Math.max(1, parseInt(String(req.query.crmLimit || '200'), 10) || 200));
 
     const clientRepository = AppDataSource.getRepository(Client);
-    const sentLeads = await clientRepository
-      .createQueryBuilder('client')
-      .where('client.deletedAt IS NULL')
-      .andWhere('client.lastSent IS NOT NULL')
-      .andWhere("TRIM(COALESCE(client.email, '')) <> ''")
-      .andWhere('LOWER(COALESCE(client.sentBy, \'\')) LIKE :sentBy', { sentBy: `%${mailbox}%` })
+    const sentListQb = clientRepository.createQueryBuilder('client');
+    applySentLeadFilters(sentListQb, mailbox, req.query);
+    const sentLeads = await sentListQb
       .orderBy('client.lastSent', 'DESC')
       .take(sentLimit)
       .getMany();
+
+    const sentMatchedQb = clientRepository.createQueryBuilder('client');
+    applySentLeadFilters(sentMatchedQb, mailbox, req.query);
+    const sentLeadsMatched = await sentMatchedQb.getCount();
+
+    const sentLeadTotal = await clientRepository
+      .createQueryBuilder('client')
+      .where('client.deletedAt IS NULL')
+      .andWhere('client.lastSent IS NOT NULL')
+      .andWhere("LOWER(COALESCE(client.sentBy, '')) LIKE :sentBy", { sentBy: `%${mailbox}%` })
+      .getCount();
 
     const crmRepo = AppDataSource.getRepository(CrmClient);
     const crmRows = await crmRepo
@@ -155,13 +306,6 @@ export async function getEmailDetail(req, res) {
       .orderBy('c.updatedAt', 'DESC')
       .take(crmLimit)
       .getMany();
-
-    const sentLeadTotal = await clientRepository
-      .createQueryBuilder('client')
-      .where('client.deletedAt IS NULL')
-      .andWhere('client.lastSent IS NOT NULL')
-      .andWhere('LOWER(COALESCE(client.sentBy, \'\')) LIKE :sentBy', { sentBy: `%${mailbox}%` })
-      .getCount();
 
     const crmTotal = await crmRepo
       .createQueryBuilder('c')
@@ -184,6 +328,7 @@ export async function getEmailDetail(req, res) {
         sentBy: row.sentBy,
       })),
       sentLeadsTotal: sentLeadTotal,
+      sentLeadsMatched,
       crmClients: crmRows.map(serializeCrmClient),
       crmClientsTotal: crmTotal,
     });
@@ -199,82 +344,155 @@ export async function getEmails(req, res) {
     const limit = parseInt(req.query.limit) || 20;
     const skip = (page - 1) * limit;
 
-    const emailRepository = AppDataSource.getRepository(Email);
-
-    const queryBuilder = emailRepository
-      .createQueryBuilder('email')
-      .leftJoinAndSelect('email.account', 'account');
-
-    applyEmailListFilters(queryBuilder, req.query);
-
-    const dataQuery = queryBuilder
-      .orderBy('email.createdAt', 'DESC')
-      .skip(skip)
-      .take(limit);
-
-    const countQuery = emailRepository.createQueryBuilder('email');
-    applyEmailListFilters(countQuery, req.query);
-
-    const [data, total] = await Promise.all([
-      dataQuery.getMany(),
-      countQuery.getCount(),
+    const sortByRaw = String(req.query.sortBy || 'createdAt').trim();
+    const sortOrder =
+      String(req.query.sortOrder || 'desc').trim().toLowerCase() === 'asc' ? 'asc' : 'desc';
+    const allowedSort = new Set([
+      'createdAt',
+      'updatedAt',
+      'address',
+      'status',
+      'firstName',
+      'lastName',
+      'sentMessagesCount',
+      'repliedCount',
+      'replyRate',
+      'crmClientsCount',
+    ]);
+    const sortBy = allowedSort.has(sortByRaw) ? sortByRaw : 'createdAt';
+    const countSorts = new Set([
+      'sentMessagesCount',
+      'repliedCount',
+      'replyRate',
+      'crmClientsCount',
     ]);
 
-    const mailboxes = [
-      ...new Set(data.map((row) => normalizeEmailAddress(row.address)).filter(Boolean)),
-    ];
+    const emailRepository = AppDataSource.getRepository(Email);
 
-    const crmCounts = {};
-    const sentCounts = {};
-    if (mailboxes.length) {
-      const crmRepo = AppDataSource.getRepository(CrmClient);
-      const clientRepository = AppDataSource.getRepository(Client);
+    const baseQb = () => {
+      const qb = emailRepository
+        .createQueryBuilder('email')
+        .leftJoinAndSelect('email.account', 'account');
+      applyEmailListFilters(qb, req.query);
+      return qb;
+    };
 
-      const [crmRows, sentRows] = await Promise.all([
-        crmRepo
-          .createQueryBuilder('c')
-          .select('LOWER(TRIM(c.sentByAccount))', 'sentByAccount')
-          .addSelect('COUNT(*)', 'count')
-          .where('c.deletedAt IS NULL')
-          .andWhere('c.sentByAccount IS NOT NULL')
-          .andWhere("TRIM(c.sentByAccount) <> ''")
-          .andWhere('LOWER(TRIM(c.sentByAccount)) IN (:...mailboxes)', { mailboxes })
-          .groupBy('LOWER(TRIM(c.sentByAccount))')
-          .getRawMany(),
-        Promise.all(
-          mailboxes.map(async (mailbox) => {
-            const count = await clientRepository
-              .createQueryBuilder('client')
-              .where('client.deletedAt IS NULL')
-              .andWhere('client.lastSent IS NOT NULL')
-              .andWhere('LOWER(COALESCE(client.sentBy, \'\')) LIKE :sentBy', {
-                sentBy: `%${mailbox}%`,
-              })
-              .getCount();
-            return { mailbox, count };
-          })
-        ),
-      ]);
+    /**
+     * @param {import('../entities/Email.js').Email[]} rows
+     */
+    async function enrichEmailRows(rows) {
+      const mailboxes = [
+        ...new Set(rows.map((row) => normalizeEmailAddress(row.address)).filter(Boolean)),
+      ];
+      const crmCounts = {};
+      const sentCounts = {};
+      const repliedCounts = {};
 
-      for (const row of crmRows) {
-        const key = String(row.sentByAccount || '').trim().toLowerCase();
-        if (key) crmCounts[key] = Number(row.count || 0);
+      if (mailboxes.length) {
+        const crmRepo = AppDataSource.getRepository(CrmClient);
+        const [crmRows, leadStatRows] = await Promise.all([
+          crmRepo
+            .createQueryBuilder('c')
+            .select('LOWER(TRIM(c.sentByAccount))', 'sentByAccount')
+            .addSelect('COUNT(*)', 'count')
+            .where('c.deletedAt IS NULL')
+            .andWhere('c.sentByAccount IS NOT NULL')
+            .andWhere("TRIM(c.sentByAccount) <> ''")
+            .andWhere('LOWER(TRIM(c.sentByAccount)) IN (:...mailboxes)', { mailboxes })
+            .groupBy('LOWER(TRIM(c.sentByAccount))')
+            .getRawMany(),
+          AppDataSource.manager.query(
+            `
+            SELECT
+              LOWER(TRIM(m.addr)) AS mailbox,
+              COUNT(*)::int AS sent,
+              COUNT(*) FILTER (WHERE c."isReplied" = true)::int AS replied
+            FROM client c
+            CROSS JOIN LATERAL unnest(string_to_array(COALESCE(c."sentBy", ''), ',')) AS m(addr)
+            WHERE c."deletedAt" IS NULL
+              AND c."lastSent" IS NOT NULL
+              AND TRIM(COALESCE(c."sentBy", '')) <> ''
+              AND TRIM(m.addr) <> ''
+              AND LOWER(TRIM(m.addr)) = ANY($1::text[])
+            GROUP BY LOWER(TRIM(m.addr))
+            `,
+            [mailboxes]
+          ),
+        ]);
+
+        for (const row of crmRows) {
+          const key = String(row.sentByAccount || '').trim().toLowerCase();
+          if (key) crmCounts[key] = Number(row.count || 0);
+        }
+        for (const row of leadStatRows) {
+          const key = String(row.mailbox || '').trim().toLowerCase();
+          if (!key) continue;
+          sentCounts[key] = Number(row.sent || 0);
+          repliedCounts[key] = Number(row.replied || 0);
+        }
       }
-      for (const row of sentRows) {
-        sentCounts[row.mailbox] = Number(row.count || 0);
-      }
+
+      return rows.map((row) => {
+        const key = normalizeEmailAddress(row.address);
+        const sentMessagesCount = sentCounts[key] || 0;
+        const repliedCount = repliedCounts[key] || 0;
+        const replyRate = sentMessagesCount > 0 ? repliedCount / sentMessagesCount : 0;
+        return {
+          ...row,
+          crmClientsCount: crmCounts[key] || 0,
+          sentMessagesCount,
+          repliedCount,
+          replyRate,
+        };
+      });
     }
 
-    const enriched = data.map((row) => {
-      const key = normalizeEmailAddress(row.address);
-      return {
-        ...row,
-        crmClientsCount: crmCounts[key] || 0,
-        sentMessagesCount: sentCounts[key] || 0,
-      };
-    });
+    function compareEnriched(a, b) {
+      const dir = sortOrder === 'asc' ? 1 : -1;
+      const av = a[sortBy];
+      const bv = b[sortBy];
+      const an = typeof av === 'number' ? av : Number(av) || 0;
+      const bn = typeof bv === 'number' ? bv : Number(bv) || 0;
+      if (an !== bn) return (an - bn) * dir;
+      return String(a.address || '').localeCompare(String(b.address || '')) * dir;
+    }
 
-    const totalPages = Math.ceil(total / limit);
+    let enriched;
+    let total;
+
+    if (countSorts.has(sortBy)) {
+      const allRows = await baseQb().orderBy('email.address', 'ASC').getMany();
+      total = allRows.length;
+      const allEnriched = await enrichEmailRows(allRows);
+      allEnriched.sort(compareEnriched);
+      enriched = allEnriched.slice(skip, skip + limit);
+    } else {
+      const columnMap = {
+        createdAt: 'email.createdAt',
+        updatedAt: 'email.updatedAt',
+        address: 'email.address',
+        status: 'email.status',
+        firstName: 'email.firstName',
+        lastName: 'email.lastName',
+      };
+      const orderCol = columnMap[sortBy] || 'email.createdAt';
+      const dataQuery = baseQb()
+        .orderBy(orderCol, sortOrder.toUpperCase())
+        .skip(skip)
+        .take(limit);
+
+      const countQuery = emailRepository.createQueryBuilder('email');
+      applyEmailListFilters(countQuery, req.query);
+
+      const [data, totalCount] = await Promise.all([
+        dataQuery.getMany(),
+        countQuery.getCount(),
+      ]);
+      total = totalCount;
+      enriched = await enrichEmailRows(data);
+    }
+
+    const totalPages = Math.ceil(total / limit) || 1;
 
     res.json({
       data: enriched,
@@ -282,6 +500,8 @@ export async function getEmails(req, res) {
       limit,
       total,
       totalPages,
+      sortBy,
+      sortOrder,
     });
   } catch (error) {
     console.error('Get emails error:', error);
@@ -539,9 +759,13 @@ export async function uploadEmails(req, res) {
     let rows = [];
 
     if (fileExtension === 'csv') {
-      // Parse CSV
-      const fileContent = await fs.readFile(filePath, 'utf-8');
-      const lines = fileContent.split('\n').filter(line => line.trim());
+      // Parse CSV — detect encoding (Excel often exports Windows-1250/1252, not UTF-8)
+      const fileBuffer = await fs.readFile(filePath);
+      const { text: fileContent, encoding: csvEncoding } = decodeCsvBuffer(fileBuffer);
+      if (csvEncoding !== 'utf-8') {
+        console.log(`[uploadEmails] Decoded CSV as ${csvEncoding}`);
+      }
+      const lines = fileContent.split(/\r?\n/).filter(line => line.trim());
 
       if (lines.length < 2) {
         await fs.unlink(filePath).catch(() => {});

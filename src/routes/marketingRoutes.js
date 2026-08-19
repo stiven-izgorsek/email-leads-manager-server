@@ -12,6 +12,8 @@ import {
   stopMarketingForEmailHandler,
   unassignMarketingLeadHandler,
   unassignAllPendingMarketingLeadsHandler,
+  retryFailedMarketingLeadHandler,
+  retryFailedMarketingLeadsHandler,
   resetDailySentCountHandler,
   listDomainBlockAlertsHandler,
   dismissDomainBlockAlertHandler,
@@ -27,6 +29,8 @@ router.patch('/emails/:emailId/enabled', setMarketingEnabledHandler);
 router.patch('/emails/:emailId/assign-default', setMarketingAssignDefaultHandler);
 router.delete('/assignments/leads/:assignmentLeadId', unassignMarketingLeadHandler);
 router.post('/unassign-all-pending', unassignAllPendingMarketingLeadsHandler);
+router.post('/assignments/leads/:assignmentLeadId/retry', retryFailedMarketingLeadHandler);
+router.post('/retry-failed', retryFailedMarketingLeadsHandler);
 router.post('/assign', assignMarketingLeads);
 router.post('/assign-all', assignMarketingLeadsAll);
 router.post('/start/:emailId', startMarketingForEmail);
