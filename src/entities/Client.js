@@ -1,7 +1,7 @@
 import { EntitySchema } from 'typeorm';
 
 export class Client {
-  constructor(id, firstName, lastName, linkedin, companyName, companyUrl, companyLinkedin, industries, templateIndustry, status, sentBy, lastSent, tech, companyLocation, email, emailStatus, location, contactedBy, jobTitle, photoUrl, employees, isSent, isReplied, isFollowup, note, leadFilterId, millionsStatus, apolloEmailStatus, apolloSuggestedEmail, apolloEmailCheckedAt, createdAt, updatedAt, deletedAt) {
+  constructor(id, firstName, lastName, linkedin, companyName, companyUrl, companyLinkedin, industries, templateIndustry, status, sentBy, lastSent, tech, companyLocation, email, emailStatus, location, contactedBy, jobTitle, photoUrl, employees, isSent, isReplied, isFollowup, note, leadFilterId, millionsStatus, apolloEmailStatus, apolloSuggestedEmail, apolloEmailCheckedAt, isInCrmClient, lastInboundMessageType, createdAt, updatedAt, deletedAt) {
     this.id = id;
     this.firstName = firstName;
     this.lastName = lastName;
@@ -32,6 +32,10 @@ export class Client {
     this.apolloEmailStatus = apolloEmailStatus;
     this.apolloSuggestedEmail = apolloSuggestedEmail;
     this.apolloEmailCheckedAt = apolloEmailCheckedAt;
+    /** True when a crm_client row links this lead by leadId or email. */
+    this.isInCrmClient = isInCrmClient;
+    /** Latest non-hidden inbound message type for this lead email (denormalized from incoming_message). */
+    this.lastInboundMessageType = lastInboundMessageType;
     this.createdAt = createdAt;
     this.updatedAt = updatedAt;
     this.deletedAt = deletedAt;
@@ -194,6 +198,18 @@ export const ClientSchema = new EntitySchema({
       name: 'apollo_email_checked_at',
       type: 'timestamp',
       nullable: true,
+    },
+    lastInboundMessageType: {
+      name: 'last_inbound_message_type',
+      type: 'varchar',
+      length: 50,
+      nullable: true,
+    },
+    isInCrmClient: {
+      name: 'is_in_crm_client',
+      type: 'boolean',
+      nullable: false,
+      default: false,
     },
     createdAt: {
       type: 'timestamp',

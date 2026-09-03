@@ -6,9 +6,11 @@ import { MarketingAssignment } from '../entities/MarketingAssignment.js';
 import { MarketingAssignmentLead } from '../entities/MarketingAssignmentLead.js';
 import {
   fetchOooRepliedLeads,
+  fetchUsedLeads,
   fetchUncontactedVerifiedLeads,
   resetLeadsFromReady,
 } from './leadFetchService.js';
+import { normalizePriorityCountries } from '../utils/marketingLeadPriorityCountries.js';
 import {
   composeLeadOutboundEmail,
   composeLeadOutboundEmailWithAi,
@@ -1090,6 +1092,87 @@ function resolveOooWantedCount(total, mix) {
   return Math.max(0, Math.min(n, Math.floor((n * numerator) / denominator)));
 }
 
+function sumReclaimNeed(plans, includeOoo, oooMix, includeUsed, usedMix) {
+  let totalOoo = 0;
+  let totalUsed = 0;
+  for (const { count: n } of plans) {
+    if (includeOoo) {
+      totalOoo += oooMix === 'only' ? n : resolveOooWantedCount(n, oooMix);
+    }
+    if (includeUsed) {
+      totalUsed += usedMix === 'only' ? n : resolveOooWantedCount(n, usedMix);
+    }
+  }
+  return { totalOoo, totalUsed };
+}
+
+function sliceFromPool(pool, index, count) {
+  const slice = pool.slice(index, index + count);
+  return { slice, nextIndex: index + slice.length };
+}
+
+function pickReclaimLeadsForSlot(
+  n,
+  { includeOooReplied, oooMix, includeUsedLeads, usedMix },
+  pools
+) {
+  if (includeOooReplied && oooMix === 'only') {
+    const { slice, nextIndex } = sliceFromPool(pools.ooo, pools.oooIdx, n);
+    pools.oooIdx = nextIndex;
+    return slice;
+  }
+  if (includeUsedLeads && usedMix === 'only') {
+    const { slice, nextIndex } = sliceFromPool(pools.used, pools.usedIdx, n);
+    pools.usedIdx = nextIndex;
+    return slice;
+  }
+
+  const leads = [];
+  const oooWanted = includeOooReplied ? resolveOooWantedCount(n, oooMix) : 0;
+  const usedWanted = includeUsedLeads ? resolveOooWantedCount(n, usedMix) : 0;
+
+  if (oooWanted > 0) {
+    const { slice, nextIndex } = sliceFromPool(pools.ooo, pools.oooIdx, Math.min(oooWanted, n));
+    pools.oooIdx = nextIndex;
+    leads.push(...slice);
+  }
+  if (includeUsedLeads && usedWanted > 0 && leads.length < n) {
+    const want = Math.min(usedWanted, n - leads.length);
+    const { slice, nextIndex } = sliceFromPool(pools.used, pools.usedIdx, want);
+    pools.usedIdx = nextIndex;
+    leads.push(...slice);
+  }
+  return leads;
+}
+
+async function attachClaimedLeadsToEmail(emailId, leads, assignmentDate) {
+  if (!leads.length) {
+    return { assigned: 0, message: 'No leads to attach' };
+  }
+  const date = getAssignmentDateString(assignmentDate);
+  const emailRepo = AppDataSource.getRepository(Email);
+  const email = await emailRepo.findOne({ where: { id: emailId, deletedAt: null } });
+  if (!email) throw new Error('Email account not found');
+
+  const assignment = await getOrCreateAssignment(email.id, date);
+  const leadRepo = AppDataSource.getRepository(MarketingAssignmentLead);
+  const entities = leads.map((client) =>
+    leadRepo.create({
+      assignmentId: assignment.id,
+      clientId: client.id,
+      sendStatus: 'pending',
+    })
+  );
+  await leadRepo.save(entities);
+
+  assignment.targetCount = await syncAssignmentTargetCount(assignment.id);
+  assignment.status = 'assigned';
+  assignment.lastError = null;
+  await AppDataSource.getRepository(MarketingAssignment).save(assignment);
+
+  return { assigned: leads.length, assignmentId: assignment.id };
+}
+
 export async function assignLeadsToEmail(emailId, count, assignmentDate, filters = {}) {
   const date = getAssignmentDateString(assignmentDate);
   const channel = filters.channel === 'smtp' ? 'smtp' : 'nylas';
@@ -1130,8 +1213,15 @@ export async function assignLeadsToEmail(emailId, count, assignmentDate, filters
 
   const includeOooReplied = Boolean(filters.includeOooReplied);
   const oooMix = includeOooReplied ? normalizeOooMix(filters.oooMix) : null;
+  const includeUsedLeads = Boolean(filters.includeUsedLeads);
+  const usedMix = includeUsedLeads ? normalizeOooMix(filters.usedMix) : null;
+  const priorityCountries = includeUsedLeads
+    ? normalizePriorityCountries(filters.priorityCountries)
+    : [];
   const oooWanted = includeOooReplied ? resolveOooWantedCount(n, oooMix) : 0;
-  const fillNew = !includeOooReplied || oooMix !== 'only';
+  const usedWanted = includeUsedLeads ? resolveOooWantedCount(n, usedMix) : 0;
+  const fillNew =
+    !(includeOooReplied && oooMix === 'only') && !(includeUsedLeads && usedMix === 'only');
   const poolOptions = {
     verifiedOnly: true,
     assignmentDate: date,
@@ -1141,51 +1231,52 @@ export async function assignLeadsToEmail(emailId, count, assignmentDate, filters
     location: filters.location,
     locations: filters.locations,
     industry: filters.industry,
+    priorityCountries,
   };
 
   let leads = [];
-  if (oooWanted > 0) {
-    leads = await fetchOooRepliedLeads({
-      count: oooWanted,
-      ...poolOptions,
-    });
-  }
-  if (fillNew && leads.length < n) {
-    const rest = await fetchUncontactedVerifiedLeads({
-      count: n - leads.length,
-      ...poolOptions,
-      excludeClientIds: leads.map((c) => c.id),
-    });
-    leads = [...leads, ...rest];
+  if (includeOooReplied && oooMix === 'only') {
+    leads = await fetchOooRepliedLeads({ count: n, ...poolOptions });
+  } else if (includeUsedLeads && usedMix === 'only') {
+    leads = await fetchUsedLeads({ count: n, ...poolOptions });
+  } else {
+    if (oooWanted > 0) {
+      leads = await fetchOooRepliedLeads({
+        count: Math.min(oooWanted, n),
+        ...poolOptions,
+      });
+    }
+    if (includeUsedLeads && usedWanted > 0 && leads.length < n) {
+      const used = await fetchUsedLeads({
+        count: Math.min(usedWanted, n - leads.length),
+        ...poolOptions,
+        excludeClientIds: leads.map((c) => c.id),
+      });
+      leads = [...leads, ...used];
+    }
+    if (fillNew && leads.length < n) {
+      const rest = await fetchUncontactedVerifiedLeads({
+        count: n - leads.length,
+        ...poolOptions,
+        excludeClientIds: leads.map((c) => c.id),
+      });
+      leads = [...leads, ...rest];
+    }
   }
   if (!leads.length) {
     return {
       assigned: 0,
-      message: includeOooReplied
-        ? oooMix === 'only'
-          ? 'No available OOO-replied Millions-verified leads to assign'
-          : 'No available OOO-replied or new Millions-verified leads to assign'
-        : 'No available new Millions-verified leads to assign (ready/sent leads are excluded)',
+      message: includeOooReplied && oooMix === 'only'
+        ? 'No available OOO-replied Millions-verified leads to assign'
+        : includeUsedLeads && usedMix === 'only'
+          ? 'No available used Millions-verified leads to assign (replied leads and CRM clients are excluded)'
+          : includeOooReplied || includeUsedLeads
+            ? 'No available reclaim or new Millions-verified leads to assign'
+            : 'No available new Millions-verified leads to assign (ready/sent leads are excluded)',
     };
   }
 
-  const assignment = await getOrCreateAssignment(email.id, date);
-  const leadRepo = AppDataSource.getRepository(MarketingAssignmentLead);
-  const entities = leads.map((client) =>
-    leadRepo.create({
-      assignmentId: assignment.id,
-      clientId: client.id,
-      sendStatus: 'pending',
-    })
-  );
-  await leadRepo.save(entities);
-
-  assignment.targetCount = await syncAssignmentTargetCount(assignment.id);
-  assignment.status = 'assigned';
-  assignment.lastError = null;
-  await AppDataSource.getRepository(MarketingAssignment).save(assignment);
-
-  return { assigned: leads.length, assignmentId: assignment.id };
+  return attachClaimedLeadsToEmail(emailId, leads, date);
 }
 
 export async function getAssignmentLeadsForEmail(emailId, assignmentDate) {
@@ -1561,11 +1652,15 @@ export async function assignLeadsToAll(countPerAccount, assignmentDate, filters 
   const continentLocations = getContinentLocationKeywords(continent);
   const includeOooReplied = Boolean(filters.includeOooReplied);
   const oooMix = includeOooReplied ? normalizeOooMix(filters.oooMix) : null;
+  const includeUsedLeads = Boolean(filters.includeUsedLeads);
+  const usedMix = includeUsedLeads ? normalizeOooMix(filters.usedMix) : null;
   const assignFilters = {
     ...filters,
     channel,
     includeOooReplied,
     oooMix,
+    includeUsedLeads,
+    usedMix,
     ...(continentLocations.length ? { locations: continentLocations } : {}),
   };
 
@@ -1579,11 +1674,15 @@ export async function assignLeadsToAll(countPerAccount, assignmentDate, filters 
       assignFraction: continent ? assignFraction || 'all' : null,
       includeOooReplied,
       oooMix,
+      includeUsedLeads,
+      usedMix,
     };
   }
 
   const accounts = [];
   let totalAssigned = 0;
+
+  const plans = [];
   for (const row of eligible) {
     const remaining = resolveMarketingAssignCount(row, defaultCount);
     const dailyLimit = resolveMarketingDailyLimit(row, defaultCount);
@@ -1609,8 +1708,85 @@ export async function assignLeadsToAll(countPerAccount, assignmentDate, filters 
       });
       continue;
     }
+    plans.push({ row, count, dailyLimit, alreadyAllocated });
+  }
+
+  const poolOptions = {
+    verifiedOnly: true,
+    assignmentDate: date,
+    leadFilterId: assignFilters.leadFilterId,
+    leadFilterIds: assignFilters.leadFilterIds,
+    leadFilterMode: assignFilters.leadFilterMode,
+    location: assignFilters.location,
+    locations: assignFilters.locations,
+    industry: assignFilters.industry,
+    priorityCountries: includeUsedLeads
+      ? normalizePriorityCountries(assignFilters.priorityCountries)
+      : [],
+  };
+
+  const fillNew =
+    !(includeOooReplied && oooMix === 'only') && !(includeUsedLeads && usedMix === 'only');
+
+  let oooPool = [];
+  let usedPool = [];
+  if (plans.length && (includeOooReplied || includeUsedLeads)) {
+    const { totalOoo, totalUsed } = sumReclaimNeed(
+      plans,
+      includeOooReplied,
+      oooMix,
+      includeUsedLeads,
+      usedMix
+    );
+    if (totalOoo > 0) {
+      oooPool = await fetchOooRepliedLeads({ count: totalOoo, ...poolOptions });
+    }
+    if (totalUsed > 0) {
+      usedPool = await fetchUsedLeads({
+        count: totalUsed,
+        ...poolOptions,
+        excludeClientIds: oooPool.map((l) => l.id),
+      });
+    }
+  }
+
+  const reclaimPools = { ooo: oooPool, used: usedPool, oooIdx: 0, usedIdx: 0 };
+
+  for (const plan of plans) {
+    const { row, count, dailyLimit, alreadyAllocated } = plan;
     try {
-      const result = await assignLeadsToEmail(row.emailId, count, date, assignFilters);
+      let leads = pickReclaimLeadsForSlot(
+        count,
+        { includeOooReplied, oooMix, includeUsedLeads, usedMix },
+        reclaimPools
+      );
+
+      if (fillNew && leads.length < count) {
+        const rest = await fetchUncontactedVerifiedLeads({
+          count: count - leads.length,
+          ...poolOptions,
+          excludeClientIds: [
+            ...oooPool.map((l) => l.id),
+            ...usedPool.map((l) => l.id),
+            ...leads.map((l) => l.id),
+          ],
+        });
+        leads = [...leads, ...rest];
+      }
+
+      const result =
+        leads.length > 0
+          ? await attachClaimedLeadsToEmail(row.emailId, leads, date)
+          : {
+              assigned: 0,
+              message:
+                includeUsedLeads && usedMix === 'only'
+                  ? 'No available used Millions-verified leads to assign'
+                  : includeOooReplied && oooMix === 'only'
+                    ? 'No available OOO-replied Millions-verified leads to assign'
+                    : 'No available reclaim or new Millions-verified leads to assign',
+            };
+
       totalAssigned += result.assigned || 0;
       accounts.push({
         emailId: row.emailId,
@@ -1643,6 +1819,8 @@ export async function assignLeadsToAll(countPerAccount, assignmentDate, filters 
     assignFraction: continent ? assignFraction || 'all' : null,
     includeOooReplied,
     oooMix,
+    includeUsedLeads,
+    usedMix,
   };
 }
 

@@ -29,6 +29,9 @@ import { releaseAllOrphanedMarketingRuns } from './services/marketingService.js'
 import { releaseAllOrphanedFollowupRuns } from './services/followupService.js';
 import { ensureDefaultHiddenSenderEntries } from './services/incomingSenderFilterService.js';
 import { ensureEcomLuxuryOutreachTemplates } from './services/ecomLuxuryTemplateSeed.js';
+import { backfillClientLastInboundMessageType } from './services/leadReplyStatusService.js';
+import { backfillClientCrmLinkFlags } from './services/crmClientLeadLinkService.js';
+import { getHeavyWorkSnapshot } from './utils/backgroundWork.js';
 
 // Load environment variables
 dotenv.config();
@@ -54,7 +57,11 @@ app.use(cookieParser());
 
 // Health check endpoint
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', message: 'Server is running' });
+  res.json({
+    status: 'ok',
+    message: 'Server is running',
+    background: getHeavyWorkSnapshot(),
+  });
 });
 
 // API routes
@@ -103,6 +110,12 @@ async function startServer() {
     await connectDatabase();
     await ensureDefaultHiddenSenderEntries();
     await ensureEcomLuxuryOutreachTemplates();
+    backfillClientLastInboundMessageType().catch((err) => {
+      console.error('[lead-reply] Startup OOO backfill failed:', err.message || err);
+    });
+    backfillClientCrmLinkFlags().catch((err) => {
+      console.error('[crm-link] Startup CRM link backfill failed:', err.message || err);
+    });
     const releasedMarketing = await releaseAllOrphanedMarketingRuns('server startup');
     if (releasedMarketing > 0) {
       console.log(
@@ -115,10 +128,10 @@ async function startServer() {
         `[followup] Cleared ${releasedFollowup} orphaned "running" mailbox flag(s) from before restart`
       );
     }
-    startNylasUnreadPollingJob();
-    startImapUnreadPollingJob();
-    startCalendarSyncJob();
-    startMeetingReminderJob();
+    startNylasUnreadPollingJob({ initialDelayMs: 3_000 });
+    startImapUnreadPollingJob({ initialDelayMs: 8_000 });
+    startCalendarSyncJob({ initialDelayMs: 20_000 });
+    startMeetingReminderJob({ initialDelayMs: 25_000 });
     app.listen(PORT, () => {
       console.log(`Server is running on port ${PORT}`);
       console.log(`Health check: http://localhost:${PORT}/health`);

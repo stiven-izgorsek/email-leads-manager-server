@@ -107,6 +107,9 @@ export async function assignMarketingLeadsAll(req, res) {
       assignFraction,
       includeOooReplied: Boolean(req.body?.includeOooReplied),
       oooMix: req.body?.oooMix,
+      includeUsedLeads: Boolean(req.body?.includeUsedLeads),
+      usedMix: req.body?.usedMix,
+      priorityCountries: req.body?.priorityCountries,
     });
     res.json(result);
   } catch (error) {

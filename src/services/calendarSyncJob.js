@@ -25,9 +25,19 @@ async function tick() {
   }
 }
 
-export function startCalendarSyncJob() {
+export function startCalendarSyncJob({ initialDelayMs = 0 } = {}) {
   if (timer) return;
-  console.log(`[calendar-sync] Job scheduled every ${Math.round(intervalMs / 60000)} minute(s)`);
-  void tick();
-  timer = setInterval(() => void tick(), intervalMs);
+  const kickoff = () => {
+    console.log(`[calendar-sync] Job scheduled every ${Math.round(intervalMs / 60000)} minute(s)`);
+    void tick();
+    timer = setInterval(() => void tick(), intervalMs);
+  };
+  if (initialDelayMs > 0) {
+    console.log(
+      `[calendar-sync] First sync in ${Math.round(initialDelayMs / 1000)}s (staggered startup)`
+    );
+    setTimeout(kickoff, initialDelayMs);
+  } else {
+    kickoff();
+  }
 }

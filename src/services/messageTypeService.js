@@ -1,5 +1,6 @@
 import { AppDataSource } from '../config/database.js';
 import { MessageTypeRule } from '../entities/MessageTypeRule.js';
+import { refreshClientLastInboundMessageType } from './leadReplyStatusService.js';
 import { createChatCompletion } from './applicationService.js';
 import {
   classifyIncomingMessageWithOllama,
@@ -455,6 +456,12 @@ async function reclassifyStoredDeliveryMessages() {
         OR subject ~* '(^|[^a-z])ooo([^a-z]|$)'
       )
   `);
+
+  try {
+    await refreshClientLastInboundMessageType();
+  } catch (err) {
+    console.error('[message-type] Failed refreshing last_inbound_message_type after reclassify:', err.message || err);
+  }
 }
 
 export async function loadMessageTypeRules() {

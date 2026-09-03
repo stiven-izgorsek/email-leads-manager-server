@@ -392,7 +392,10 @@ let timer = null;
 let running = false;
 
 async function tick() {
-  if (running) return;
+  if (running) {
+    console.log('[meeting-reminder] Skipping tick — previous still running');
+    return;
+  }
   running = true;
   try {
     await runMeetingReminderTick();
@@ -403,7 +406,7 @@ async function tick() {
   }
 }
 
-export function startMeetingReminderJob() {
+export function startMeetingReminderJob({ initialDelayMs = 0 } = {}) {
   if (timer) return;
   if (!getMeetingsWebhookUrl()) {
     console.log(
@@ -413,9 +416,19 @@ export function startMeetingReminderJob() {
   }
   const pollMs = getReminderPollMs();
   const lead = getReminderLeadMinutes();
-  console.log(
-    `[meeting-reminder] Job every ${Math.round(pollMs / 1000)}s — Slack ~${lead} min before each meeting → ${getSlackMeetingsChannel()}`
-  );
-  void tick();
-  timer = setInterval(() => void tick(), pollMs);
+  const kickoff = () => {
+    console.log(
+      `[meeting-reminder] Job every ${Math.round(pollMs / 1000)}s — Slack ~${lead} min before each meeting → ${getSlackMeetingsChannel()}`
+    );
+    void tick();
+    timer = setInterval(() => void tick(), pollMs);
+  };
+  if (initialDelayMs > 0) {
+    console.log(
+      `[meeting-reminder] First tick in ${Math.round(initialDelayMs / 1000)}s (staggered startup)`
+    );
+    setTimeout(kickoff, initialDelayMs);
+  } else {
+    kickoff();
+  }
 }

@@ -19,6 +19,7 @@ import {
   MESSAGE_TYPE_HIDE_SENDER,
 } from './incomingSenderFilterService.js';
 import { isAppPasswordFeaturesEnabled } from './smtpSendService.js';
+import { getPollBackoffMsWhenHeavy, isHeavyWorkActive } from '../utils/backgroundWork.js';
 
 const POLL_MS = Math.min(
   30 * 60 * 1000,
@@ -376,7 +377,10 @@ async function fetchUnreadMessagesForMailbox(emailRow) {
 
 async function pollImapUnreadEmails() {
   if (!isAppPasswordFeaturesEnabled()) return;
-  if (isRunning) return;
+  if (isRunning) {
+    console.log('[IMAP] Skipping tick — previous poll still running');
+    return;
+  }
   isRunning = true;
 
   try {
@@ -389,6 +393,13 @@ async function pollImapUnreadEmails() {
       .andWhere("TRIM(email.app_password) <> ''")
       .getMany();
 
+    const staggerMs = getPollBackoffMsWhenHeavy(POLL_STAGGER_MS);
+    if (isHeavyWorkActive() && emailAccounts.length) {
+      console.log(
+        `[IMAP] Heavy work active — using ${staggerMs}ms mailbox stagger (${emailAccounts.length} mailboxes)`
+      );
+    }
+
     for (let i = 0; i < emailAccounts.length; i += 1) {
       const emailRow = emailAccounts[i];
       try {
@@ -396,8 +407,8 @@ async function pollImapUnreadEmails() {
       } catch (error) {
         console.error(`[IMAP] Failed polling ${emailRow.address}:`, error.message || error);
       }
-      if (POLL_STAGGER_MS > 0 && i < emailAccounts.length - 1) {
-        await sleep(POLL_STAGGER_MS);
+      if (staggerMs > 0 && i < emailAccounts.length - 1) {
+        await sleep(staggerMs);
       }
     }
   } catch (error) {
@@ -407,7 +418,7 @@ async function pollImapUnreadEmails() {
   }
 }
 
-export function startImapUnreadPollingJob() {
+export function startImapUnreadPollingJob({ initialDelayMs = 0 } = {}) {
   if (!isAppPasswordFeaturesEnabled()) {
     console.log(
       '[IMAP] App-password unread polling DISABLED (APP_PASSWORD_FEATURES_ENABLED=false)'
@@ -415,9 +426,17 @@ export function startImapUnreadPollingJob() {
     return;
   }
   if (timer) return;
-  pollImapUnreadEmails().catch(() => undefined);
-  timer = setInterval(() => {
+  const kickoff = () => {
     pollImapUnreadEmails().catch(() => undefined);
-  }, POLL_MS);
-  console.log(`[IMAP] App-password unread polling started (every ${Math.round(POLL_MS / 1000)}s)`);
+    timer = setInterval(() => {
+      pollImapUnreadEmails().catch(() => undefined);
+    }, POLL_MS);
+    console.log(`[IMAP] App-password unread polling started (every ${Math.round(POLL_MS / 1000)}s)`);
+  };
+  if (initialDelayMs > 0) {
+    console.log(`[IMAP] First poll in ${Math.round(initialDelayMs / 1000)}s (staggered startup)`);
+    setTimeout(kickoff, initialDelayMs);
+  } else {
+    kickoff();
+  }
 }

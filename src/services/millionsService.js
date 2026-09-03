@@ -3,7 +3,7 @@
  * API Documentation: https://api.millionverifier.com/api/v3/
  *
  * Concurrency knobs (env):
- * - MILLIONS_VERIFY_CONCURRENCY — parallel single-email calls (default 10, max 50)
+ * - MILLIONS_VERIFY_CONCURRENCY — parallel single-email calls (default 5, max 50)
  * - MILLIONS_VERIFY_DELAY_MS — optional pause after each call per worker (default 0)
  */
 
@@ -14,7 +14,7 @@ function getVerifyConcurrency(override) {
     return Math.min(50, Math.floor(override));
   }
   const n = parseInt(process.env.MILLIONS_VERIFY_CONCURRENCY || '', 10);
-  return Number.isFinite(n) && n >= 1 ? Math.min(50, n) : 10;
+  return Number.isFinite(n) && n >= 1 ? Math.min(50, n) : 5;
 }
 
 function getVerifyDelayMs() {

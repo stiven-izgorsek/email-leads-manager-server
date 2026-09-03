@@ -12,9 +12,13 @@ import { verifyEmailsBulk } from '../services/millionsService.js';
 import {
   fetchUncontactedVerifiedLeads,
   getUncontactedPoolStats,
+  getOooReclaimablePoolStats,
+  getUsedReclaimablePoolStats,
   resetLeadsFromReady,
 } from '../services/leadFetchService.js';
 import { countOutboundEmailsInRange } from '../services/outboundEmailStatsService.js';
+import { getDashboardAnalytics as fetchDashboardAnalytics } from '../services/dashboardAnalyticsService.js';
+import { runHeavyWork, yieldToEventLoop } from '../utils/backgroundWork.js';
 import { leadsToCsv } from '../utils/csvExport.js';
 import { getFirstEmailFromCsvRow } from '../utils/csvLeadImport.js';
 import { decodeCsvBuffer, preferRepairedName, repairImportedText } from '../utils/csvEncoding.js';
@@ -379,6 +383,7 @@ export async function uploadLeads(req, res) {
       Object.assign(j, patch);
     };
 
+    void runHeavyWork('lead-csv-import', async () => {
     try {
     const clientRepository = AppDataSource.getRepository(Client);
     const leadFilterRepository = AppDataSource.getRepository(LeadFilter);
@@ -817,6 +822,7 @@ export async function uploadLeads(req, res) {
           total: rows.length,
           errorCount: errors.length,
         });
+        await yieldToEventLoop();
       }
     }
 
@@ -1037,6 +1043,7 @@ export async function uploadLeads(req, res) {
           errorCount: errors.length,
           skipCounts: { ...skipCounts },
         });
+        await yieldToEventLoop();
       }
     }
 
@@ -1077,6 +1084,7 @@ export async function uploadLeads(req, res) {
         // ignore cleanup errors
       }
     }
+    });
   } catch (error) {
     console.error('Upload leads error:', error);
     // Only reached if we failed before sending 202
@@ -1509,6 +1517,41 @@ export async function getUncontactedLeads(req, res) {
   }
 }
 
+/**
+ * Counts for the marketing assign pool: new + Millions verified (good/risky),
+ * not already pending/ready, same rules as assignLeadsToEmail.
+ */
+export async function getAssignablePoolStats(req, res) {
+  try {
+    const verifiedOnly = req.query.verifiedOnly !== 'false';
+    const [pool, oooPool, usedPool] = await Promise.all([
+      getUncontactedPoolStats({ verifiedOnly }),
+      getOooReclaimablePoolStats({ verifiedOnly }),
+      getUsedReclaimablePoolStats({ verifiedOnly }),
+    ]);
+    res.json({
+      success: true,
+      data: {
+        /** Leads marketing can assign right now */
+        assignable: pool.available,
+        /** Previously contacted leads with latest inbound OOO only */
+        oooReclaimable: oooPool.available,
+        /** Previously used leads (not replied, not in CRM) */
+        usedReclaimable: usedPool.available,
+        /** All new (unsent) leads */
+        newTotal: pool.newTotal,
+        /** New leads with Millions status good or risky */
+        newVerified: pool.newVerifiedGoodOrRisky,
+        /** Verified new leads blocked by a pending marketing assignment */
+        blockedByPendingMarketing: pool.blockedByPendingMarketing,
+      },
+    });
+  } catch (error) {
+    console.error('Get assignable pool stats error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
 export async function getLeadFilters(req, res) {
   try {
     const leadFilterRepository = AppDataSource.getRepository(LeadFilter);
@@ -1767,7 +1810,7 @@ export async function checkLeadsStatus(req, res) {
 export async function getDashboardKPIs(req, res) {
   try {
     const clientRepository = AppDataSource.getRepository(Client);
-    
+
     // Get today's date range (start and end of today)
     const today = new Date();
     today.setHours(0, 0, 0, 0);
@@ -1807,22 +1850,22 @@ export async function getDashboardKPIs(req, res) {
       .andWhere('client.updatedAt < :tomorrow', { tomorrow })
       .getCount();
     
-    // Count meetings scheduled (check status or note field)
-    // Assuming meetings might be tracked in status field or note contains "meeting"
-    // We'll check for status that might indicate meeting, or note containing meeting keywords
-    const meetingsScheduledToday = await clientRepository
-      .createQueryBuilder('client')
-      .where('client.deletedAt IS NULL')
-      .andWhere(
-        '(client.status ILIKE :meetingStatus OR client.note ILIKE :meetingNote)',
-        { 
-          meetingStatus: '%meeting%',
-          meetingNote: '%meeting%'
-        }
-      )
-      .andWhere('client.updatedAt >= :today', { today })
-      .andWhere('client.updatedAt < :tomorrow', { tomorrow })
-      .getCount();
+    // Count meetings scheduled today from calendar (same source as Calendar page / analytics charts)
+    const meetingRows = await AppDataSource.query(
+      `
+      SELECT COUNT(*)::int AS count
+      FROM calendar_event ce
+      WHERE ce.deleted_at IS NULL
+        AND ce.start_at >= $1
+        AND ce.start_at < $2
+        AND (
+          ce.event_status IS NULL
+          OR LOWER(TRIM(ce.event_status)) NOT IN ('cancelled', 'canceled')
+        )
+      `,
+      [today, tomorrow]
+    );
+    const meetingsScheduledToday = Number(meetingRows?.[0]?.count || 0);
     
     res.json({
       success: true,
@@ -1837,6 +1880,16 @@ export async function getDashboardKPIs(req, res) {
     });
   } catch (error) {
     console.error('Get dashboard KPIs error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
+export async function getDashboardAnalytics(req, res) {
+  try {
+    const data = await fetchDashboardAnalytics();
+    res.json({ success: true, data });
+  } catch (error) {
+    console.error('Get dashboard analytics error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 }
@@ -2070,8 +2123,8 @@ export async function bulkVerifyEmails(req, res) {
       startTime: new Date(),
     });
 
-    // Start verification in background
-    (async () => {
+    // Start verification in background (queued behind other heavy jobs)
+    void runHeavyWork('millions-verify-selected', async () => {
       try {
         await verifyEmailsBulk(
           emails,
@@ -2099,6 +2152,7 @@ export async function bulkVerifyEmails(req, res) {
                 });
               }
             }
+            if (index % 25 === 0) await yieldToEventLoop();
           }
         );
 
@@ -2118,7 +2172,7 @@ export async function bulkVerifyEmails(req, res) {
           job.endTime = new Date();
         }
       }
-    })();
+    });
 
     res.json({
       success: true,
@@ -2191,8 +2245,8 @@ export async function bulkVerifyAllNew(req, res) {
       startTime: new Date(),
     });
 
-    // Start verification in background
-    (async () => {
+    // Start verification in background (queued behind other heavy jobs)
+    void runHeavyWork('millions-verify-all-new', async () => {
       try {
         await verifyEmailsBulk(
           emails,
@@ -2220,6 +2274,7 @@ export async function bulkVerifyAllNew(req, res) {
                 });
               }
             }
+            if (index % 25 === 0) await yieldToEventLoop();
           }
         );
 
@@ -2239,7 +2294,7 @@ export async function bulkVerifyAllNew(req, res) {
           job.endTime = new Date();
         }
       }
-    })();
+    });
 
     res.json({
       success: true,
@@ -2477,24 +2532,23 @@ export async function fetchApolloEmails(req, res) {
       });
     }
 
-    // Run enrichment in background so FE can poll progress
-    setImmediate(() => {
-      void (async () => {
-        const job = apolloFetchJobs.get(jobId);
-        if (!job) return;
+    // Run enrichment in background (queued behind other heavy jobs)
+    void runHeavyWork('apollo-email-fetch', async () => {
+      const job = apolloFetchJobs.get(jobId);
+      if (!job) return;
 
-        try {
-          const enrichInput = leads.map((lead) => ({
-            id: lead.id,
-            linkedin: lead.linkedin,
-            firstName: lead.firstName,
-            lastName: lead.lastName,
-            companyName: lead.companyName,
-            companyUrl: lead.companyUrl,
-          }));
+      try {
+        const enrichInput = leads.map((lead) => ({
+          id: lead.id,
+          linkedin: lead.linkedin,
+          firstName: lead.firstName,
+          lastName: lead.lastName,
+          companyName: lead.companyName,
+          companyUrl: lead.companyUrl,
+        }));
 
-          await bulkEnrichPeopleByLinkedIn(account.apiKey, enrichInput, {
-            onBatch: async ({ processed, total, batchResults }) => {
+        await bulkEnrichPeopleByLinkedIn(account.apiKey, enrichInput, {
+          onBatch: async ({ processed, total, batchResults }) => {
               const checkedAt = new Date();
               for (const item of batchResults) {
                 const lead = leads.find((l) => l.id === item.id);
@@ -2584,7 +2638,6 @@ export async function fetchApolloEmails(req, res) {
           job.error = error.message || 'Apollo fetch failed';
           job.completedAt = new Date().toISOString();
         }
-      })();
     });
 
     return res.json({

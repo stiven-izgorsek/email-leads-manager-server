@@ -17,6 +17,7 @@ import {
 import { NYLAS_LIST_PAGE_LIMIT, parseNylas429RetryDelayMs, nylasFetchWithRetry, sleep } from '../utils/nylasRateLimit.js';
 import { maybeCreateDomainBlockAlert } from './domainBlockAlertService.js';
 import { markLeadsRepliedFromIncomingMessage } from './leadReplyStatusService.js';
+import { getPollBackoffMsWhenHeavy, isHeavyWorkActive } from '../utils/backgroundWork.js';
 
 const POLL_MS = Math.min(
   30 * 60 * 1000,
@@ -411,7 +412,10 @@ async function fetchUnreadMessagesForMailbox(emailRow) {
 }
 
 async function pollUnreadEmails() {
-  if (isRunning) return;
+  if (isRunning) {
+    console.log('[NYLAS] Skipping tick — previous poll still running');
+    return;
+  }
   isRunning = true;
 
   try {
@@ -426,6 +430,13 @@ async function pollUnreadEmails() {
       .andWhere("TRIM(email.nylas_key) <> ''")
       .getMany();
 
+    const staggerMs = getPollBackoffMsWhenHeavy(POLL_STAGGER_MS);
+    if (isHeavyWorkActive() && emailAccounts.length) {
+      console.log(
+        `[NYLAS] Heavy work active — using ${staggerMs}ms mailbox stagger (${emailAccounts.length} mailboxes)`
+      );
+    }
+
     for (let i = 0; i < emailAccounts.length; i += 1) {
       const emailRow = emailAccounts[i];
       try {
@@ -435,8 +446,8 @@ async function pollUnreadEmails() {
           grantId: emailRow.grantId,
         });
       }
-      if (POLL_STAGGER_MS > 0 && i < emailAccounts.length - 1) {
-        await sleep(POLL_STAGGER_MS);
+      if (staggerMs > 0 && i < emailAccounts.length - 1) {
+        await sleep(staggerMs);
       }
     }
   } catch (error) {
@@ -446,12 +457,20 @@ async function pollUnreadEmails() {
   }
 }
 
-export function startNylasUnreadPollingJob() {
+export function startNylasUnreadPollingJob({ initialDelayMs = 0 } = {}) {
   if (timer) return;
-  pollUnreadEmails().catch(() => undefined);
-  timer = setInterval(() => {
+  const kickoff = () => {
     pollUnreadEmails().catch(() => undefined);
-  }, POLL_MS);
-  console.log(`[NYLAS] Unread-email polling started (every ${Math.round(POLL_MS / 1000)}s)`);
+    timer = setInterval(() => {
+      pollUnreadEmails().catch(() => undefined);
+    }, POLL_MS);
+    console.log(`[NYLAS] Unread-email polling started (every ${Math.round(POLL_MS / 1000)}s)`);
+  };
+  if (initialDelayMs > 0) {
+    console.log(`[NYLAS] First poll in ${Math.round(initialDelayMs / 1000)}s (staggered startup)`);
+    setTimeout(kickoff, initialDelayMs);
+  } else {
+    kickoff();
+  }
 }
 

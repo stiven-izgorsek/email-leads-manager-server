@@ -3,6 +3,77 @@ import { Client } from '../entities/Client.js';
 
 const SKIP_MESSAGE_TYPES = new Set(['ignored_sender', 'hide_sender']);
 
+/** SQL expression: normalized lead email from incoming_message.fromEmail */
+const INBOUND_LEAD_EMAIL_EXPR = `LOWER(TRIM(BOTH FROM regexp_replace(LOWER(TRIM(im."fromEmail")), '^.*<([^>]+)>.*$', '\\1')))`;
+
+/**
+ * Refresh denormalized last_inbound_message_type on client rows from stored incoming_message.
+ * Used at ingest and by backfill so OOO marketing assign avoids per-row subqueries.
+ *
+ * @param {string[]} [emails] - optional lead emails; omit to refresh all clients with inbound mail
+ * @returns {Promise<number>} rows updated
+ */
+export async function refreshClientLastInboundMessageType(emails = null) {
+  const normalized =
+    emails == null
+      ? null
+      : [...new Set((emails || []).map(normalizeReplyEmail).filter(Boolean))];
+  if (Array.isArray(normalized) && normalized.length === 0) return 0;
+
+  const emailFilter =
+    normalized == null
+      ? ''
+      : `AND parsed.lead_email = ANY($1::text[])`;
+
+  const params = normalized == null ? [] : [normalized];
+
+  const result = await AppDataSource.manager.query(
+    `
+    WITH parsed AS (
+      SELECT
+        ${INBOUND_LEAD_EMAIL_EXPR} AS lead_email,
+        LOWER(TRIM(COALESCE(im."messageType", ''))) AS message_type,
+        COALESCE(im."receivedAt", im."createdAt") AS received_at,
+        im."createdAt" AS created_at
+      FROM incoming_message im
+      WHERE im."deletedAt" IS NULL
+        AND im."fromEmail" IS NOT NULL
+        AND TRIM(im."fromEmail") <> ''
+        AND LOWER(TRIM(COALESCE(im."messageType", ''))) NOT IN ('ignored_sender', 'hide_sender')
+    ),
+    latest AS (
+      SELECT DISTINCT ON (lead_email) lead_email, message_type
+      FROM parsed
+      WHERE lead_email <> ''
+        ${emailFilter}
+      ORDER BY lead_email, received_at DESC NULLS LAST, created_at DESC
+    )
+    UPDATE client c
+    SET
+      last_inbound_message_type = l.message_type,
+      "updatedAt" = NOW()
+    FROM latest l
+    WHERE c."deletedAt" IS NULL
+      AND c.email IS NOT NULL
+      AND TRIM(c.email) <> ''
+      AND LOWER(TRIM(c.email)) = l.lead_email
+    RETURNING c.id
+    `,
+    params
+  );
+
+  return Array.isArray(result) ? result.length : 0;
+}
+
+/** One-time / startup backfill for all clients with stored inbound messages. */
+export async function backfillClientLastInboundMessageType() {
+  const updated = await refreshClientLastInboundMessageType();
+  if (updated > 0) {
+    console.log(`[lead-reply] backfilled last_inbound_message_type for ${updated} client(s)`);
+  }
+  return { updated };
+}
+
 /** Do not overwrite these CRM pipeline statuses when marking a reply/bounce. */
 const PROTECTED_STATUSES = new Set(['demoed', 'onboarding', 'hired']);
 
@@ -190,6 +261,12 @@ export async function markLeadsRepliedFromIncomingMessage({
     reason,
   });
 
+  try {
+    await refreshClientLastInboundMessageType(targetEmails);
+  } catch (error) {
+    console.error('[lead-reply] Failed refreshing last_inbound_message_type:', error.message || error);
+  }
+
   return { updated: ids.length, ids };
 }
 
@@ -294,5 +371,6 @@ export async function backfillLeadRepliedFromIncomingMessages() {
   return {
     humanUpdated: Array.isArray(human) ? human.length : 0,
     bounceUpdated: Array.isArray(bounce) ? bounce.length : 0,
+    ...(await backfillClientLastInboundMessageType()),
   };
 }

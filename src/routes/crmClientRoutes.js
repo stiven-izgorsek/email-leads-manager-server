@@ -9,6 +9,7 @@ import {
   getFollowUpCountsByDay,
   getCrmClientStatuses,
   getCrmClientCountsBySentAccount,
+  notifyFollowupReminderSlack,
 } from '../controllers/crmClientController.js';
 
 const router = express.Router();
@@ -23,5 +24,6 @@ router.post('/', createCrmClient);
 router.get('/:id', getCrmClient);
 router.put('/:id', updateCrmClient);
 router.delete('/:id', deleteCrmClient);
+router.post('/:id/notify-followup', notifyFollowupReminderSlack);
 
 export default router;

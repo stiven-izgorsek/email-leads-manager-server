@@ -2,7 +2,7 @@ import express from 'express';
 import multer from 'multer';
 import path from 'path';
 import os from 'os';
-import { getLeads, createLead, uploadLeads, getLeadUploadStatus, bulkDeleteLeads, bulkUpdateLeads, getUncontactedLeads, getLeadFilters, markClientAsSent, markClientAsFollowedUp, checkLeadsStatus, getDashboardKPIs, resetLeadsStatus, getEmailsSentInDateRange, bulkVerifyEmails, bulkVerifyAllNew, getNewLeadsVerificationCount, getVerificationStatus, downloadNewLeadsCsv, getFollowupCandidates, getApolloMissingEmailCount, fetchApolloEmails, getApolloFetchStatus, getLeadById, updateLead, deleteLead, getLeadHistory } from '../controllers/leadController.js';
+import { getLeads, createLead, uploadLeads, getLeadUploadStatus, bulkDeleteLeads, bulkUpdateLeads, getUncontactedLeads, getAssignablePoolStats, getLeadFilters, markClientAsSent, markClientAsFollowedUp, checkLeadsStatus, getDashboardKPIs, getDashboardAnalytics, resetLeadsStatus, getEmailsSentInDateRange, bulkVerifyEmails, bulkVerifyAllNew, getNewLeadsVerificationCount, getVerificationStatus, downloadNewLeadsCsv, getFollowupCandidates, getApolloMissingEmailCount, fetchApolloEmails, getApolloFetchStatus, getLeadById, updateLead, deleteLead, getLeadHistory } from '../controllers/leadController.js';
 // import { authenticateToken } from '../middleware/auth.js';
 
 const router = express.Router();
@@ -23,8 +23,10 @@ const upload = multer({ storage });
 
 router.get('/', getLeads);
 router.get('/uncontacted', getUncontactedLeads);
+router.get('/assignable-pool', getAssignablePoolStats);
 router.get('/filters', getLeadFilters);
 router.get('/dashboard-kpis', getDashboardKPIs);
+router.get('/dashboard-analytics', getDashboardAnalytics);
 router.get('/emails-date-range', getEmailsSentInDateRange);
 router.get('/followup-candidates', getFollowupCandidates);
 router.post('/', createLead);

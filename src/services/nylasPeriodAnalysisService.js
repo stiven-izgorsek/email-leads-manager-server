@@ -175,19 +175,24 @@ export async function analyzeNylasMessagesForPeriod({ preset, n }) {
   const accounts = await emailRepo
     .createQueryBuilder('email')
     .where('email.deletedAt IS NULL')
-    .andWhere('email.grant_id IS NOT NULL')
-    .andWhere("TRIM(email.grant_id) <> ''")
-    .andWhere('email.nylas_key IS NOT NULL')
-    .andWhere("TRIM(email.nylas_key) <> ''")
+    .andWhere('email.grantId IS NOT NULL')
+    .andWhere("TRIM(email.grantId) <> ''")
+    .andWhere('email.nylasKey IS NOT NULL')
+    .andWhere("TRIM(email.nylasKey) <> ''")
     .getMany();
 
   const data = [];
 
   for (const emailRow of accounts) {
+    const grantId = String(emailRow.grantId || '').trim();
+    const nylasKey = String(emailRow.nylasKey || '').trim();
+    // Skip App Password–only (or incomplete Nylas) mailboxes
+    if (!grantId || !nylasKey) continue;
+
     try {
       const messages = await fetchAllMessagesInRange(
-        emailRow.grantId,
-        emailRow.nylasKey,
+        grantId,
+        nylasKey,
         range.receivedAfter,
         range.receivedBefore
       );

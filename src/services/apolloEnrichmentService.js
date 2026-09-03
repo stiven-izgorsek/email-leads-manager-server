@@ -4,6 +4,7 @@
  * Single: POST https://api.apollo.io/api/v1/people/match
  */
 import { normalizeLinkedInUrl } from '../utils/linkedinUrl.js';
+import { yieldToEventLoop } from '../utils/backgroundWork.js';
 
 const APOLLO_BULK_MATCH_URL = 'https://api.apollo.io/api/v1/people/bulk_match';
 const BULK_BATCH_SIZE = 10;
@@ -129,6 +130,7 @@ export async function bulkEnrichPeopleByLinkedIn(apiKey, people, options = {}) {
 
     // Gentle pacing between Apollo bulk batches
     if (i + BULK_BATCH_SIZE < list.length) {
+      await yieldToEventLoop();
       await new Promise((r) => setTimeout(r, 300));
     }
   }

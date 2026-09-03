@@ -14,6 +14,7 @@ import {
   applyExcludeHiddenSendersForUpdate,
 } from '../services/incomingSenderFilterService.js';
 import { analyzeNylasMessagesForPeriod } from '../services/nylasPeriodAnalysisService.js';
+import { refreshClientLastInboundMessageType } from '../services/leadReplyStatusService.js';
 import {
   replyToIncomingMessageById,
   listManualRepliesForIncomingMessage,
@@ -82,22 +83,68 @@ function getMarkAllReadDayBounds(body) {
 }
 
 /** Exclude App Password / SMTP rows when excludeSmtp is set. */
+/** Bounce/block types stay visible even when routine SMTP mail is hidden. */
+const SMTP_ALWAYS_VISIBLE_TYPES = ['blocked', 'delivery_failed', 'no_address'];
+
 function applyExcludeSmtp(qb, alias = 'm') {
-  qb.andWhere(`(${alias}.source IS NULL OR ${alias}.source <> :appPasswordSource)`, {
-    appPasswordSource: 'app_password',
-  });
+  qb.andWhere(
+    `(${alias}.source IS NULL OR ${alias}.source <> :appPasswordSource OR LOWER(TRIM(COALESCE(${alias}.messageType, ''))) IN (:...smtpAlwaysVisibleTypes))`,
+    {
+      appPasswordSource: 'app_password',
+      smtpAlwaysVisibleTypes: SMTP_ALWAYS_VISIBLE_TYPES,
+    }
+  );
   return qb;
 }
 
 function applyExcludeSmtpForUpdate(qb) {
-  qb.andWhere('("source" IS NULL OR "source" <> :appPasswordSource)', {
-    appPasswordSource: 'app_password',
-  });
+  qb.andWhere(
+    `("source" IS NULL OR "source" <> :appPasswordSource OR LOWER(TRIM(COALESCE("messageType", ''))) IN (:...smtpAlwaysVisibleTypes))`,
+    {
+      appPasswordSource: 'app_password',
+      smtpAlwaysVisibleTypes: SMTP_ALWAYS_VISIBLE_TYPES,
+    }
+  );
   return qb;
 }
 
 function isQueryFlagTrue(value) {
   return String(value ?? '').toLowerCase() === 'true';
+}
+
+/** Parse excludeTypes from query/body: string, comma-list, or array. */
+function parseExcludeTypes(raw) {
+  const values = Array.isArray(raw)
+    ? raw
+    : String(raw ?? '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+  const seen = new Set();
+  const out = [];
+  for (const v of values) {
+    const t = String(v || '').trim().toLowerCase();
+    if (!t || seen.has(t)) continue;
+    seen.add(t);
+    out.push(t);
+  }
+  return out;
+}
+
+function applyExcludeMessageTypes(qb, types, alias = 'm') {
+  if (!types?.length) return qb;
+  qb.andWhere(`LOWER(TRIM(COALESCE(${alias}.messageType, ''))) NOT IN (:...excludeTypes)`, {
+    excludeTypes: types,
+  });
+  return qb;
+}
+
+function applyExcludeMessageTypesForUpdate(qb, types) {
+  if (!types?.length) return qb;
+  qb.andWhere('LOWER(TRIM(COALESCE("messageType", \'\'))) NOT IN (:...excludeTypes)', {
+    excludeTypes: types,
+  });
+  return qb;
 }
 
 function applyStarredOnlyFilter(qb, alias = 'm') {
@@ -248,6 +295,7 @@ export async function listIncomingMessages(req, res) {
     if (isQueryFlagTrue(req.query.excludeSmtp)) {
       applyExcludeSmtp(qb, 'm');
     }
+    applyExcludeMessageTypes(qb, parseExcludeTypes(req.query.excludeTypes), 'm');
 
     if (req.query.emailAddress) {
       qb.andWhere('m.emailAddress ILIKE :emailAddress', { emailAddress: `%${req.query.emailAddress}%` });
@@ -305,6 +353,7 @@ export async function getIncomingUnreadCount(req, res) {
     if (isQueryFlagTrue(req.query.excludeSmtp)) {
       applyExcludeSmtp(qb, 'm');
     }
+    applyExcludeMessageTypes(qb, parseExcludeTypes(req.query.excludeTypes), 'm');
     const dayBounds = getIncomingListDayBounds(req.query);
     applyIncomingReceivedDateFilter(qb, {
       dayBounds,
@@ -333,6 +382,7 @@ export async function markAllIncomingAsRead(req, res) {
     if (isQueryFlagTrue(req.body?.excludeSmtp)) {
       applyExcludeSmtpForUpdate(qb);
     }
+    applyExcludeMessageTypesForUpdate(qb, parseExcludeTypes(req.body?.excludeTypes));
 
     const dayBounds = getMarkAllReadDayBounds(req.body || {});
     applyIncomingReceivedDateFilterForUpdate(qb, {
@@ -395,8 +445,26 @@ export async function listLatestUnreadIncoming(req, res) {
 export async function listIncomingMessageTypeCounts(req, res) {
   try {
     const repo = AppDataSource.getRepository(IncomingMessage);
+    const emailRepo = AppDataSource.getRepository(Email);
+
+    // Only mailboxes with a Nylas grant + API key (hide App Password–only accounts)
+    const nylasAccounts = await emailRepo
+      .createQueryBuilder('email')
+      .select('email.address', 'address')
+      .where('email.deletedAt IS NULL')
+      .andWhere('email.grantId IS NOT NULL')
+      .andWhere("TRIM(email.grantId) <> ''")
+      .andWhere('email.nylasKey IS NOT NULL')
+      .andWhere("TRIM(email.nylasKey) <> ''")
+      .getRawMany();
+    const nylasAddresses = new Set(
+      nylasAccounts.map((r) => String(r.address || '').trim().toLowerCase()).filter(Boolean)
+    );
+
     const qb = repo.createQueryBuilder('m').where('m.deletedAt IS NULL');
     await applyExcludeHiddenSenders(qb, 'm');
+    // Hide App Password / SMTP inbox rows from overview totals
+    applyExcludeSmtp(qb, 'm');
     const rows = await qb
       .select('m.emailAddress', 'emailAddress')
       .addSelect('m.messageType', 'messageType')
@@ -409,6 +477,8 @@ export async function listIncomingMessageTypeCounts(req, res) {
     const map = new Map();
     for (const row of rows) {
       const emailAddress = row.emailAddress;
+      const key = String(emailAddress || '').trim().toLowerCase();
+      if (!nylasAddresses.has(key)) continue;
       const messageType = row.messageType || 'other';
       const count = Number(row.count || 0);
       if (!map.has(emailAddress)) {
@@ -551,6 +621,10 @@ export async function renameMessageTypeForRules(req, res) {
           .andWhere('"deletedAt" IS NULL')
           .execute();
       }
+    });
+
+    refreshClientLastInboundMessageType().catch((err) => {
+      console.error('[lead-reply] Failed refreshing last_inbound_message_type after rename:', err.message || err);
     });
 
     res.json({

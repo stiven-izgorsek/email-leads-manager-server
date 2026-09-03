@@ -3,6 +3,11 @@ import { Brackets } from 'typeorm';
 import { CrmClient, CRM_CLIENT_STATUSES } from '../entities/CrmClient.js';
 import { Client } from '../entities/Client.js';
 import { sanitizeAiMarkerInName, serializeClientLeadForApi } from '../utils/leadNameSanitize.js';
+import { postFollowupReminderToSlack } from '../services/followupReminderSlackService.js';
+import {
+  markClientsLinkedToCrm,
+  refreshClientCrmLinkFlag,
+} from '../services/crmClientLeadLinkService.js';
 
 function normalizeStatus(raw, fallback = 'first_connected') {
   const s = String(raw || fallback).toLowerCase().trim();
@@ -533,6 +538,9 @@ export async function createCrmClient(req, res) {
     applyStatusesToRow(row, parsedStatuses || ['first_connected']);
 
     const saved = await repo.save(row);
+    markClientsLinkedToCrm({ leadId: saved.leadId, email: saved.email }).catch((err) => {
+      console.error('[crm-link] Failed marking lead in CRM:', err.message || err);
+    });
     res.status(201).json({
       ...serializeCrmClient(saved),
       createdNewLead,
@@ -552,6 +560,9 @@ export async function updateCrmClient(req, res) {
       where: { id: req.params.id, deletedAt: null },
     });
     if (!existing) return res.status(404).json({ error: 'Not found' });
+
+    const priorLeadId = existing.leadId;
+    const priorEmail = existing.email;
 
     if (body.leadId !== undefined) {
       existing.leadId = trimOrNull(body.leadId);
@@ -595,6 +606,12 @@ export async function updateCrmClient(req, res) {
     }
 
     const saved = await repo.save(existing);
+    refreshClientCrmLinkFlag({ leadId: priorLeadId, email: priorEmail }).catch((err) => {
+      console.error('[crm-link] Failed refreshing prior lead CRM flag:', err.message || err);
+    });
+    refreshClientCrmLinkFlag({ leadId: saved.leadId, email: saved.email }).catch((err) => {
+      console.error('[crm-link] Failed refreshing lead CRM flag:', err.message || err);
+    });
     res.json(serializeCrmClient(saved));
   } catch (error) {
     console.error('updateCrmClient error:', error);
@@ -611,6 +628,9 @@ export async function deleteCrmClient(req, res) {
     if (!row) return res.status(404).json({ error: 'Not found' });
     row.deletedAt = new Date();
     await repo.save(row);
+    refreshClientCrmLinkFlag({ leadId: row.leadId, email: row.email }).catch((err) => {
+      console.error('[crm-link] Failed refreshing lead CRM flag after delete:', err.message || err);
+    });
     res.json({ message: 'Client deleted successfully' });
   } catch (error) {
     console.error('deleteCrmClient error:', error);
@@ -699,5 +719,20 @@ export async function getCrmClientCountsBySentAccount(req, res) {
   } catch (error) {
     console.error('getCrmClientCountsBySentAccount error:', error);
     res.status(500).json({ error: 'Failed to load client counts' });
+  }
+}
+
+export async function notifyFollowupReminderSlack(req, res) {
+  try {
+    const repo = AppDataSource.getRepository(CrmClient);
+    const row = await repo.findOne({ where: { id: req.params.id, deletedAt: null } });
+    if (!row) return res.status(404).json({ error: 'Client not found' });
+
+    await postFollowupReminderToSlack(serializeCrmClient(row));
+    res.json({ success: true });
+  } catch (error) {
+    console.error('notifyFollowupReminderSlack error:', error);
+    const status = error.status || 500;
+    res.status(status).json({ error: error.message || 'Failed to send Slack notification' });
   }
 }
